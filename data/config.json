@@ -1,0 +1,90 @@
+{
+  "version": "1.0.0",
+  "memory": {
+    "auto_cleanup_enabled": true,
+    "cleanup_days": 180,
+    "archive_enabled": true,
+    "archive_days": 90,
+    "vector_search_top_k": 5,
+    "similarity_threshold": 0.7,
+    "show_archived_in_search": true,
+    "organize_enabled": true,
+    "organize_time": "03:00",
+    "organize_last_run": "2026-03-07T02:59:19.674395"
+  },
+  "logs": {
+    "task_log_retention_days": 30,
+    "system_log_retention_days": 7,
+    "log_level": "INFO"
+  },
+  "notification": {
+    "app_enabled": true,
+    "desktop_enabled": false,
+    "lark_enabled": false,
+    "lark_webhook_url": "",
+    "lark_secret": "",
+    "qq_enabled": false,
+    "qq_notify_openids": [],
+    "email_enabled": false,
+    "email_smtp_host": "smtp.gmail.com",
+    "email_smtp_port": 587,
+    "email_username": "",
+    "email_password": "",
+    "email_from": "",
+    "email_to": [],
+    "poll_interval": 30
+  },
+  "lark_bot": {
+    "enabled": true,
+    "connection_mode": "ws",
+    "app_id": "cli_a9132cb571789cc1",
+    "app_secret": "ECe6ejwecLk0aQmg6e0cPhblAt5YMUtj",
+    "verify_token": "",
+    "encrypt_key": "",
+    "receive_id_type": "chat_id"
+  },
+  "qq_bot": {
+    "enabled": true,
+    "app_id": "102915474",
+    "client_secret": "HRRE6mKhsrb5KOGX",
+    "enable_c2c": true,
+    "enable_group": true
+  },
+  "opencode": {
+    "server_url": "http://127.0.0.1:1120",
+    "auto_install": true,
+    "auto_start": true
+  },
+  "models": {
+    "primary_model": "",
+    "multimodal_model": "",
+    "models": []
+  },
+  "network": {
+    "host": "0.0.0.0",
+    "port": 8080
+  },
+  "integration": {
+    "modelscope_api_key": "ms-59224e87-02f4-488c-bef6-10ca674d7699"
+  },
+  "skills": {
+    "custom_skill_dirs": []
+  },
+  "sandbox": {
+    "execution_mode": "auto",
+    "runtime_binary": "",
+    "image_path": "",
+    "workspace_dir": "",
+    "memory_mb": 2048,
+    "startup_timeout": 60,
+    "exec_timeout": 300,
+    "ipc_dir": "",
+    "auto_download": true,
+    "extra_qemu_args": [],
+    "snapshot_mode": true,
+    "network_enabled": true,
+    "image_url": "",
+    "runtime_url": "",
+    "enabled": true
+  }
+}

@@ -1,0 +1,62 @@
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# Database
+chromadb==0.4.22
+
+# Cron
+croniter==2.0.1
+
+# Email
+aiosmtplib==3.0.1
+
+# Lark (Feishu)
+lark-oapi>=1.2.0
+
+# Utilities
+python-dotenv==1.0.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+httpx==0.26.0
+aiofiles==23.2.1
+psutil>=5.9.0
+
+# Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# Logging
+loguru==0.7.2
+
+# Vector Search
+numpy==1.26.3
+onnxruntime>=1.17.0
+tornado>=6.4.0
+
+# Office Skills - Excel
+openpyxl>=3.1.0
+pandas>=2.0.0
+xlrd>=2.0.1
+
+# Office Skills - Word
+python-docx>=1.1.0
+
+# Office Skills - PowerPoint
+python-pptx>=0.6.23
+Pillow>=10.0.0
+defusedxml>=0.7.1
+
+# Office Skills - PDF
+pypdf>=4.0.0
+pdfplumber>=0.10.0
+reportlab>=4.0.0
+
+# Web Skills
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Desktop Notifications
+plyer>=2.1.0
+windows-toasts>=1.1.0

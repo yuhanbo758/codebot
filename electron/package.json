@@ -1,0 +1,61 @@
+{
+  "name": "codebot",
+  "version": "1.0.0",
+  "description": "基于 OpenCode 的个人 AI 助手",
+  "author": "Codebot",
+  "main": "main.js",
+  "scripts": {
+    "start": "chcp 65001 && npm --prefix ../frontend run build && electron .",
+    "build": "electron-builder"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.0"
+  },
+  "build": {
+    "appId": "ai.codebot.app",
+    "productName": "Codebot",
+    "icon": "../logo.ico",
+    "directories": {
+      "output": "dist/electron_new"
+    },
+    "files": [
+      "main.js",
+      "preload.js"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend/dist_build/codebot-backend",
+        "to": "backend/codebot-backend",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../frontend/dist",
+        "to": "frontend-dist",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "../skills",
+        "to": "skills",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "vendor/opencode",
+        "to": "opencode",
+        "filter": ["**/*"]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": ["dmg"]
+    },
+    "win": {
+      "icon": "../logo.ico",
+      "target": ["nsis"]
+    },
+    "linux": {
+      "target": ["AppImage", "deb"]
+    }
+  }
+}

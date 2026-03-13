@@ -1,0 +1,86 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm
+.yarn
+
+# 前端构建
+frontend/dist/
+frontend/.vite/
+
+# Electron
+electron/dist/
+electron/out/
+
+# 数据文件
+data/*.db
+data/chroma/
+data/chroma_v2/
+data/sandbox/
+*.qcow2
+data/backups/*.zip
+data/export_*/
+data/import_*/
+
+# 日志
+logs/
+*.log
+backend/build_log*.txt
+
+# 后端构建
+backend/dist/
+backend/build_tmp/
+backend/build_tmp2/
+
+# 环境配置
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
