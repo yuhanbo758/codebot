@@ -343,13 +343,14 @@ codebot/
 
 在设置页面"沙箱"标签页可以配置：
 
-- **启用沙箱**: 开启后 AI 生成的代码在隔离 VM 中执行
-- **执行模式**: `auto`（自动检测）或 `vm`（强制使用 VM）
+- **启用沙箱**: 开关变更会立即保存；开启后才允许路由到沙箱
+- **执行模式**: `auto`（仅高风险操作优先走沙箱）/ `local`（始终本地）/ `sandbox`（始终优先沙箱）
 - **内存大小**: VM 内存（MB，默认 2048）
 - **启动超时**: VM 启动等待时间（秒，默认 60）
 - **执行超时**: 单次命令执行超时（秒，默认 300）
 - **网络访问**: 控制 VM 是否可访问外网
 - **自动下载**: 首次使用时自动下载 QEMU 运行时和磁盘镜像
+- **注意**: `auto` 并不等于“自动启用沙箱”，仍需先开启沙箱并准备/启动 VM
 
 ### MCP 服务器配置
 
@@ -493,9 +494,13 @@ npm run build
 ### 沙箱 API
 
 - `GET /api/sandbox/status` - 获取沙箱状态
+- `GET /api/sandbox/config` - 获取沙箱配置
+- `PATCH /api/sandbox/config` - 更新沙箱配置
+- `POST /api/sandbox/prepare` - 检测/下载沙箱运行时与镜像
+- `POST /api/sandbox/install-qemu` - 自动安装 QEMU
 - `POST /api/sandbox/start` - 启动沙箱 VM
 - `POST /api/sandbox/stop` - 停止沙箱 VM
-- `POST /api/sandbox/execute` - 在沙箱中执行命令
+- `POST /api/sandbox/test` - 在沙箱中执行冒烟测试
 
 ### 日志 API
 

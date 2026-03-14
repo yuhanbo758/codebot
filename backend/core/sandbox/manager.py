@@ -109,6 +109,15 @@ class SandboxManager:
         # 额外扫描：清理可能的孤立 QEMU 进程
         self._kill_orphan_qemu_processes()
 
+    def update_config(self, config) -> None:
+        self._cfg = config
+        self._ipc_dir = self._resolve_ipc_dir()
+        self._workspace_dir = self._resolve_workspace_dir()
+        if self._runtime:
+            self._runtime._cfg = config
+        if self._runner:
+            self._runner._cfg = config
+
     # ── VM 生命周期 ───────────────────────────────────────────────────────────
 
     async def start_vm(self) -> bool:

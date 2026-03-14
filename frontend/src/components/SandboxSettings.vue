@@ -119,14 +119,23 @@
       <el-form :model="form" label-width="150px" size="default">
 
         <el-form-item label="启用沙箱">
-          <el-switch v-model="form.enabled" />
+          <el-switch
+            v-model="form.enabled"
+            :loading="quickSaving.enabled"
+            @change="onEnabledChange"
+          />
           <span style="margin-left:10px;font-size:12px;color:#888">
             启用后聊天任务可在隔离 VM 中执行
           </span>
         </el-form-item>
 
         <el-form-item label="执行模式">
-          <el-select v-model="form.execution_mode" style="width:200px">
+          <el-select
+            v-model="form.execution_mode"
+            style="width:200px"
+            :loading="quickSaving.execution_mode"
+            @change="onExecutionModeChange"
+          >
             <el-option label="自动（auto）" value="auto" />
             <el-option label="始终本地（local）" value="local" />
             <el-option label="始终沙箱（sandbox）" value="sandbox" />
@@ -209,6 +218,10 @@ const form = ref({
   workspace_dir: '',
 })
 const saving = ref(false)
+const quickSaving = ref({
+  enabled: false,
+  execution_mode: false,
+})
 const testResult = ref(null)
 let pollTimer = null
 
@@ -271,6 +284,51 @@ const save = async () => {
     ElMessage.error('保存失败：' + (e.response?.data?.detail || e.message))
   } finally {
     saving.value = false
+  }
+}
+
+const patchConfig = async (payload) => {
+  const res = await axios.patch('/api/sandbox/config', payload)
+  const cfg = res.data?.data || {}
+  Object.assign(form.value, {
+    enabled: cfg.enabled ?? form.value.enabled,
+    execution_mode: cfg.execution_mode ?? form.value.execution_mode,
+    memory_mb: cfg.memory_mb ?? form.value.memory_mb,
+    startup_timeout: cfg.startup_timeout ?? form.value.startup_timeout,
+    exec_timeout: cfg.exec_timeout ?? form.value.exec_timeout,
+    snapshot_mode: cfg.snapshot_mode ?? form.value.snapshot_mode,
+    network_enabled: cfg.network_enabled ?? form.value.network_enabled,
+    auto_download: cfg.auto_download ?? form.value.auto_download,
+    runtime_binary: cfg.runtime_binary ?? form.value.runtime_binary,
+    image_path: cfg.image_path ?? form.value.image_path,
+    image_url: cfg.image_url ?? form.value.image_url,
+    workspace_dir: cfg.workspace_dir ?? form.value.workspace_dir,
+  })
+}
+
+const onEnabledChange = async (val) => {
+  quickSaving.value.enabled = true
+  try {
+    await patchConfig({ enabled: val })
+    ElMessage.success(`沙箱已${val ? '启用' : '禁用'}`)
+  } catch (e) {
+    ElMessage.error('保存失败：' + (e.response?.data?.detail || e.message))
+    await loadConfig()
+  } finally {
+    quickSaving.value.enabled = false
+  }
+}
+
+const onExecutionModeChange = async (val) => {
+  quickSaving.value.execution_mode = true
+  try {
+    await patchConfig({ execution_mode: val })
+    ElMessage.success('执行模式已保存')
+  } catch (e) {
+    ElMessage.error('保存失败：' + (e.response?.data?.detail || e.message))
+    await loadConfig()
+  } finally {
+    quickSaving.value.execution_mode = false
   }
 }
 

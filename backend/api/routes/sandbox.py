@@ -154,10 +154,20 @@ async def update_sandbox_config(patch: SandboxConfigPatch):
     current.update(updates)
     from config import SandboxConfig
     app_config.sandbox = SandboxConfig(**current)
+    if sandbox_manager is not None and hasattr(sandbox_manager, "update_config"):
+        sandbox_manager.update_config(app_config.sandbox)
+
     try:
         save_config(app_config)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"保存配置失败: {e}")
+
+    if sandbox_manager is not None:
+        if updates.get("enabled") is True:
+            import asyncio
+            asyncio.create_task(sandbox_manager.initialize())
+        elif updates.get("enabled") is False:
+            await sandbox_manager.stop_vm()
 
     logger.info(f"沙箱配置已更新: {updates}")
     return {"success": True, "data": app_config.sandbox.model_dump(), "message": "配置已保存"}
