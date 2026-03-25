@@ -106,37 +106,34 @@ class SkillsConfig(BaseModel):
 
 
 class SandboxConfig(BaseModel):
-    """沙箱 VM 配置"""
+    """
+    沙箱配置（工作目录隔离模式）
+    参考 LobsterAI 的本地执行架构，不依赖 QEMU/VM。
+    """
     # 执行模式：auto | local | sandbox
+    # auto    — 包含高风险操作时使用隔离工作目录执行，否则本地执行
+    # local   — 始终本地执行（不使用隔离工作目录）
+    # sandbox — 始终使用隔离工作目录执行
     execution_mode: str = "auto"
-    # QEMU 运行时二进制路径（为空则自动检测）
-    runtime_binary: str = ""
-    # 沙箱磁盘镜像路径（为空则自动检测/下载）
-    image_path: str = ""
-    # 工作目录（沙箱内挂载的主机目录，为空则使用默认数据目录）
+    # 是否启用沙箱功能（启用后使用隔离工作目录）
+    enabled: bool = False
+    # 工作目录（为空则自动在数据目录下创建 sandbox_workspace/）
     workspace_dir: str = ""
-    # 沙箱 VM 内存大小（MB）
-    memory_mb: int = 2048
-    # 沙箱启动超时（秒）
-    startup_timeout: int = 60
     # 沙箱执行超时（秒）
     exec_timeout: int = 300
-    # IPC 目录（主机侧与 VM 通信的共享目录）
-    ipc_dir: str = ""
-    # 是否自动下载运行时和镜像
-    auto_download: bool = True
-    # 自定义 QEMU 启动参数（附加）
-    extra_qemu_args: List[str] = []
-    # 快照模式：每次启动使用全新快照（安全）
-    snapshot_mode: bool = True
-    # 网络访问：允许沙箱访问互联网
+    # 网络访问：是否允许沙箱访问互联网（本地模式下始终允许）
     network_enabled: bool = True
-    # 沙箱镜像下载 URL（空则使用默认 CDN）
+    # 以下字段保留以兼容旧配置文件，不再使用
+    runtime_binary: str = ""
+    image_path: str = ""
+    memory_mb: int = 2048
+    startup_timeout: int = 60
+    ipc_dir: str = ""
+    auto_download: bool = False
+    extra_qemu_args: List[str] = []
+    snapshot_mode: bool = False
     image_url: str = ""
-    # 运行时下载 URL（空则使用默认 CDN）
     runtime_url: str = ""
-    # 是否启用沙箱功能
-    enabled: bool = False
 
 
 class AppConfig(BaseModel):

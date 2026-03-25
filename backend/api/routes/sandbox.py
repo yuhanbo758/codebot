@@ -1,16 +1,16 @@
 """
 沙箱 API 路由
-提供沙箱 VM 的管理接口。
+提供沙箱（工作目录隔离模式）的管理接口。
 
 端点：
-  GET  /api/sandbox/status          — 运行时 & VM 状态
-  POST /api/sandbox/prepare         — 触发运行时/镜像下载与检测
-  POST /api/sandbox/install-qemu    — 自动下载并安装 QEMU
+  GET  /api/sandbox/status          — 运行状态
+  POST /api/sandbox/prepare         — 初始化沙箱工作目录
   GET  /api/sandbox/config          — 获取沙箱配置
   PATCH /api/sandbox/config         — 更新沙箱配置
-  POST /api/sandbox/start           — 启动 VM
-  POST /api/sandbox/stop            — 停止 VM
+  POST /api/sandbox/start           — 兼容接口（本地模式无操作）
+  POST /api/sandbox/stop            — 兼容接口（本地模式无操作）
   POST /api/sandbox/test            — 沙箱冒烟测试
+  POST /api/sandbox/install-qemu    — 兼容接口（本地模式不需要 QEMU）
 """
 from __future__ import annotations
 
@@ -33,17 +33,18 @@ sandbox_manager = None  # type: Optional[object]
 class SandboxConfigPatch(BaseModel):
     execution_mode: Optional[str] = None
     enabled: Optional[bool] = None
+    exec_timeout: Optional[int] = None
+    network_enabled: Optional[bool] = None
+    workspace_dir: Optional[str] = None
+    # 以下字段保留兼容性，但本地模式下无效
     memory_mb: Optional[int] = None
     startup_timeout: Optional[int] = None
-    exec_timeout: Optional[int] = None
     snapshot_mode: Optional[bool] = None
-    network_enabled: Optional[bool] = None
     auto_download: Optional[bool] = None
     image_url: Optional[str] = None
     runtime_url: Optional[str] = None
     image_path: Optional[str] = None
     runtime_binary: Optional[str] = None
-    workspace_dir: Optional[str] = None
     ipc_dir: Optional[str] = None
 
 
@@ -55,7 +56,7 @@ class SandboxTestRequest(BaseModel):
 
 @router.get("/status")
 async def get_sandbox_status():
-    """获取沙箱运行时 & VM 状态"""
+    """获取沙箱状态"""
     if sandbox_manager is None:
         return {
             "success": True,
@@ -63,11 +64,14 @@ async def get_sandbox_status():
                 "state": "idle",
                 "vm_running": False,
                 "enabled": app_config.sandbox.enabled,
-                "runtime_ready": False,
+                "runtime_ready": True,
                 "qemu_available": False,
                 "image_available": False,
                 "downloading": False,
                 "download_progress": 0.0,
+                "ready": True,
+                "mode": "local_isolation",
+                "mode_description": "工作目录隔离模式（参考 LobsterAI 本地执行架构）",
                 "platform": _detect_platform(),
             }
         }
@@ -79,8 +83,8 @@ async def get_sandbox_status():
 @router.post("/prepare")
 async def prepare_sandbox():
     """
-    触发运行时检测与镜像下载（如果尚未就绪）。
-    这是一个异步触发操作；客户端应轮询 /status 来跟踪进度。
+    初始化沙箱工作目录（幂等操作）。
+    本地模式下只需确保工作目录存在。
     """
     if sandbox_manager is None:
         raise HTTPException(status_code=503, detail="沙箱管理器未初始化")
@@ -89,52 +93,24 @@ async def prepare_sandbox():
 
     async def _do_prepare():
         try:
-            # initialize() 是幂等的：会创建 _runtime（如果还没有）并调用 ensure_ready()
             await sandbox_manager.initialize()
         except Exception as e:
-            logger.error(f"沙箱准备失败: {e}")
+            logger.error(f"沙箱初始化失败: {e}")
 
     asyncio.create_task(_do_prepare())
-    return {"success": True, "message": "正在检测/下载沙箱运行时，请轮询 /api/sandbox/status 获取进度"}
+    return {"success": True, "message": "沙箱工作目录已就绪（本地隔离模式，无需下载）"}
 
 
 @router.post("/install-qemu")
 async def install_qemu():
     """
-    自动下载并安装 QEMU：
-    - Windows: 下载官方 NSIS installer → /S 静默安装（需要管理员权限）
-    - macOS: brew install qemu
-    - Linux: apt / dnf / pacman 安装
-
-    这是一个异步触发操作；客户端应轮询 /status 中的
-    installing_qemu / install_qemu_progress / install_qemu_error 字段来跟踪进度。
+    兼容接口。本地隔离模式不需要 QEMU，直接返回成功。
+    保留此端点以兼容旧版前端。
     """
-    if sandbox_manager is None:
-        raise HTTPException(status_code=503, detail="沙箱管理器未初始化")
-
-    # 确保 runtime 对象已创建
-    await sandbox_manager.initialize()
-
-    runtime = sandbox_manager._runtime
-    if runtime is None:
-        raise HTTPException(status_code=503, detail="沙箱运行时未初始化")
-
-    if runtime.status.qemu_available:
-        return {"success": True, "message": f"QEMU 已安装: {runtime.status.qemu_path}"}
-
-    if runtime.status.installing_qemu:
-        return {"success": True, "message": "QEMU 安装已在进行中，请轮询 /api/sandbox/status"}
-
-    import asyncio
-
-    async def _do_install():
-        try:
-            await runtime.install_qemu()
-        except Exception as e:
-            logger.error(f"QEMU 安装任务异常: {e}")
-
-    asyncio.create_task(_do_install())
-    return {"success": True, "message": "已触发 QEMU 安装，请轮询 /api/sandbox/status 获取进度"}
+    return {
+        "success": True,
+        "message": "当前使用工作目录隔离模式，无需安装 QEMU。"
+    }
 
 
 @router.get("/config")
@@ -153,11 +129,19 @@ async def update_sandbox_config(patch: SandboxConfigPatch):
     current = app_config.sandbox.model_dump()
     current.update(updates)
     from config import SandboxConfig
-    app_config.sandbox = SandboxConfig(**current)
+    validated_config = SandboxConfig(**current)
+    for key, value in validated_config.model_dump().items():
+        setattr(app_config.sandbox, key, value)
+    if sandbox_manager is not None:
+        sandbox_manager.update_config(app_config.sandbox)
     try:
         save_config(app_config)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"保存配置失败: {e}")
+
+    if sandbox_manager is not None:
+        # 本地模式下只需重新初始化工作目录
+        await sandbox_manager.initialize()
 
     logger.info(f"沙箱配置已更新: {updates}")
     return {"success": True, "data": app_config.sandbox.model_dump(), "message": "配置已保存"}
@@ -165,49 +149,78 @@ async def update_sandbox_config(patch: SandboxConfigPatch):
 
 @router.post("/start")
 async def start_sandbox_vm():
-    """手动启动沙箱 VM"""
+    """
+    兼容接口。本地隔离模式不需要启动 VM。
+    保留此端点以兼容旧版前端。
+    """
     if sandbox_manager is None:
         raise HTTPException(status_code=503, detail="沙箱管理器未初始化")
-    if not app_config.sandbox.enabled:
-        raise HTTPException(status_code=400, detail="沙箱功能未启用，请先在配置中开启")
-
-    ok = await sandbox_manager.start_vm()
-    if not ok:
-        raise HTTPException(status_code=500, detail="启动沙箱 VM 失败，请检查 QEMU 安装和镜像配置")
-    return {"success": True, "message": "沙箱 VM 已启动"}
+    # 本地模式下确保工作目录存在即可
+    await sandbox_manager.initialize()
+    return {"success": True, "message": "沙箱已就绪（工作目录隔离模式）"}
 
 
 @router.post("/stop")
 async def stop_sandbox_vm():
-    """手动停止沙箱 VM"""
+    """
+    兼容接口。本地隔离模式不需要停止 VM。
+    保留此端点以兼容旧版前端。
+    """
     if sandbox_manager is None:
         raise HTTPException(status_code=503, detail="沙箱管理器未初始化")
     await sandbox_manager.stop_vm()
-    return {"success": True, "message": "沙箱 VM 已停止"}
+    return {"success": True, "message": "沙箱已停止（本地模式）"}
 
 
 @router.post("/test")
 async def test_sandbox(request: SandboxTestRequest):
     """
-    在沙箱中运行冒烟测试任务。
-    如果 VM 未运行则自动启动。
+    沙箱冒烟测试。
+    在隔离工作目录中执行测试命令并验证结果。
+    参考 LobsterAI 的 CoworkRunner 测试流程。
     """
     if sandbox_manager is None:
         raise HTTPException(status_code=503, detail="沙箱管理器未初始化")
     if not app_config.sandbox.enabled:
-        raise HTTPException(status_code=400, detail="沙箱功能未启用")
+        raise HTTPException(status_code=400, detail="沙箱功能未启用，请先在设置中开启")
 
-    result = await sandbox_manager.execute(request.prompt)
-    return {
-        "success": result.success,
-        "data": {
-            "content": result.content,
-            "error": result.error,
-            "exit_code": result.exit_code,
-            "execution_mode": result.execution_mode,
-        },
-        "message": "沙箱测试完成" if result.success else f"沙箱测试失败: {result.error}",
-    }
+    try:
+        result = await sandbox_manager.execute(request.prompt)
+        if result.success:
+            content = result.content or "命令执行成功"
+            return {
+                "success": True,
+                "data": {
+                    "content": content,
+                    "error": "",
+                    "exit_code": result.exit_code,
+                    "execution_mode": result.execution_mode,
+                },
+                "message": f"沙箱冒烟测试通过：{content}",
+            }
+
+        return {
+            "success": False,
+            "data": {
+                "content": result.content,
+                "error": result.error,
+                "exit_code": result.exit_code,
+                "execution_mode": result.execution_mode,
+            },
+            "message": f"沙箱测试失败：{result.error or '未返回有效结果'}",
+        }
+    except Exception as e:
+        logger.error(f"沙箱冒烟测试异常: {e}")
+        return {
+            "success": False,
+            "data": {
+                "content": "",
+                "error": str(e),
+                "exit_code": 1,
+                "execution_mode": "local",
+            },
+            "message": f"沙箱测试异常: {e}",
+        }
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────

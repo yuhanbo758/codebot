@@ -24,7 +24,7 @@ from core.memory_manager import MemoryManager
 from core.memory_organizer import run_organize_loop
 from core.lark_ws_bot import LarkWsBot
 from core.scheduler import TaskScheduler
-from core.sandbox.manager import SandboxManager
+from core.sandbox import SandboxManager
 from services.notification import NotificationService
 from utils.installer import check_and_install_opencode, start_opencode_server, stop_opencode_server
 

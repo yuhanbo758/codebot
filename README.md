@@ -18,7 +18,7 @@
 - 🖥️ **跨平台**: Electron 桌面应用 + Web 应用
 - 🛠️ **技能系统**: 内置 web\_search / web\_fetch / news / file\_reader / pdf / docx / pptx / xlsx 等技能，支持自定义目录扩展
 - 🔌 **MCP 支持**: 管理 MCP 服务器（stdio/SSE），AI 自动调用匹配的外部工具
-- 🏖️ **沙箱执行**: 可选 QEMU 虚拟机隔离执行环境，安全运行 AI 生成的代码
+- 🏖️ **沙箱执行**: 工作目录隔离执行环境，AI 生成的代码在独立 `sandbox_workspace/` 目录中运行，无需 QEMU/Docker，开箱即用
 
 ## 🚀 快速开始
 
@@ -28,7 +28,6 @@
 - Node.js 18+
 - OpenCode CLI
   - `opencode serve` 默认端口 4096（<http://127.0.0.1:4096）>
-
 ### 安装
 
 #### Windows
@@ -120,6 +119,13 @@ npm start
 开发模式下（从源码运行），Electron 默认使用 `venv\\Scripts\\python.exe`（若存在）启动 `backend\\main.py`，以确保后端代码变更立即生效；如需强制使用 `backend\\dist\\codebot-backend.exe`，可设置环境变量 `CODEBOT_BACKEND_MODE=exe`。
 Electron 会优先使用应用内置的 `opencode` 可执行文件（`electron/vendor/opencode` 或打包后的 `resources/opencode`）自动拉起 `opencode serve`；若内置文件不可用或不可执行，会自动回退到系统 PATH 中的 `opencode`。桌面端会强制开启 OpenCode 自动拉起，并优先尝试 1120（回退配置端口与 4096）。
 
+### Windows 沙箱现状
+
+- 沙箱已重构为**工作目录隔离**模式，移除 QEMU 依赖，开箱即用，无需安装任何额外软件
+- AI 生成的代码在独立的 `data/sandbox/workspace/` 目录中执行，通过 `asyncio` 子进程运行，带超时控制
+- 执行结果实时返回，支持 `stdout`/`stderr`/`exit_code` 完整输出
+- 旧版 QEMU 相关端点（`/install-qemu`、`/start`、`/stop`）保留但返回本地模式说明，保持 API 向后兼容
+
 ### 访问
 
 - **本地访问**: <http://127.0.0.1:8080>
@@ -148,10 +154,9 @@ codebot/
 │   │   ├── task_solver.py      # 多策略 AI 任务求解器
 │   │   ├── tool_dispatcher.py  # 提示词路由（技能 & MCP 工具匹配）
 │   │   ├── lark_ws_bot.py      # 飞书 WebSocket 长连接机器人
-│   │   └── sandbox/            # QEMU 沙箱隔离执行环境
-│   │       ├── manager.py      # 沙箱生命周期 & 任务分发
-│   │       ├── runtime.py      # QEMU 运行时检测/下载
-│   │       └── vm_runner.py    # VM 进程管理
+│   │   └── sandbox/            # 沙箱隔离执行环境
+│   │       ├── __init__.py     # 模块入口
+│   │       └── manager.py      # 沙箱生命周期 & 工作目录隔离执行
 │   ├── api/routes/             # REST API 路由
 │   │   ├── chat.py             # 对话 API
 │   │   ├── memory.py           # 记忆 CRUD & 搜索 API
@@ -295,14 +300,14 @@ codebot/
 - SSE 模式的 MCP 工具由 `tool_dispatcher.py` 自动调用：当用户提示词匹配到工具描述时，后端自动发起工具调用并将结果注入上下文
 - 完整 CRUD 管理界面（`/mcp` 页面）及 REST API（`/api/mcp`）
 
-### 7. 沙箱执行（QEMU）
+### 7. 沙箱执行
 
-- 可选隔离执行环境，在 QEMU 虚拟机中安全运行 AI 生成的代码，防止宿主机受影响
-- 支持 `linux-x86_64.qcow2` 磁盘镜像（快照模式，每次执行后恢复干净状态）
-- IPC 通道：macOS/Linux 使用 **9p virtfs**，Windows 使用 **串口桥接**
-- 启动时自动同步技能文件到虚拟机；环境变量中的 `localhost/127.0.0.1` 自动映射为 QEMU 宿主别名 `10.0.2.2`
-- 状态机：`idle → starting → running → stopping → error`
-- 可配置：内存大小、启动/执行超时、网络访问开关、额外 QEMU 参数、运行时/镜像自动下载
+- 工作目录隔离执行环境，AI 生成的代码在独立 `data/sandbox/workspace/` 目录中运行
+- **无需安装额外软件**：移除 QEMU/Docker 依赖，开箱即用
+- 基于 `asyncio.create_subprocess_shell` 执行命令，支持超时控制
+- 完整输出捕获：`stdout`、`stderr`、`exit_code`
+- 执行模式：`local`（工作目录隔离）
+- 可配置执行超时（秒，默认 300）
 
 ## 🧩 常见问题
 
@@ -375,15 +380,12 @@ codebot/
 
 ### 沙箱配置
 
-在设置页面"沙箱"标签页可以配置：
+在设置页面沙箱标签页可以配置：
 
-- **启用沙箱**: 开启后 AI 生成的代码在隔离 VM 中执行
-- **执行模式**: `auto`（自动检测）或 `vm`（强制使用 VM）
-- **内存大小**: VM 内存（MB，默认 2048）
-- **启动超时**: VM 启动等待时间（秒，默认 60）
+- **启用沙箱**: 开启后 AI 生成的代码在工作目录隔离环境中执行
 - **执行超时**: 单次命令执行超时（秒，默认 300）
-- **网络访问**: 控制 VM 是否可访问外网
-- **自动下载**: 首次使用时自动下载 QEMU 运行时和磁盘镜像
+- 无需安装 QEMU 或 Docker，所有执行均在本机  目录中进行
+- 切换启用沙箱后，点击冒烟测试立即验证执行环境是否正常
 
 ### MCP 服务器配置
 
