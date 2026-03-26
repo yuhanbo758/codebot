@@ -1041,6 +1041,57 @@ def _extract_reminder_content(message: str) -> str:
     return content or text
 
 
+def _extract_task_content(message: str) -> str:
+    """从用户消息中提取纯任务内容，去掉时间相关的描述部分。
+
+    例如：
+      "5 分钟后，写首春天的诗，保存到 D:\\temp" → "写首春天的诗，保存到 D:\\temp"
+      "每天早上 9 点总结今日新闻"              → "总结今日新闻"
+      "明天上午10点写周报"                    → "写周报"
+    """
+    text = message.strip()
+
+    # 1. 去掉句首的相对时间前缀（如"5分钟后，"、"半小时后 "）
+    text = re.sub(
+        r"^((\d+\s*(分钟|小时|天|周|个月|年)|半小时|一小时|一天|一周|一个月)\s*(后|之后|以后)[，,\s]*)+",
+        "",
+        text
+    )
+
+    # 2. 反复去除句首的时间词（每次去一个单元，循环直到不再变化）
+    # 注意：更具体/更长的模式排在前面，避免被短模式抢先匹配
+    _TIME_PREFIX_PATTERN = (
+        r"^(?:"
+        r"每月\d{1,2}[号日]?|"          # 每月X号
+        r"每周[一二三四五六七日]|"        # 每周一/每周二...
+        r"每[天周月年小时分钟]|"          # 每天/每周/每月等
+        r"今天|明天|后天|工作日|周末|"
+        r"周[一二三四五六七日]|星期[一二三四五六七日]|"
+        r"早上|上午|中午|下午|晚上|凌晨|"
+        r"\d{1,2}\s*[:：]\s*\d{2}|"     # HH:MM
+        r"\d{1,2}\s*点半|"
+        r"\d{1,2}\s*点\s*\d{1,2}\s*分|" # X点Y分
+        r"\d{1,2}\s*(?:点钟?)|"          # X点/X点钟
+        r"\d{1,2}\s*[号日](?!\d)"        # X号/X日
+        r")\s*[，,\s]*"
+    )
+    prev = None
+    while prev != text:
+        prev = text
+        text = re.sub(_TIME_PREFIX_PATTERN, "", text, count=1)
+        text = text.lstrip("，,、 ")
+
+    # 3. 去掉内嵌的相对时间表达（如任务中夹着的"X分钟后"）
+    text = re.sub(r"\d+\s*(分钟|小时|天)\s*(后|之后|以后)", "", text)
+    text = re.sub(r"(半小时|一小时|一天)\s*(后|之后|以后)", "", text)
+
+    # 4. 清理多余空白和前导标点
+    text = re.sub(r"^[，,、\s]+", "", text)
+    text = " ".join(text.split())
+
+    return text if text else message.strip()
+
+
 async def _try_create_scheduled_task(message: str) -> Optional[str]:
     if not _looks_like_schedule_message(message):
         return None
@@ -1094,25 +1145,23 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
             task_payload = f"提醒：{content}" if content else message.strip()
             task_prompt = f"__REMINDER__\n{task_payload}"
         else:
-            action_text = message.strip()
-            action_text = re.sub(
-                r"(每天|每周|每月|每年|每小时|每分钟|早上|上午|中午|下午|晚上|凌晨|今天|明天|后天|周一|周二|周三|周四|周五|周六|周日|星期一|星期二|星期三|星期四|星期五|星期六|星期日|工作日|周末)",
-                " ",
-                action_text
-            )
-            action_text = re.sub(r"\d{1,2}\s*点钟|\d{1,2}\s*点半|\d{1,2}\s*点\s*\d{0,2}\s*分?|\d{1,2}\s*[:：]\s*\d{2}", " ", action_text)
-            action_text = re.sub(r"[，。,.!！?？;；:：]", " ", action_text)
+            # 提取纯任务内容（去掉时间相关描述，只保留真正要执行的任务）
+            task_content = _extract_task_content(message)
+            # 用于任务名称展示的简短版本（进一步去除标点和空白）
+            action_text = re.sub(r"[，。,.!！?？;；:：]", " ", task_content)
             action_text = " ".join(action_text.split())
             if not action_text:
                 action_text = message.strip()
             name = f"{'一次性' if run_once else ''}任务：{action_text}"
-            task_prompt = message.strip()
+            # task_prompt 使用提取后的纯任务内容，而非原始消息
+            # 这样执行时不会将"5分钟后"等时间描述混入任务指令
+            task_prompt = task_content
             drive_match = re.search(r"保存到\s*([a-zA-Z])\s*盘", message)
             if drive_match:
                 drive = drive_match.group(1).upper()
                 output_dir = f"{drive}:\\codebot_tasks"
                 task_prompt = (
-                    f"{message.strip()}\n"
+                    f"{task_content}\n"
                     f"请将产出保存为 Markdown 文件到 {output_dir} 目录（如不存在请创建），"
                     f"文件名包含日期时间（例如 20260301_0800.md），并在完成后输出保存路径。"
                 )

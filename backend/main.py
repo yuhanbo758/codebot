@@ -334,7 +334,7 @@ def _is_port_available(host: str, port: int) -> bool:
 app = FastAPI(
     title="Codebot",
     description="基于 OpenCode 的个人 AI 助手",
-    version="1.0.0",
+    version="1.1.1",
     lifespan=lifespan
 )
 

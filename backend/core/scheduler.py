@@ -213,25 +213,30 @@ class TaskScheduler:
             await asyncio.sleep(60)  # 每分钟检查一次
     
     async def _execute_task(self, task: ScheduledTask):
-        """执行定时任务"""
+        """执行定时任务
+
+        执行逻辑：
+        - 带 __REMINDER__ 前缀的纯提醒任务：直接生成提醒内容，不调用 OpenCode
+        - 其他所有任务（包括带 __RUN_ONCE__ 前缀的一次性任务）：
+          像聊天一样通过 opencode cli 处理，task_prompt 中只包含纯任务内容
+          （时间部分已在创建任务时从原始消息中剥离）
+        """
         raw_prompt = task.task_prompt or ""
         run_once = False
         if raw_prompt.startswith("__RUN_ONCE__"):
             run_once = True
             raw_prompt = raw_prompt.split("\n", 1)[1] if "\n" in raw_prompt else ""
 
+        # 只有明确带 __REMINDER__ 标志的才走提醒路径（不通过 AI 执行）
         reminder_payload = None
         if raw_prompt.startswith("__REMINDER__"):
             reminder_payload = raw_prompt.split("\n", 1)[1] if "\n" in raw_prompt else ""
             raw_prompt = reminder_payload
 
-        is_reminder = (
-            reminder_payload is not None
-            or ("提醒" in (task.name or ""))
-            or ("请提醒用户" in raw_prompt)
-            or ("提醒用户" in raw_prompt)
-        )
-        
+        # is_reminder 严格限定：仅当任务 prompt 显式带 __REMINDER__ 前缀时才走纯提醒路径
+        # 不再根据任务名称中的"提醒"二字来判断，避免误将真实任务（如"提醒写周报"）走提醒路径
+        is_reminder = reminder_payload is not None
+
         # 创建任务日志
         log_id = f"log_{datetime.now().timestamp()}"
         await self._create_task_log(
@@ -239,12 +244,16 @@ class TaskScheduler:
             task_id=task.id,
             task_name=task.name
         )
-        
+
         try:
             result = None
             if is_reminder:
+                # 纯提醒：不消耗 AI，直接返回提醒内容
                 result = SimpleNamespace(success=True, content=raw_prompt, error=None, tokens_used=0)
             elif self.opencode_ws and getattr(self.opencode_ws, "connected", False):
+                # 像聊天一样通过 opencode cli 执行任务
+                # raw_prompt 此时是纯任务内容（已去除时间前缀）
+                logger.info(f"通过 OpenCode 执行任务：{task.name}，prompt：{raw_prompt[:100]}...")
                 result = await self.opencode_ws.execute_task(raw_prompt)
             else:
                 raise RuntimeError("OpenCode 未连接，无法执行该定时任务")
@@ -304,17 +313,39 @@ class TaskScheduler:
                 )
 
     def _try_save_markdown_output(self, task_prompt: str, content: str) -> Optional[str]:
+        """尝试将任务输出保存为 Markdown 文件。
+
+        支持以下路径格式（按优先级）：
+        1. "Markdown 文件到 <dir> 目录"
+        2. "保存到 <dir>" / "保存到"<dir>"" （含引号的路径）
+        3. 路径中含盘符的 Windows 绝对路径（如 D:\\xxx）
+        """
         if not task_prompt or not content:
             return None
+
+        out_dir = None
+
+        # 格式1：Markdown 文件到 <dir> 目录
         m = re.search(r"Markdown\s*文件\s*到\s*(.+?)\s*目录", task_prompt, flags=re.IGNORECASE)
         if not m:
             m = re.search(r"Markdown\s*文件\s*到\s*(.+)", task_prompt, flags=re.IGNORECASE)
-        if not m:
-            return None
-        out_dir = (m.group(1) or "").strip()
-        out_dir = re.split(r"[，。,.!！?？;；\n\r]", out_dir, maxsplit=1)[0].strip().strip("\"'“”")
+        if m:
+            out_dir = (m.group(1) or "").strip()
+            out_dir = re.split(r"[，。,.!！?？;；\n\r]", out_dir, maxsplit=1)[0].strip().strip("\"''\u201c\u201d")
+
+        # 格式2：保存到"<dir>" 或 保存到 <dir>（支持引号路径）
+        if not out_dir:
+            m = re.search(r'保存到\s*["""\'\'](.*?)["""\'\']', task_prompt)
+            if m:
+                out_dir = m.group(1).strip()
+        if not out_dir:
+            m = re.search(r'保存到\s*([A-Za-z]:[^\s，。,!！?？;；\n\r]+)', task_prompt)
+            if m:
+                out_dir = m.group(1).strip().rstrip("，。,!！?？;；")
+
         if not out_dir:
             return None
+
         out_path = Path(out_dir)
         try:
             out_path.mkdir(parents=True, exist_ok=True)
@@ -335,7 +366,7 @@ class TaskScheduler:
             return str(file_path)
         except Exception:
             return None
-    
+
     async def _create_task_log(self, log_id: str, task_id: str, task_name: str):
         """创建任务日志"""
         with self._db_lock:
