@@ -78,6 +78,7 @@ security-report*.json
 # 系统文件
 .DS_Store
 Thumbs.db
+/nul
 
 # 临时文件
 tmp/
