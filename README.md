@@ -1,10 +1,11 @@
 # Codebot
 
-基于 OpenCode 的个人 AI 助手 - 支持飞书和邮箱通讯渠道
+基于 OpenCode 的第三方能力工作台 - 所有聊天统一由 OpenCode 处理，Codebot 负责提供 MCP / Skills / 记忆 / 定时任务能力并展示结果
 
 ## ✨ 特性
 
-- 🤖 **OpenCode 集成**: 通过 HTTP API 连接 OpenCode Server，支持多模型切换
+- 🤖 **OpenCode 主控**: 所有聊天消息统一交给 OpenCode 处理，支持多模型切换与原生工具流式事件展示
+- 🔗 **Codebot 第三方化**: Codebot 自身以第三方 MCP 形式注册到 OpenCode，OpenCode 可直接调用 Codebot 的记忆、任务、技能与会话工具
 - 🧭 **自主执行策略**: 默认优先自主决策与自动重试，减少把流程决策抛给用户
 - 💾 **记忆系统**: SQLite + ChromaDB 持久化存储，支持上下文记忆和长期记忆
 - 🧠 **自动记忆提取**: 从对话中自动识别并保存用户的习惯、偏好、个人信息等，无需手动触发
@@ -16,8 +17,8 @@
 - 🌐 **局域网访问**: 支持通过 IP 地址远程访问
 - 📱 **移动端适配**: 响应式设计，支持手机浏览器
 - 🖥️ **跨平台**: Electron 桌面应用 + Web 应用
-- 🛠️ **技能系统**: 内置 web\_search / web\_fetch / news / file\_reader / pdf / docx / pptx / xlsx 等技能，支持自定义目录扩展
-- 🔌 **MCP 支持**: 管理 MCP 服务器（stdio/SSE），AI 自动调用匹配的外部工具
+- 🛠️ **第三方技能系统**: `skills/` 中的 SKILL.md 会同步到 OpenCode 的技能目录，作为第三方技能直接被调用
+- 🔌 **第三方 MCP 支持**: Codebot 会聚合并代理外部 MCP 服务器（尤其是魔搭 ModelScope MCP），再通过自身 MCP SSE 入口统一暴露给 OpenCode 调用
 - 🏖️ **沙箱执行**: 工作目录隔离执行环境，AI 生成的代码在独立 `sandbox_workspace/` 目录中运行，无需 QEMU/Docker，开箱即用
 
 ## 🚀 快速开始
@@ -60,6 +61,16 @@ opencode serve --port 4096 --hostname 127.0.0.1
 ```
 
 应用程序配置文件（设置 → 通用设置 → 配置文件 → `config.json`）里的 `server_url` 需要与 `opencode serve` 保持一致（端口/地址一致）。如果连不上，请优先检查该配置项。桌面端启动后端时会自动尝试拉起 OpenCode 服务，端口优先级为 `127.0.0.1:1120` → 配置端口 → `127.0.0.1:4096`。若 `1120` 被其他进程占用，会直接回退到后续候选端口，不会改用 `1121/1122` 这类随机端口。这样可优先为 Codebot 单独使用 1120，不干扰已有的 `4096` 服务。
+启动后，Codebot 会自动把以下内容同步到 OpenCode：
+
+- Codebot 自身的第三方 MCP 入口：`/api/mcp/codebot/sse`
+- `skills/` 目录中的内置与生成技能
+
+注意：外部 MCP 服务器不会再以独立条目直接写入 OpenCode 配置，而是由 Codebot 统一代理。也就是说：
+
+- OpenCode 只需要连接 `codebot` 这一个第三方 MCP
+- Codebot 内部再去访问你在“第三方 MCP”页面里配置的魔搭 MCP / 其他远程 MCP
+- 对于魔搭 ModelScope MCP，Codebot 会沿用 Bearer 认证头透传请求，并把可用工具重新暴露给 OpenCode
 
 ##### 后台自动启动（Windows 任务计划程序）
 
@@ -151,18 +162,17 @@ codebot/
 │   │   ├── memory_extractor.py # 自动记忆提取（对话中识别习惯/偏好）
 │   │   ├── memory_organizer.py # AI 驱动的每日记忆整理（合并/去重）
 │   │   ├── scheduler.py        # Cron 定时任务调度器
-│   │   ├── task_solver.py      # 多策略 AI 任务求解器
-│   │   ├── tool_dispatcher.py  # 提示词路由（技能 & MCP 工具匹配）
+│   │   ├── tool_dispatcher.py  # 技能发现与 MCP 协议适配（桥接辅助模块）
 │   │   ├── lark_ws_bot.py      # 飞书 WebSocket 长连接机器人
 │   │   └── sandbox/            # 沙箱隔离执行环境
 │   │       ├── __init__.py     # 模块入口
 │   │       └── manager.py      # 沙箱生命周期 & 工作目录隔离执行
 │   ├── api/routes/             # REST API 路由
-│   │   ├── chat.py             # 对话 API
+│   │   ├── chat.py             # OpenCode 会话 API（Codebot 只负责转发、展示与存储）
 │   │   ├── memory.py           # 记忆 CRUD & 搜索 API
 │   │   ├── scheduler.py        # 定时任务 API
-│   │   ├── skills.py           # 技能管理 API
-│   │   ├── mcp.py              # MCP 服务器管理 API
+│   │   ├── skills.py           # 第三方技能管理与同步 API
+│   │   ├── mcp.py              # 外部 MCP 管理 + Codebot 自身 MCP SSE 入口
 │   │   ├── config.py           # 应用配置 API
 │   │   ├── notifications.py    # 通知 API
 │   │   ├── lark.py             # 飞书 Webhook/事件 API
@@ -207,9 +217,10 @@ codebot/
 
 ## 📖 功能说明
 
-### 1. 聊天对话
+### 1. OpenCode 会话
 
 - 创建和管理多个对话，支持重命名、置顶、归档、删除
+- 所有消息统一交给 OpenCode 处理，Codebot 不再充当主代理，只负责提供第三方能力和结果展示
 - 查看历史对话记录；进入"聊天"自动打开最近对话
 - 支持多对话并行处理，多个对话可同时发送并后台执行
 - **分组聊天**: 支持将多个对话合并为群组模式
@@ -237,6 +248,16 @@ codebot/
 - 后台事件回放与数据库最终消息会做去重收敛，避免同一回复先流式出现后又重复插入一次
 - 消息操作按钮（复制/撤销）统一固定在回复气泡右下角
 - 应用与对话回复头像使用 logo.ico
+
+### 1.1 Codebot 作为第三方的工作方式
+
+- OpenCode 是主聊天入口，负责模型选择、推理、工具决策与最终回答
+- Codebot 通过 `/api/mcp/codebot/sse` 暴露第三方 MCP，向 OpenCode 提供记忆、任务、技能、会话等工具
+- Codebot 会把“第三方 MCP”页面中启用的远程 MCP 工具代理成 `codebot_mcp__...` 形式的工具名，再暴露给 OpenCode
+- Codebot 会把 `skills/` 目录中的技能同步到 OpenCode 技能目录，使其作为第三方技能被直接调用
+- 聊天请求发往 OpenCode 时只附带必要的用户记忆上下文，不再由 Codebot 预判技能或代替 OpenCode 做二次工具编排
+- `backend/core/tool_dispatcher.py` 已收敛为桥接辅助模块，仅负责技能发现与 MCP 协议适配，不再承担聊天主链路上的工具调度
+- 前端聊天页只展示 OpenCode 的流式步骤与最终结果，并提示当前第三方桥接状态
 
 ### 2. 记忆系统
 
@@ -432,7 +453,9 @@ codebot/
 
 - `APP_TOKEN` 不再内置默认值，需在 `.env` 中显式配置随机高强度令牌
 - `.env.example` 仅保留占位符，避免误用示例值作为生产密钥
-- `backend/dist_build/` 与 `security-scan-*.json` 已加入 `.gitignore`，避免将打包产物和扫描报告误提交
+- `backend/dist_build/`、`backend/dist/`、`backend/build_tmp2/` 与 `security-scan-*.json` 已加入 `.gitignore`，避免将打包产物和扫描报告误提交
+- `data/*.json` 已加入 `.gitignore`，防止含 API token 的 `mcp_servers.json` 等运行时数据文件被误提交
+- `data/mcp_servers.json` 已从 git 追踪中移除（`git rm --cached`），文件内容仅保留在本地
 - 本地开源清理建议先删除 `backend/dist_build/`、`security-scan-*.json`、`security-report*.json` 再提交
 - 推荐执行：`python C:\Users\yuhan\.agents\skills\security\scripts\scan_secrets.py . --severity medium --extensions .py,.js,.vue,.json,.env,.toml,.yaml,.yml,.md`
 - 飞书 Webhook 日志默认不再记录消息正文，仅记录 `chat_id` 和文本长度
