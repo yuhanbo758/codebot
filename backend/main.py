@@ -26,7 +26,7 @@ from core.lark_ws_bot import LarkWsBot
 from core.scheduler import TaskScheduler
 from core.sandbox import SandboxManager
 from services.notification import NotificationService
-from utils.installer import check_and_install_opencode, start_opencode_server, stop_opencode_server
+from utils.installer import check_and_install_opencode, start_opencode_server, stop_opencode_server, _is_opencode_http_ready
 
 # 导入 API 路由
 from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router
@@ -107,6 +107,47 @@ def _seed_builtin_skills(skills_dir: Path):
         logger.info(f"共复制 {copied} 个内置技能到 {skills_dir}")
 
 
+def _migrate_auto_json_skills(skills_dir: Path):
+    """将旧格式的 auto_*.json 自动技能迁移为目录格式（builtin: 兼容，可编辑）。"""
+    import json as _json
+    migrated = 0
+    for json_path in list(skills_dir.glob("auto_*.json")):
+        try:
+            data = _json.loads(json_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        skill_id = data.get("id") or json_path.stem
+        target_dir = skills_dir / skill_id
+        if target_dir.exists():
+            # 目录已存在，直接删除旧 JSON
+            json_path.unlink(missing_ok=True)
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
+        name = data.get("name") or skill_id
+        description = data.get("description") or ""
+        skill_content = f"""---
+name: {name}
+description: {description[:120] if len(description) > 120 else description}
+---
+
+# {name}
+
+## 技能概述
+
+此技能由对话自动生成（从旧格式迁移）。
+
+## 描述
+
+{description}
+"""
+        (target_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
+        json_path.unlink(missing_ok=True)
+        migrated += 1
+        logger.info(f"已迁移自动技能: {skill_id}")
+    if migrated:
+        logger.info(f"共迁移 {migrated} 个旧格式自动技能")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
@@ -123,6 +164,7 @@ async def lifespan(app: FastAPI):
     # 2. 确保技能目录存在，并从打包资源中种子复制内置技能
     settings.SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     _seed_builtin_skills(settings.SKILLS_DIR)
+    _migrate_auto_json_skills(settings.SKILLS_DIR)
     
     # 3. 检查并安装 OpenCode
     if app_config.opencode.auto_install:
@@ -197,7 +239,14 @@ async def lifespan(app: FastAPI):
             if p not in candidate_ports:
                 candidate_ports.append(p)
         actual_port = 0
+        reused_existing = False
         for port in candidate_ports:
+            # 先检测该端口是否已有正常运行的 OpenCode 服务（如桌面版 OpenCode）
+            if await _is_opencode_http_ready(f"http://127.0.0.1:{port}"):
+                logger.info(f"检测到已有 OpenCode 服务运行在端口 {port}，直接复用，不重复启动")
+                actual_port = port
+                reused_existing = True
+                break
             actual_port = await start_opencode_server(port)
             if actual_port:
                 break
@@ -221,6 +270,22 @@ async def lifespan(app: FastAPI):
             logger.warning("请确保 OpenCode Server 已启动")
     
     asyncio.create_task(connect_opencode())
+
+    # 8b. 启动时全量同步 MCP 到 opencode（Skills 不同步，由用户自主管理）
+    async def sync_to_opencode():
+        # 等待 opencode 连接就绪后再同步
+        for _ in range(20):
+            await asyncio.sleep(1)
+            if opencode_ws and opencode_ws.connected:
+                break
+        try:
+            from api.routes.mcp import full_sync_mcp_to_opencode
+            full_sync_mcp_to_opencode()
+            logger.info("[Startup] MCP 全量同步到 opencode 完成")
+        except Exception as _e:
+            logger.warning(f"[Startup] MCP 同步到 opencode 失败: {_e}")
+
+    asyncio.create_task(sync_to_opencode())
 
     # 9. 启动记忆自动整理循环
     global _organize_loop_task
@@ -364,7 +429,7 @@ async def health_check():
     """健康检查"""
     return {
         "status": "healthy",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "opencode_connected": opencode_ws.connected if opencode_ws else False,
         "runtime_source": "packaged" if getattr(sys, "frozen", False) else "source",
         "pid": os.getpid()

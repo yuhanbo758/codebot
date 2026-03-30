@@ -907,7 +907,7 @@ class MemoryManager:
             # 创建元数据
             metadata = {
                 "export_date": datetime.now().isoformat(),
-                "version": "1.0.0"
+                "version": "2.0.0"
             }
             with open(export_dir / "metadata.json", "w", encoding="utf-8") as f:
                 json.dump(metadata, f, ensure_ascii=False, indent=2)

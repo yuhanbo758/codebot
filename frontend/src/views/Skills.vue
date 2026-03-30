@@ -3,7 +3,7 @@
     <!-- 固定头部区域 -->
     <div class="skills-header">
       <div class="header-title-row">
-        <h2>技能管理</h2>
+        <h2>技能</h2>
         <el-input
           v-model="searchQuery"
           placeholder="搜索技能..."
@@ -27,6 +27,17 @@
           <el-button @click="toggleBatchMode">
             {{ batchMode ? '退出批量' : '批量处理' }}
           </el-button>
+          <el-tooltip v-if="ocSyncStatus !== null" :content="ocSyncTooltip" placement="bottom">
+            <el-button
+              :type="ocSyncStatus?.in_sync ? 'success' : 'warning'"
+              plain
+              :loading="ocSyncing"
+              @click="syncSkillsToOpencode"
+            >
+              <el-icon><Refresh /></el-icon>
+              {{ ocSyncStatus?.in_sync ? 'OpenCode 已同步' : `同步到 OpenCode (${ocSyncStatus?.not_synced?.length ?? '?'} 待同步)` }}
+            </el-button>
+          </el-tooltip>
           <el-button type="success" @click="showGenerateDialog = true">
             <el-icon><MagicStick /></el-icon>
             生成技能
@@ -37,6 +48,7 @@
           </el-button>
         </div>
       </div>
+      <div class="skills-subtitle">管理 Codebot 的技能。内置技能和自动生成技能仅供 Codebot 内部使用；OpenCode 技能由 OpenCode CLI 自身管理（位于 ~/.agents/skills/）。</div>
     </div>
 
     <!-- 可滚动表格区域 -->
@@ -66,9 +78,29 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160">
+        <el-table-column label="操作" width="220">
           <template #default="{ row }">
-            <template v-if="!row.id?.startsWith('builtin:') && !row.id?.startsWith('custom:')">
+            <!-- builtin: 支持编辑 SKILL.md，不支持卸载 -->
+            <template v-if="row.id?.startsWith('builtin:')">
+              <el-button size="small" type="primary" plain @click="openEditDialog(row)">编辑</el-button>
+              <el-text type="info" size="small" style="margin-left:8px">内置</el-text>
+            </template>
+            <!-- auto: 自动生成，支持编辑和删除 -->
+            <template v-else-if="row.id?.startsWith('auto:')">
+              <el-button size="small" type="primary" plain @click="openEditDialog(row)">编辑</el-button>
+              <el-button size="small" type="danger" plain @click="deleteSkill(row)" :loading="row.deleting">删除</el-button>
+            </template>
+            <!-- custom: 外部目录只读 -->
+            <el-text v-else-if="row.id?.startsWith('custom:')" type="info" size="small">外部只读</el-text>
+            <!-- opencode: / 普通 JSON 技能 -->
+            <template v-else>
+              <el-button
+                v-if="isEditable(row)"
+                size="small"
+                type="primary"
+                plain
+                @click="openEditDialog(row)"
+              >编辑</el-button>
               <el-button
                 v-if="!row.id?.startsWith('opencode:')"
                 size="small"
@@ -81,8 +113,6 @@
                 卸载
               </el-button>
             </template>
-            <el-text v-else-if="row.id?.startsWith('custom:')" type="info" size="small">外部只读</el-text>
-            <el-text v-else type="info" size="small">内置只读</el-text>
           </template>
         </el-table-column>
       </el-table>
@@ -165,13 +195,34 @@
         </el-button>
       </template>
     </el-dialog>
+    <!-- 编辑技能对话框（全文 SKILL.md 编辑器） -->
+    <el-dialog v-model="showEditDialog" title="编辑 SKILL.md" width="800px" :fullscreen="editFullscreen">
+      <div style="display:flex; justify-content:flex-end; margin-bottom:8px; gap:8px">
+        <el-button size="small" @click="editFullscreen = !editFullscreen">
+          {{ editFullscreen ? '退出全屏' : '全屏编辑' }}
+        </el-button>
+      </div>
+      <el-input
+        v-model="editForm.content"
+        type="textarea"
+        :rows="editFullscreen ? 30 : 20"
+        placeholder="SKILL.md 内容..."
+        :disabled="editLoading"
+        style="font-family: monospace; font-size: 13px"
+      />
+      <div v-if="editLoadError" style="color:#f56c6c; margin-top:8px; font-size:13px">{{ editLoadError }}</div>
+      <template #footer>
+        <el-button @click="showEditDialog = false" :disabled="editSaving">取消</el-button>
+        <el-button type="primary" @click="saveEditSkill" :loading="editSaving">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Download, Search, MagicStick, Link } from '@element-plus/icons-vue'
+import { Download, Search, MagicStick, Link, Refresh } from '@element-plus/icons-vue'
 import axios from 'axios'
 
 const skills = ref([])
@@ -186,6 +237,60 @@ const searchQuery = ref('')
 const showInstallDialog = ref(false)
 const showGenerateDialog = ref(false)
 const generateDescription = ref('')
+
+// ── 编辑技能 ──────────────────────────────────────────────────────────────
+const showEditDialog = ref(false)
+const editSaving = ref(false)
+const editLoading = ref(false)
+const editLoadError = ref('')
+const editFullscreen = ref(false)
+const editForm = ref({ id: '', content: '' })
+
+/**
+ * 支持编辑的技能类型：
+ *  - builtin: / auto: / opencode: → SKILL.md 全文编辑
+ *  - custom:                      → 外部目录只读
+ *  - 普通 JSON（source=chat）     → 也走全文编辑（content 为空时可填写）
+ */
+const isEditable = (row) => {
+  if (row.id?.startsWith('custom:')) return false   // 外部目录只读
+  if (row.id?.startsWith('builtin:')) return true
+  if (row.id?.startsWith('auto:')) return true
+  if (row.id?.startsWith('opencode:')) return true
+  return row.source === 'chat'
+}
+
+const openEditDialog = async (row) => {
+  editForm.value = { id: row.id, content: '' }
+  editLoadError.value = ''
+  editFullscreen.value = false
+  showEditDialog.value = true
+  editLoading.value = true
+  try {
+    const res = await axios.get(`/api/skills/${encodeURIComponent(row.id)}/content`)
+    editForm.value.content = res.data?.data?.content || ''
+  } catch (err) {
+    editLoadError.value = err?.response?.data?.detail || '无法加载 SKILL.md 内容'
+  } finally {
+    editLoading.value = false
+  }
+}
+
+const saveEditSkill = async () => {
+  editSaving.value = true
+  try {
+    await axios.put(`/api/skills/${encodeURIComponent(editForm.value.id)}/content`, {
+      content: editForm.value.content,
+    })
+    ElMessage.success('技能已更新')
+    showEditDialog.value = false
+    await loadSkills()
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.detail || '更新失败')
+  } finally {
+    editSaving.value = false
+  }
+}
 
 const installForm = ref({
   name: '',
@@ -206,6 +311,7 @@ const filteredSkills = computed(() => {
 const sourceLabel = (id) => {
   if (!id) return '自定义'
   if (id.startsWith('builtin:')) return '内置'
+  if (id.startsWith('auto:')) return '自动生成'
   if (id.startsWith('opencode:')) return 'OpenCode'
   if (id.startsWith('custom:')) return '外部目录'
   return '自定义'
@@ -213,9 +319,10 @@ const sourceLabel = (id) => {
 
 const sourceTagType = (source) => {
   if (source === 'builtin') return 'warning'
+  if (source === 'auto') return 'success'
   if (source === 'opencode') return 'info'
   if (source === 'custom') return ''
-  return 'success'
+  return 'primary'
 }
 
 const loadSkills = async () => {
@@ -321,16 +428,16 @@ const onSelectionChange = (rows) => {
 }
 
 const batchDelete = async () => {
-  const deletable = selectedIds.value.filter(id => !id.startsWith('builtin:'))
-  const builtinCount = selectedIds.value.length - deletable.length
+  const deletable = selectedIds.value.filter(id => !id.startsWith('builtin:') && !id.startsWith('custom:'))
+  const skippedCount = selectedIds.value.length - deletable.length
 
   if (deletable.length === 0) {
-    ElMessage.warning('所选技能均为内置技能，无法卸载')
+    ElMessage.warning('所选技能均为内置或外部只读技能，无法卸载')
     return
   }
 
-  const tip = builtinCount > 0
-    ? `将卸载 ${deletable.length} 个技能（${builtinCount} 个内置技能将被跳过）`
+  const tip = skippedCount > 0
+    ? `将卸载 ${deletable.length} 个技能（${skippedCount} 个内置/外部技能将被跳过）`
     : `将卸载 ${deletable.length} 个技能`
 
   try {
@@ -354,8 +461,42 @@ const batchDelete = async () => {
   }
 }
 
+// ── opencode 同步状态 ─────────────────────────────────────────────────────
+const ocSyncStatus = ref(null)
+const ocSyncing = ref(false)
+
+const ocSyncTooltip = computed(() => {
+  if (!ocSyncStatus.value) return ''
+  if (ocSyncStatus.value.in_sync) return 'Codebot 提供给 OpenCode 的技能已全部同步'
+  const names = (ocSyncStatus.value.not_synced || []).join(', ')
+  return `点击将以下技能同步到 OpenCode:\n${names}`
+})
+
+const loadOcSyncStatus = async () => {
+  try {
+    const res = await axios.get('/api/skills/opencode-sync-status')
+    ocSyncStatus.value = res.data?.data ?? null
+  } catch {
+    ocSyncStatus.value = null
+  }
+}
+
+const syncSkillsToOpencode = async () => {
+  ocSyncing.value = true
+  try {
+    const res = await axios.post('/api/skills/sync-to-opencode')
+    ElMessage.success(res.data?.message || '同步成功')
+    await loadOcSyncStatus()
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.detail || '同步失败')
+  } finally {
+    ocSyncing.value = false
+  }
+}
+
 onMounted(() => {
   loadSkills()
+  loadOcSyncStatus()
 })
 </script>
 
@@ -392,6 +533,12 @@ onMounted(() => {
   gap: 8px;
   align-items: center;
   flex-shrink: 0;
+}
+
+.skills-subtitle {
+  margin-top: 10px;
+  font-size: 13px;
+  color: #606266;
 }
 
 .skills-table-wrapper {

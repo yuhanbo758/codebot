@@ -25,7 +25,7 @@ from core.opencode_ws import OpenCodeClient, _conversation_current_session, is_c
 from core.memory_extractor import extract_and_save_background
 from api.routes import scheduler as scheduler_router
 from api.routes import mcp as mcp_router
-from core.tool_dispatcher import build_augmented_prompt
+from api.routes import skills as skills_router
 from utils.installer import start_opencode_server
 
 router = APIRouter()
@@ -82,7 +82,7 @@ class ToggleGroupRequest(BaseModel):
 class SkillGenerateRequest(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
-    version: str = "1.0.0"
+    version: str = "2.0.0"
     source: Optional[str] = None
     enabled: bool = True
     message_limit: int = 50
@@ -107,9 +107,28 @@ def _sanitize_assistant_output(content: str) -> str:
     if not content:
         return ""
     text = str(content).replace("\r\n", "\n")
+
+    # ── 1. 清除 codebot 注入的 XML 包装标签 ────────────────────────────────
     text = re.sub(r"(?is)<(system_policy|conversation_context)>[\s\S]*?</\1>", "", text)
     text = re.sub(r"(?is)</?(system_policy|conversation_context)>", "", text)
-    text = re.sub(r"(?m)^【用户输入】.*$", "", text)
+    text = re.sub(r"(?is)<internal_context>[\s\S]*?</internal_context>", "", text)
+    text = re.sub(r"(?is)<user_message>[\s\S]*?</user_message>", "", text)
+
+    # ── 2. 清除附件注入的上下文块（【附件：...】...```）────────────────────
+    text = re.sub(r"(?m)^【附件[：:][^】]*】\n```[\s\S]*?```\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"(?m)^【附件[：:][^】]*（二进制文件，类型：[^）]*）】\s*$", "", text)
+
+    # ── 3. 清除用户消息/输入包装标记行 ─────────────────────────────────────
+    text = re.sub(r"(?m)^【用户(?:输入|消息|请求)】.*$", "", text)
+
+    # ── 4. 过滤内部 prompt 标记行（定时任务/提醒/一次性标记）───────────────
+    text = re.sub(r"(?m)^__RUN_ONCE__.*$", "", text)
+    text = re.sub(r"(?m)^__REMINDER__.*$", "", text)
+
+    # ── 5. 过滤 cron 表达式行（如 "0 9 * * *"）─────────────────────────────
+    text = re.sub(r"(?m)^\s*\d+\s+\d+\s+[\d*,/-]+\s+[\d*,/-]+\s+[\d*,/-]+\s*$", "", text)
+
+    # ── 6. 清除 "请只输出给用户的最终结果..." 指令句及其之前内容 ─────────────
     instruction_idx = text.find("请只输出给用户的最终结果")
     if instruction_idx >= 0:
         suffix = text[instruction_idx:]
@@ -118,9 +137,57 @@ def _sanitize_assistant_output(content: str) -> str:
             text = suffix[dot_idx + 1:]
         else:
             text = ""
-    if any(tag in text.lower() for tag in ["system_policy", "conversation_context", "internal_context"]):
+
+    # ── 7. 清除意图识别内部 prompt 特征（防止整段 JSON prompt 泄露）─────────
+    # 当输出以"你是意图识别"等内置 prompt 关键词开头时，直接丢弃
+    INTERNAL_PROMPT_PREFIXES = [
+        "你是意图识别",
+        "你是 Cron 表达式生成器",
+        "你是Cron表达式生成器",
+        "任务：从用户输入中提取结构化指令",
+    ]
+    stripped = text.lstrip()
+    for prefix in INTERNAL_PROMPT_PREFIXES:
+        if stripped.startswith(prefix):
+            text = ""
+            break
+
+    # ── 7b. 清除注入的系统提示词行（逐行过滤） ──────────────────────────────
+    # OpenCode 有时会把整个 prompt（含内置提示词）原样回显，需要逐行过滤掉
+    INTERNAL_PROMPT_LINES = {
+        "你正在 OpenCode 中处理用户消息。",
+        "请自主决策并持续执行，不要把流程决策反问给用户；遇到可恢复问题时优先自行切换替代方案。",
+        "当前聊天由 OpenCode 统一处理；Codebot Desktop 作为能力面板，向你提供记忆、定时任务、技能与 MCP 工具。",
+        "除非用户明确询问架构细节，否则不要在最终回答中解释内部桥接、同步或上下文包装。",
+        "请直接输出给用户的最终结果。",
+        "当前是规划模式，直接给出可执行计划，不要让用户做流程选择。",
+        "以下是与当前问题相关的用户记忆，请在回答中参考；若与用户本轮消息冲突，以用户本轮消息为准。",
+    }
+    # 同时过滤以这些前缀开头的行（如带有换行的变体）
+    INTERNAL_PROMPT_STARTSWITH = (
+        "你正在 OpenCode 中处理用户消息",
+        "请自主决策并持续执行",
+        "当前聊天由 OpenCode 统一处理",
+        "除非用户明确询问架构细节",
+        "请直接输出给用户的最终结果",
+        "当前是规划模式，直接给出可执行计划",
+        "以下是与当前问题相关的用户记忆",
+    )
+    lines_out = []
+    for line in text.split("\n"):
+        stripped_line = line.strip()
+        if stripped_line in INTERNAL_PROMPT_LINES:
+            continue
+        if any(stripped_line.startswith(p) for p in INTERNAL_PROMPT_STARTSWITH):
+            continue
+        lines_out.append(line)
+    text = "\n".join(lines_out)
+
+    # ── 8. 兜底：残留 prompt 关键字则保留最后一段非空内容 ───────────────────
+    if any(tag in text.lower() for tag in ["system_policy", "conversation_context"]):
         lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
         text = lines[-1] if lines else ""
+
     text = text.strip()
     return text
 
@@ -268,19 +335,40 @@ async def _execute_opencode_client_with_parts(
 # ── MCP 聊天意图识别与处理 ─────────────────────────────────────────────────
 
 def _looks_like_mcp_message(message: str) -> bool:
-    """判断消息是否与 MCP Server 管理相关"""
+    """
+    判断消息是否与 MCP Server **管理**相关（添加/删除/启用/禁用等）。
+
+    规则：
+    1. 必须同时含有 MCP 关键词 AND 管理动作关键词
+    2. 排除"调用/使用/invoke/call/run/执行"等使用意图——这类消息应透传给 opencode 处理
+    """
     if not message:
         return False
     text = message.strip()
-    mcp_keywords = ["mcp", "MCP", "model context protocol"]
-    action_keywords = ["添加", "新增", "安装", "配置", "删除", "移除", "卸载", "启用", "禁用", "列出", "查看", "查询"]
-    has_mcp = any(kw.lower() in text.lower() for kw in mcp_keywords)
+    lower = text.lower()
+
+    mcp_keywords = ["mcp", "model context protocol"]
+    has_mcp = any(kw in lower for kw in mcp_keywords)
     if not has_mcp:
         return False
-    has_action = any(kw in text for kw in action_keywords) or re.search(
-        r"(server|服务器|服务|工具)", text, re.IGNORECASE
-    )
-    return bool(has_action) or has_mcp
+
+    # 明确的"使用/调用"意图 → 不拦截，让 opencode 处理
+    invoke_keywords = ["调用", "使用", "invoke", "call", "run", "执行", "帮我用", "通过mcp", "通过 mcp",
+                       "用mcp", "用 mcp", "利用", "借助"]
+    if any(kw in lower for kw in invoke_keywords):
+        return False
+
+    # 必须同时有管理动作才算管理消息
+    mgmt_action_keywords = ["添加", "新增", "安装", "配置", "删除", "移除", "卸载", "启用", "禁用",
+                             "列出", "查看", "查询", "add", "install", "remove", "delete",
+                             "enable", "disable", "list"]
+    has_mgmt = any(kw in lower for kw in mgmt_action_keywords)
+    if not has_mgmt:
+        return False
+
+    # 还需要有"服务器/server"语境，避免误杀含 mcp 词的普通句子
+    has_server_ctx = bool(re.search(r"(server|服务器|服务|mcp\s*服务)", lower))
+    return has_server_ctx
 
 
 def _extract_mcp_command_from_message(message: str) -> Optional[dict]:
@@ -402,8 +490,10 @@ async def _try_handle_mcp_message(message: str) -> Optional[str]:
         return "\n".join(lines)
 
     # ── 删除/移除 ──────────────────────────────────────────────────────────
+    # 必须同时有删除关键词 AND MCP Server 语境，防止误拦截"修改文件内容"等正常请求
     delete_keywords = ["删除", "移除", "卸载", "remove", "delete"]
-    if any(kw in lower for kw in delete_keywords):
+    has_server_ctx_del = bool(re.search(r"(mcp\s*(server|服务器)|server.*mcp|服务器.*mcp)", lower))
+    if any(kw in lower for kw in delete_keywords) and has_server_ctx_del:
         from api.routes.mcp import _read_all, _write_all
         servers = _read_all()
         # 尝试按名称匹配
@@ -506,89 +596,30 @@ def _should_use_sandbox(message: str) -> bool:
     return False
 
 
-async def _execute_opencode(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None) -> str:
-    content = ""
-
-    # MCP 操作优先（不走 AI 路由）
-    mcp_reply = await _try_handle_mcp_message(message)
-    if mcp_reply:
-        return mcp_reply
-
-    # 定时任务优先判断（不受记忆判断干扰）
-    schedule_like = _looks_like_schedule_message(message)
-    birthday_reminder_like = _looks_like_birthday_reminder_message(message)
-    # 记忆判断：已在 _looks_like_memory_message 内部排除定时任务消息
-    memory_like = _looks_like_memory_message(message) or _looks_like_birthday_memory_intent(message)
-    # 若已识别为定时任务，则不再路由到记忆
-    if schedule_like and not birthday_reminder_like:
-        memory_like = False
-
-    wants_action = schedule_like or memory_like
-
-    if wants_action:
-        # 定时任务优先处理
-        if schedule_like:
-            scheduled = await _try_create_scheduled_task(message)
-            if scheduled:
-                if birthday_reminder_like:
-                    saved = await _try_save_memory(message)
-                    if saved:
-                        return f"{saved}\n\n{scheduled}"
-                return scheduled
-
-        # 记忆处理（仅在非定时任务场景下）
-        if memory_like:
-            saved = await _try_save_memory(message)
-            if saved:
-                return saved
-
-        ai_routed, opencode_available = await _try_ai_route_action(message)
-        if ai_routed:
-            return ai_routed
-
-        if not opencode_available:
-            if schedule_like:
-                return (
-                    "我识别到你想创建定时任务，但当前未能解析时间表达。\n"
-                    "建议用类似格式：\n"
-                    "- 今天 20:05 提醒我休息\n"
-                    "- 每天 09:00 提醒我喝水"
-                )
-            if memory_like:
-                return (
-                    "我识别到你想保存记忆，但当前未能提取要记住的内容。\n"
-                    "建议用类似格式：帮我记住：xxx"
-                )
-            return "OpenCode 正在启动或未连接，请稍后重试。"
-
-        return "未能识别你的意图，请更明确描述要创建的定时任务或要保存的记忆。"
-
-    memory_answer = await _try_answer_from_memory(message)
-    if memory_answer:
-        return memory_answer
-
-    # 沙箱执行路由（在增强 prompt 之前判断，避免暴露内部记忆数据到沙箱）
-    if _should_use_sandbox(message):
-        sandbox_result = await _execute_sandbox(message)
-        if sandbox_result is not None:
-            return sandbox_result
-        # 沙箱失败，降级继续走本地 OpenCode
-
-    # 自动匹配并注入相关 Skills / MCP 工具上下文
+async def _sync_codebot_as_third_party():
+    mcp_router.auto_sync_mcp_to_opencode()
+    mcp_router.ensure_codebot_remote_mcp_in_opencode()
     try:
-        augmented = await build_augmented_prompt(message)
-    except Exception as _disp_err:
-        logger.warning(f"[ToolDispatcher] 增强 prompt 失败（跳过）: {_disp_err}")
-        augmented = message
+        status = await skills_router.get_opencode_sync_status()
+        status_data = status.get("data") if isinstance(status, dict) else {}
+        if not status_data.get("in_sync", True):
+            skills_router.sync_builtin_skills_to_opencode()
+    except Exception:
+        pass
 
-    prompt = await _build_opencode_prompt_with_memory(augmented, mode=mode)
+
+async def _execute_opencode(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None) -> str:
+    try:
+        await _sync_codebot_as_third_party()
+    except Exception as _sync_err:
+        logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
+
+    # 消息直接发给 opencode CLI，由其通过注册的 MCP/Skills 处理
+    prompt = await _build_opencode_prompt_with_memory(message, mode=mode)
     content, _ = await _execute_opencode_client(prompt, model=model, mode=mode, conversation_id=conversation_id)
     content = _sanitize_assistant_output(content or "")
 
     if not content:
-        memory_fallback = await _try_answer_from_semantic_memory(message)
-        if memory_fallback:
-            return memory_fallback
         content = "OpenCode 未连接，请先启动本地 opencode server 或检查 server_url 配置"
 
     return content
@@ -600,67 +631,13 @@ async def _execute_opencode_with_meta(
     mode: Optional[str] = None,
     conversation_id: Optional[str] = None
 ) -> Tuple[str, List[dict]]:
-    mcp_reply = await _try_handle_mcp_message(message)
-    if mcp_reply:
-        return mcp_reply, []
-
-    schedule_like = _looks_like_schedule_message(message)
-    birthday_reminder_like = _looks_like_birthday_reminder_message(message)
-    memory_like = _looks_like_memory_message(message) or _looks_like_birthday_memory_intent(message)
-    if schedule_like and not birthday_reminder_like:
-        memory_like = False
-
-    wants_action = schedule_like or memory_like
-    if wants_action:
-        if schedule_like:
-            scheduled = await _try_create_scheduled_task(message)
-            if scheduled:
-                if birthday_reminder_like:
-                    saved = await _try_save_memory(message)
-                    if saved:
-                        return f"{saved}\n\n{scheduled}", []
-                return scheduled, []
-        if memory_like:
-            saved = await _try_save_memory(message)
-            if saved:
-                return saved, []
-        ai_routed, opencode_available = await _try_ai_route_action(message)
-        if ai_routed:
-            return ai_routed, []
-        if not opencode_available:
-            if schedule_like:
-                return (
-                    "我识别到你想创建定时任务，但当前未能解析时间表达。\n"
-                    "建议用类似格式：\n"
-                    "- 今天 20:05 提醒我休息\n"
-                    "- 每天 09:00 提醒我喝水",
-                    []
-                )
-            if memory_like:
-                return (
-                    "我识别到你想保存记忆，但当前未能提取要记住的内容。\n"
-                    "建议用类似格式：帮我记住：xxx",
-                    []
-                )
-            return "OpenCode 正在启动或未连接，请稍后重试。", []
-        return "未能识别你的意图，请更明确描述要创建的定时任务或要保存的记忆。", []
-
-    memory_answer = await _try_answer_from_memory(message)
-    if memory_answer:
-        return memory_answer, []
-
-    if _should_use_sandbox(message):
-        sandbox_result = await _execute_sandbox(message)
-        if sandbox_result is not None:
-            return sandbox_result, []
-
     try:
-        augmented = await build_augmented_prompt(message)
-    except Exception as _disp_err:
-        logger.warning(f"[ToolDispatcher] 增强 prompt 失败（跳过）: {_disp_err}")
-        augmented = message
+        await _sync_codebot_as_third_party()
+    except Exception as _sync_err:
+        logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
 
-    prompt = await _build_opencode_prompt_with_memory(augmented, mode=mode)
+    # 消息直接发给 opencode CLI，由其通过注册的 MCP/Skills 处理
+    prompt = await _build_opencode_prompt_with_memory(message, mode=mode)
     content, _, parts = await _execute_opencode_client_with_parts(
         prompt,
         model=model,
@@ -670,9 +647,6 @@ async def _execute_opencode_with_meta(
     content = _sanitize_assistant_output(content or "")
 
     if not content:
-        memory_fallback = await _try_answer_from_semantic_memory(message)
-        if memory_fallback:
-            return memory_fallback, []
         content = "OpenCode 未连接，请先启动本地 opencode server 或检查 server_url 配置"
         return content, []
 
@@ -685,76 +659,13 @@ async def _stream_execute_opencode_with_meta(
     mode: Optional[str] = None,
     conversation_id: Optional[str] = None
 ):
-    mcp_reply = await _try_handle_mcp_message(message)
-    if mcp_reply:
-        yield {"type": "done", "content": mcp_reply, "parts": []}
-        return
-
-    schedule_like = _looks_like_schedule_message(message)
-    birthday_reminder_like = _looks_like_birthday_reminder_message(message)
-    memory_like = _looks_like_memory_message(message) or _looks_like_birthday_memory_intent(message)
-    if schedule_like and not birthday_reminder_like:
-        memory_like = False
-
-    wants_action = schedule_like or memory_like
-    if wants_action:
-        if schedule_like:
-            scheduled = await _try_create_scheduled_task(message)
-            if scheduled:
-                if birthday_reminder_like:
-                    saved = await _try_save_memory(message)
-                    if saved:
-                        yield {"type": "done", "content": f"{saved}\n\n{scheduled}", "parts": []}
-                        return
-                yield {"type": "done", "content": scheduled, "parts": []}
-                return
-        if memory_like:
-            saved = await _try_save_memory(message)
-            if saved:
-                yield {"type": "done", "content": saved, "parts": []}
-                return
-        ai_routed, opencode_available = await _try_ai_route_action(message)
-        if ai_routed:
-            yield {"type": "done", "content": ai_routed, "parts": []}
-            return
-        if not opencode_available:
-            if schedule_like:
-                yield {
-                    "type": "done",
-                    "content": "我识别到你想创建定时任务，但当前未能解析时间表达。\n建议用类似格式：\n- 今天 20:05 提醒我休息\n- 每天 09:00 提醒我喝水",
-                    "parts": []
-                }
-                return
-            if memory_like:
-                yield {
-                    "type": "done",
-                    "content": "我识别到你想保存记忆，但当前未能提取要记住的内容。\n建议用类似格式：帮我记住：xxx",
-                    "parts": []
-                }
-                return
-            yield {"type": "done", "content": "OpenCode 正在启动或未连接，请稍后重试。", "parts": []}
-            return
-        yield {"type": "done", "content": "未能识别你的意图，请更明确描述要创建的定时任务或要保存的记忆。", "parts": []}
-        return
-
-    memory_answer = await _try_answer_from_memory(message)
-    if memory_answer:
-        yield {"type": "done", "content": memory_answer, "parts": []}
-        return
-
-    if _should_use_sandbox(message):
-        sandbox_result = await _execute_sandbox(message)
-        if sandbox_result is not None:
-            yield {"type": "done", "content": sandbox_result, "parts": []}
-            return
-
     try:
-        augmented = await build_augmented_prompt(message)
-    except Exception as _disp_err:
-        logger.warning(f"[ToolDispatcher] 增强 prompt 失败（跳过）: {_disp_err}")
-        augmented = message
+        await _sync_codebot_as_third_party()
+    except Exception as _sync_err:
+        logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
 
-    prompt = await _build_opencode_prompt_with_memory(augmented, mode=mode)
+    # 消息直接发给 opencode CLI，由其通过注册的 MCP/Skills 处理
+    prompt = await _build_opencode_prompt_with_memory(message, mode=mode)
 
     client = opencode_ws
     created_client = False
@@ -764,10 +675,6 @@ async def _stream_execute_opencode_with_meta(
             created_client = True
         ok = await client.try_connect(attempts=3, delay=0.4, open_timeout=1.0)
         if not ok:
-            memory_fallback = await _try_answer_from_semantic_memory(message)
-            if memory_fallback:
-                yield {"type": "done", "content": memory_fallback, "parts": []}
-                return
             yield {"type": "done", "content": "OpenCode 未连接，请先启动本地 opencode server 或检查 server_url 配置", "parts": []}
             return
         async for event in client.execute_task_stream(
@@ -818,7 +725,7 @@ async def _try_ai_route_action(message: str) -> Tuple[Optional[str], bool]:
         return None, opencode_available
 
     prompt = (
-        "你是意图识别与结构化指令提取器，用于驱动一个本地个人助理。\n"
+        "你是意图识别与结构化指令提取器，用于辅助 OpenCode 桌面工作流。\n"
         "任务：从用户输入中提取结构化指令。\n"
         f"本次允许的 action 只有：{ '|'.join(allowed_actions) }。\n"
         "只输出 JSON（不要输出任何解释、不要输出 Markdown、不要输出代码块）。\n"
@@ -1097,6 +1004,19 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
         return None
     if not scheduler_router.scheduler:
         return None
+    # 从全局通知配置读取默认渠道
+    _nc = app_config.notification
+    _default_channels: list = []
+    if _nc.app_enabled:
+        _default_channels.append("app")
+    if _nc.desktop_enabled:
+        _default_channels.append("desktop")
+    if _nc.lark_enabled:
+        _default_channels.append("lark")
+    if _nc.email_enabled:
+        _default_channels.append("email")
+    if not _default_channels:
+        _default_channels = ["app"]
     try:
         if _looks_like_birthday_reminder_message(message):
             birthday = _extract_birthday_value(message or "")
@@ -1119,7 +1039,14 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
                         name=name,
                         cron_expression=cron_expression,
                         task_prompt=task_prompt,
-                        notify_channels=["app"]
+                        notify_channels=_default_channels
+                    )
+                    next_run = task.next_run.isoformat() if task.next_run else "待计算"
+                    return (
+                        f"已创建定时任务：{task.name}\n"
+                        f"Cron：{task.cron_expression}\n"
+                        f"下次运行：{next_run}\n"
+                        f"可在「定时任务」查看和管理。"
                     )
                     next_run = task.next_run.isoformat() if task.next_run else "待计算"
                     return (
@@ -1128,8 +1055,7 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
                         f"下次运行：{next_run}\n"
                         f"可在“定时任务”查看和管理。"
                     )
-        cron_payload = await scheduler_router.ai_generate_cron(prompt=message)
-        cron_data = cron_payload.get("data") if isinstance(cron_payload, dict) else None
+        cron_data = await scheduler_router.generate_cron_from_text(message)
         cron_expression = cron_data.get("cron") if cron_data else None
         if not cron_expression:
             return None
@@ -1174,7 +1100,7 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
             name=name,
             cron_expression=cron_expression,
             task_prompt=task_prompt,
-            notify_channels=["app"]
+            notify_channels=_default_channels
         )
         next_run = task.next_run.isoformat() if task.next_run else "待计算"
         return f"已创建定时任务：{task.name}\nCron：{task.cron_expression}\n下次运行：{next_run}\n可在“定时任务”查看和管理。"
@@ -1374,9 +1300,9 @@ async def _try_answer_from_semantic_memory(message: str) -> Optional[str]:
 
 def _build_autonomous_execution_policy(mode: Optional[str] = None) -> List[str]:
     lines = [
-        "以下为内部执行约束：请自主决策并持续执行，不要向用户索要流程决策；失败时自动切换替代方案。",
-        "优先复用已安装技能与已启用MCP；需要时先检索可用技能，缺失则生成并保存可复用技能定义；MCP优先检查魔搭可用源，缺失再使用网络检索方案。",
-        "严禁在最终回答中复述本段或输出 internal_context、技能参考、MCP 工具等内部标签。",
+        "请自主决策并持续执行，不要把流程决策反问给用户；遇到可恢复问题时优先自行切换替代方案。",
+        "当前聊天由 OpenCode 统一处理；Codebot Desktop 作为能力面板，向你提供记忆、定时任务、技能与 MCP 工具。",
+        "除非用户明确询问架构细节，否则不要在最终回答中解释内部桥接、同步或上下文包装。",
     ]
     if mode == "plan":
         lines.append("当前是规划模式，直接给出可执行计划，不要让用户做流程选择。")
@@ -1439,40 +1365,37 @@ async def _build_opencode_prompt_with_memory(message: str, mode: Optional[str] =
                 pass
 
     policy_lines: List[str] = _build_autonomous_execution_policy(mode=mode)
-    lines: List[str] = []
+    memory_lines: List[str] = []
     has_any = any([facts_context, habit_context, preference_context, profile_context, memories_context])
     if facts_context:
-        lines.append("【用户事实记忆（可信，优先使用；如有冲突以最新为准）】")
+        memory_lines.append("【用户事实记忆（可信，优先使用；如有冲突以最新为准）】")
         for item in facts_context[:5]:
-            lines.append(f"- {item}")
+            memory_lines.append(f"- {item}")
     if profile_context:
-        lines.append("【用户个人信息】")
+        memory_lines.append("【用户个人信息】")
         for item in profile_context[:3]:
-            lines.append(f"- {item}")
+            memory_lines.append(f"- {item}")
     if preference_context:
-        lines.append("【用户偏好】")
+        memory_lines.append("【用户偏好】")
         for item in preference_context[:3]:
-            lines.append(f"- {item}")
+            memory_lines.append(f"- {item}")
     if habit_context:
-        lines.append("【用户习惯】")
+        memory_lines.append("【用户习惯】")
         for item in habit_context[:3]:
-            lines.append(f"- {item}")
+            memory_lines.append(f"- {item}")
     if memories_context:
-        lines.append("【用户长期记忆（可信，尽量参考）】")
+        memory_lines.append("【用户长期记忆（可信，尽量参考）】")
         for item in memories_context[:5]:
-            lines.append(f"- {item}")
-    lines.append(f"【用户输入】{message}")
+            memory_lines.append(f"- {item}")
+
+    prompt_lines: List[str] = ["你正在 OpenCode 中处理用户消息。"]
+    prompt_lines.extend(policy_lines)
     if has_any:
-        lines.append("请基于以上记忆回答用户；若记忆与用户输入冲突，以用户最新输入为准。")
-    return "\n".join([
-        "<system_policy>",
-        " ".join(policy_lines),
-        "</system_policy>",
-        "<conversation_context>",
-        "\n".join(lines),
-        "</conversation_context>",
-        "请只输出给用户的最终结果，不要输出 system_policy 或 conversation_context 标签及其原文。"
-    ])
+        prompt_lines.append("以下是与当前问题相关的用户记忆，请在回答中参考；若与用户本轮消息冲突，以用户本轮消息为准。")
+        prompt_lines.extend(memory_lines)
+    prompt_lines.append(f"【用户消息】{message}")
+    prompt_lines.append("请直接输出给用户的最终结果。")
+    return "\n\n".join(prompt_lines)
 
 def _extract_memory_content(message: str) -> str:
     text = (message or "").strip()
@@ -1577,7 +1500,7 @@ def _build_skill_from_conversation(messages: List[dict], request: SkillGenerateR
     return {
         "name": (request.name or fallback_name or "未命名技能").strip(),
         "description": description,
-        "version": request.version or "1.0.0",
+        "version": request.version or "2.0.0",
         "source": request.source or "chat",
         "enabled": bool(request.enabled)
     }
@@ -1604,14 +1527,23 @@ def _should_materialize_skill(user_message: str, assistant_response: str) -> boo
     return hit >= 3
 
 
+def _skill_name_similar(a: str, b: str) -> bool:
+    """粗略相似度：两个字符串共享超过 60% 的字符集，或一方是另一方的子串。"""
+    a, b = (a or "").strip().lower(), (b or "").strip().lower()
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    set_a, set_b = set(a), set(b)
+    if not set_a or not set_b:
+        return False
+    overlap = len(set_a & set_b) / min(len(set_a), len(set_b))
+    return overlap >= 0.6
+
+
 def _materialize_reusable_skill(user_message: str, assistant_response: str) -> None:
     cleaned_response = _sanitize_assistant_output(assistant_response or "")
     if not _should_materialize_skill(user_message, cleaned_response):
-        return
-    digest = hashlib.sha1(f"{user_message}\n{cleaned_response[:300]}".encode("utf-8")).hexdigest()[:16]
-    skill_id = f"auto_{digest}"
-    path = settings.SKILLS_DIR / f"{skill_id}.json"
-    if path.exists():
         return
     title = generate_conversation_title(user_message or "自动技能")
     desc = cleaned_response.strip().replace("\n", " ")
@@ -1619,18 +1551,101 @@ def _materialize_reusable_skill(user_message: str, assistant_response: str) -> N
         return
     if len(desc) > 180:
         desc = f"{desc[:180]}..."
-    data = {
-        "id": skill_id,
-        "name": f"自动技能-{title}",
-        "description": desc,
-        "version": "1.0.0",
-        "source": "auto",
-        "enabled": True,
-        "installed_at": datetime.now().isoformat(),
-    }
+    new_name = f"自动技能-{title}"
+
+    # 生成目录名（slug）：基于 name 的英文简写 + digest
+    digest = hashlib.sha1(f"{user_message}\n{cleaned_response[:300]}".encode("utf-8")).hexdigest()[:8]
+    slug_base = re.sub(r"[^a-z0-9_]", "_", title[:20].lower().replace(" ", "_"))
+    slug_base = re.sub(r"_+", "_", slug_base).strip("_") or "auto"
+    slug = f"auto_{slug_base}_{digest}"
+
     settings.SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    # 检查是否存在相似的已有自动技能（目录格式或旧 JSON 格式），升级替代而非新增
+    # 1. 扫描目录格式的自动技能（auto_*.../SKILL.md）
+    for existing_dir in settings.SKILLS_DIR.glob("auto_*"):
+        if not existing_dir.is_dir():
+            continue
+        skill_md = existing_dir / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        try:
+            content = skill_md.read_text(encoding="utf-8")
+            existing_name = ""
+            existing_desc = ""
+            if content.startswith("---"):
+                end = content.find("\n---", 3)
+                if end != -1:
+                    for line in content[3:end].splitlines():
+                        if line.startswith("name:"):
+                            existing_name = line[5:].strip().strip("\"'")
+                        elif line.startswith("description:"):
+                            existing_desc = line[12:].strip().strip("\"'")
+            if _skill_name_similar(existing_name, new_name) or _skill_name_similar(existing_desc, desc):
+                # 升级：重写 SKILL.md
+                _write_auto_skill_md(skill_md, new_name, desc, user_message, cleaned_response)
+                logger.info(f"升级已有自动技能目录: {existing_dir.name}")
+                return
+        except Exception:
+            continue
+
+    # 2. 扫描旧 JSON 格式的自动技能（auto_*.json）并迁移
+    for existing_path in settings.SKILLS_DIR.glob("auto_*.json"):
+        try:
+            with open(existing_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            continue
+        if _skill_name_similar(existing.get("name", ""), new_name) or \
+                _skill_name_similar(existing.get("description", ""), desc):
+            # 迁移旧 JSON：转为目录格式，删除旧 JSON
+            old_id = existing.get("id", existing_path.stem)
+            new_dir = settings.SKILLS_DIR / old_id
+            new_dir.mkdir(parents=True, exist_ok=True)
+            skill_md = new_dir / "SKILL.md"
+            _write_auto_skill_md(skill_md, new_name, desc, user_message, cleaned_response)
+            existing_path.unlink(missing_ok=True)
+            logger.info(f"迁移并升级旧 JSON 技能: {old_id}")
+            return
+
+    # 新建目录格式自动技能
+    target_dir = settings.SKILLS_DIR / slug
+    # 避免目录冲突
+    counter = 1
+    while target_dir.exists():
+        target_dir = settings.SKILLS_DIR / f"{slug}_{counter}"
+        counter += 1
+    target_dir.mkdir(parents=True, exist_ok=True)
+    skill_md = target_dir / "SKILL.md"
+    _write_auto_skill_md(skill_md, new_name, desc, user_message, cleaned_response)
+    logger.info(f"生成新自动技能: {target_dir.name}")
+
+
+def _write_auto_skill_md(skill_md_path, name: str, description: str,
+                          user_message: str, assistant_response: str) -> None:
+    """将自动技能写入 SKILL.md 文件（builtin 格式，可编辑）。"""
+    # 截断过长内容
+    content_body = assistant_response.strip()
+    if len(content_body) > 2000:
+        content_body = content_body[:2000] + "\n\n..."
+    skill_content = f"""---
+name: {name}
+description: {description[:120] if len(description) > 120 else description}
+---
+
+# {name}
+
+## 技能概述
+
+此技能由对话自动生成，记录了以下场景的处理方式：
+
+> {user_message[:200] if len(user_message) > 200 else user_message}
+
+## 主要内容
+
+{content_body}
+"""
+    skill_md_path.write_text(skill_content, encoding="utf-8")
 
 
 def _write_skill(skill_id: str, data: dict):
@@ -2408,6 +2423,9 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                     continue
                 if event_type == "error":
                     raise RuntimeError(stream_event.get("error") or "OpenCode 流式调用失败")
+
+            # opencode agent 已经原生处理了所有工具调用（包括 MCP、bash、git 等）。
+            # codebot 只负责展示结果，不再做任何二次工具调用或总结。
 
             if content:
                 await memory_manager.save_message(

@@ -42,6 +42,7 @@ electron/out/
 
 # 数据文件
 data/*.db
+data/*.json
 data/chroma/
 data/chroma_v2/
 data/sandbox/
@@ -77,6 +78,7 @@ security-report*.json
 # 系统文件
 .DS_Store
 Thumbs.db
+/nul
 
 # 临时文件
 tmp/

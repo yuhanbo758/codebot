@@ -29,7 +29,9 @@ class ScheduledTask:
         last_run: datetime = None,
         next_run: datetime = None,
         notify_channels: List[str] = None,
-        created_at: datetime = None
+        created_at: datetime = None,
+        run_once: bool = False,
+        archived: bool = False,
     ):
         self.id = id
         self.name = name
@@ -40,6 +42,8 @@ class ScheduledTask:
         self.next_run = next_run
         self.notify_channels = notify_channels or []
         self.created_at = created_at or datetime.now()
+        self.run_once = run_once
+        self.archived = archived
     
     def calculate_next_run(self) -> datetime:
         """计算下次运行时间"""
@@ -61,7 +65,9 @@ class ScheduledTask:
             "last_run": self.last_run.isoformat() if self.last_run else None,
             "next_run": self.next_run.isoformat() if self.next_run else None,
             "notify_channels": self.notify_channels,
-            "created_at": self.created_at.isoformat() if self.created_at else None
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "run_once": self.run_once,
+            "archived": self.archived,
         }
 
 
@@ -100,9 +106,18 @@ class TaskScheduler:
                 last_run TIMESTAMP,
                 next_run TIMESTAMP,
                 notify_channels TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                run_once BOOLEAN DEFAULT 0,
+                archived BOOLEAN DEFAULT 0
             )
         """)
+
+        # Migration: add run_once and archived columns if they don't exist yet
+        existing_cols = {row[1] for row in cursor.execute("PRAGMA table_info(scheduled_tasks)")}
+        if "run_once" not in existing_cols:
+            cursor.execute("ALTER TABLE scheduled_tasks ADD COLUMN run_once BOOLEAN DEFAULT 0")
+        if "archived" not in existing_cols:
+            cursor.execute("ALTER TABLE scheduled_tasks ADD COLUMN archived BOOLEAN DEFAULT 0")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS task_logs (
@@ -126,6 +141,10 @@ class TaskScheduler:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasks_next_run 
             ON scheduled_tasks(next_run)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tasks_archived
+            ON scheduled_tasks(archived)
         """)
 
         conn.commit()
@@ -153,12 +172,12 @@ class TaskScheduler:
         logger.info("定时任务调度器已停止")
     
     async def _load_tasks(self):
-        """从数据库加载任务（加载所有任务，包括 enabled=0 的禁用任务）"""
+        """从数据库加载任务（加载所有非归档任务，包括 enabled=0 的禁用任务）"""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        # Bug1 修复：加载全部任务，而非仅 enabled=1，避免重启后任务丢失
-        cursor.execute("SELECT * FROM scheduled_tasks")
+        # 只加载未归档的任务到内存，归档任务仅留在数据库供查询
+        cursor.execute("SELECT * FROM scheduled_tasks WHERE archived = 0 OR archived IS NULL")
 
         for row in cursor.fetchall():
             task = ScheduledTask(
@@ -170,12 +189,14 @@ class TaskScheduler:
                 last_run=datetime.fromisoformat(row["last_run"]) if row["last_run"] else None,
                 next_run=datetime.fromisoformat(row["next_run"]) if row["next_run"] else None,
                 notify_channels=json.loads(row["notify_channels"]) if row["notify_channels"] else [],
-                created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None
+                created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
+                run_once=bool(row["run_once"]) if row["run_once"] is not None else False,
+                archived=bool(row["archived"]) if row["archived"] is not None else False,
             )
 
             # Bug4 修复：重启后 next_run 若已过期，重新基于当前时间计算下次执行时间
             # 对于周期性任务（非一次性），过期的 next_run 应推进到未来
-            is_run_once = (task.task_prompt or "").startswith("__RUN_ONCE__")
+            is_run_once = task.run_once or (task.task_prompt or "").startswith("__RUN_ONCE__")
             if task.enabled:
                 if not task.next_run or (not is_run_once and task.next_run < datetime.now()):
                     task.next_run = task.calculate_next_run()
@@ -222,7 +243,7 @@ class TaskScheduler:
           （时间部分已在创建任务时从原始消息中剥离）
         """
         raw_prompt = task.task_prompt or ""
-        run_once = False
+        run_once = task.run_once
         if raw_prompt.startswith("__RUN_ONCE__"):
             run_once = True
             raw_prompt = raw_prompt.split("\n", 1)[1] if "\n" in raw_prompt else ""
@@ -420,8 +441,9 @@ class TaskScheduler:
                 conn.execute(
                     """INSERT OR REPLACE INTO scheduled_tasks 
                        (id, name, cron_expression, task_prompt, enabled, 
-                        last_run, next_run, notify_channels, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        last_run, next_run, notify_channels, created_at,
+                        run_once, archived)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         task.id,
                         task.name,
@@ -431,7 +453,9 @@ class TaskScheduler:
                         task.last_run.isoformat() if task.last_run else None,
                         task.next_run.isoformat() if task.next_run else None,
                         json.dumps(task.notify_channels),
-                        task.created_at.isoformat() if task.created_at else None
+                        task.created_at.isoformat() if task.created_at else None,
+                        task.run_once,
+                        task.archived,
                     )
                 )
                 conn.commit()
@@ -443,7 +467,8 @@ class TaskScheduler:
         name: str,
         cron_expression: str,
         task_prompt: str,
-        notify_channels: List[str] = None
+        notify_channels: List[str] = None,
+        run_once: bool = False,
     ) -> ScheduledTask:
         """创建新任务"""
         task = ScheduledTask(
@@ -452,7 +477,9 @@ class TaskScheduler:
             cron_expression=cron_expression,
             task_prompt=task_prompt,
             enabled=True,
-            notify_channels=notify_channels or []
+            notify_channels=notify_channels or [],
+            run_once=run_once,
+            archived=False,
         )
         
         # 计算下次运行时间
@@ -507,8 +534,65 @@ class TaskScheduler:
         return self.tasks.get(task_id)
     
     def list_tasks(self) -> List[ScheduledTask]:
-        """列出所有任务"""
+        """列出所有未归档任务"""
         return list(self.tasks.values())
+
+    def archive_task(self, task_id: str) -> bool:
+        """归档任务：标记 archived=True、disabled，从内存列表移除，保留在数据库"""
+        task = self.tasks.get(task_id)
+        if not task:
+            # 可能已不在内存（已禁用），直接从数据库操作
+            with self._db_lock:
+                conn = self._get_conn()
+                try:
+                    rows = conn.execute(
+                        "SELECT id FROM scheduled_tasks WHERE id = ?", (task_id,)
+                    ).fetchone()
+                    if not rows:
+                        return False
+                    conn.execute(
+                        "UPDATE scheduled_tasks SET archived = 1, enabled = 0 WHERE id = ?",
+                        (task_id,)
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+            return True
+
+        task.archived = True
+        task.enabled = False
+        self._save_task(task)
+        del self.tasks[task_id]
+        logger.info(f"归档定时任务：{task_id}")
+        return True
+
+    def list_archived_tasks(self) -> List[dict]:
+        """从数据库读取已归档任务列表"""
+        with self._db_lock:
+            conn = self._get_conn()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM scheduled_tasks WHERE archived = 1"
+                ).fetchall()
+                result = []
+                for row in rows:
+                    t = ScheduledTask(
+                        id=row["id"],
+                        name=row["name"],
+                        cron_expression=row["cron_expression"],
+                        task_prompt=row["task_prompt"],
+                        enabled=bool(row["enabled"]),
+                        last_run=datetime.fromisoformat(row["last_run"]) if row["last_run"] else None,
+                        next_run=datetime.fromisoformat(row["next_run"]) if row["next_run"] else None,
+                        notify_channels=json.loads(row["notify_channels"]) if row["notify_channels"] else [],
+                        created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
+                        run_once=bool(row["run_once"]) if row["run_once"] is not None else False,
+                        archived=True,
+                    )
+                    result.append(t.to_dict())
+                return result
+            finally:
+                conn.close()
     
     async def run_task_now(self, task_id: str) -> bool:
         """立即执行任务"""

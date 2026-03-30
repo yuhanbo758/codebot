@@ -5,7 +5,7 @@
     <div class="mcp-header">
       <div class="header-left">
         <h2 class="page-title">MCP 服务器</h2>
-        <span class="page-subtitle">通过 Model Context Protocol 为 AI 扩展工具能力</span>
+        <span class="page-subtitle">管理外部 MCP 服务器，并通过 Codebot bridge 暴露给 OpenCode。</span>
       </div>
       <div class="header-right">
         <el-input
@@ -16,6 +16,18 @@
         >
           <template #prefix><el-icon><Search /></el-icon></template>
         </el-input>
+        <el-tooltip v-if="ocSyncStatus" :content="ocSyncTooltip" placement="bottom">
+          <el-button
+            :type="ocSyncStatus.in_sync ? 'success' : 'warning'"
+            plain
+            size="default"
+            @click="syncToOpencode"
+            :loading="ocSyncing"
+          >
+            <el-icon><Refresh /></el-icon>
+            {{ ocSyncButtonLabel }}
+          </el-button>
+        </el-tooltip>
         <el-button type="primary" @click="openAddDialog">
           <el-icon><Plus /></el-icon>
           添加服务器
@@ -25,6 +37,25 @@
 
     <!-- 主体内容 -->
     <div class="mcp-body">
+      <div v-if="codebotStatus" class="codebot-bridge-card">
+        <div class="bridge-title">Codebot Bridge</div>
+        <div class="bridge-desc">OpenCode 会通过下面的 SSE 入口调用 Codebot 暴露的记忆、任务、技能与外部 MCP 代理工具。</div>
+        <div class="bridge-meta">{{ codebotStatus.sse_url }}</div>
+        <div class="bridge-actions">
+          <el-tag size="small" :type="codebotStatus.opencode_connected ? 'success' : 'info'">
+            {{ codebotStatus.opencode_connected ? 'OpenCode 在线' : 'OpenCode 未连接' }}
+          </el-tag>
+          <el-tag size="small" :type="codebotStatus.bridge_status?.registered ? 'success' : 'warning'">
+            {{ codebotStatus.bridge_status?.registered ? 'Bridge 已注册' : 'Bridge 未注册' }}
+          </el-tag>
+          <el-tag size="small" type="info">
+            {{ `技能 ${codebotStatus.synced_skill_count || 0}/${codebotStatus.builtin_skill_count || 0} 已同步` }}
+          </el-tag>
+          <el-button size="small" type="primary" plain @click="registerCodebotBridge" :loading="registeringCodebotBridge">
+            写入 OpenCode 配置
+          </el-button>
+        </div>
+      </div>
 
       <!-- ModelScope MCP Hub 卡片 -->
       <div class="ms-card" :class="{ 'ms-card--no-key': !msApiKey }">
@@ -55,29 +86,15 @@
         <!-- 已配置 key -->
         <div v-else class="ms-add-body">
           <div class="ms-input-row">
-            <el-input
-              v-model="msServiceName"
-              placeholder="服务名称，例如：mcp-server-time"
-              clearable
-              @keyup.enter="addMsServer"
-              class="ms-svc-input"
-            >
-              <template #prefix><el-icon style="color:#909399"><Connection /></el-icon></template>
-            </el-input>
-            <el-input
-              v-model="msDisplayName"
-              placeholder="显示名称（可选）"
-              clearable
-              class="ms-name-input"
-            />
-            <el-button type="primary" @click="addMsServer" :loading="msAdding" class="ms-add-btn">
-              <el-icon><Plus /></el-icon> 添加
+            <el-button type="primary" @click="openMsHubDialog" :loading="msHubLoading">
+              <el-icon><Download /></el-icon>
+              浏览并导入服务
             </el-button>
+            <span class="ms-hint">从 ModelScope MCP Hub 一键导入，API Key 将自动注入</span>
           </div>
           <div class="ms-hint">
-            服务 slug 即 Hub 上的服务标识，API Key 将自动注入。
             <a href="https://www.modelscope.cn/mcp" target="_blank" class="link">
-              浏览全部可用服务 <el-icon style="font-size:11px;vertical-align:-1px"><TopRight /></el-icon>
+              在浏览器中查看全部服务 <el-icon style="font-size:11px;vertical-align:-1px"><TopRight /></el-icon>
             </a>
           </div>
         </div>
@@ -148,6 +165,18 @@
           <div class="col-actions">
             <el-button
               size="small"
+              type="success"
+              plain
+              @click="testServer(server)"
+              class="action-test"
+              :loading="server._testing"
+              title="测试连接"
+            >
+              <el-icon v-if="!server._testing"><Connection /></el-icon>
+              测试
+            </el-button>
+            <el-button
+              size="small"
               type="primary"
               plain
               @click="openEditDialog(server)"
@@ -155,7 +184,7 @@
             >
               <el-icon><Edit /></el-icon>
             </el-button>
-            <el-dropdown trigger="click" @command="(cmd) => handleRowAction(cmd, server)">
+              <el-dropdown trigger="click" @command="(cmd) => handleRowAction(cmd, server)">
               <el-button size="small" class="action-more">
                 <el-icon><MoreFilled /></el-icon>
               </el-button>
@@ -185,9 +214,122 @@
             中说"添加 MCP 服务器，命令=npx ..."
           </div>
         </div>
+  </div>
+
+  <!-- 测试结果对话框 -->
+  <el-dialog
+    v-model="showTestDialog"
+    title="MCP 连接测试"
+    width="520px"
+    :close-on-click-modal="true"
+  >
+    <div v-if="testResult" class="test-result">
+      <div class="test-status" :class="testResult.success === true ? 'test-ok' : testResult.success === null ? 'test-warn' : 'test-fail'">
+        <el-icon class="test-status-icon">
+          <component :is="testResult.success === true ? 'CircleCheck' : testResult.success === null ? 'InfoFilled' : 'CircleClose'" />
+        </el-icon>
+        <span class="test-status-text">{{ testResult.message }}</span>
+      </div>
+      <div v-if="testResult.tools && testResult.tools.length > 0" class="test-tools">
+        <div class="test-tools-title">可用工具（{{ testResult.tools.length }} 个）：</div>
+        <div class="test-tools-list">
+          <el-tag
+            v-for="tool in testResult.tools"
+            :key="tool"
+            size="small"
+            class="test-tool-tag"
+          >{{ tool }}</el-tag>
+        </div>
+      </div>
+    </div>
+    <template #footer>
+      <el-button @click="showTestDialog = false">关闭</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- ModelScope Hub 导入对话框 -->
+  <el-dialog
+    v-model="showMsHubDialog"
+    title="从 ModelScope MCP Hub 导入服务"
+    width="740px"
+    :close-on-click-modal="true"
+  >
+    <div class="ms-hub-dialog">
+      <!-- 搜索栏 -->
+      <div class="ms-hub-toolbar">
+        <el-input
+          v-model="msHubSearch"
+          placeholder="搜索服务名称或描述..."
+          clearable
+          class="ms-hub-search"
+        >
+          <template #prefix><el-icon><Search /></el-icon></template>
+        </el-input>
+        <el-button @click="loadMsHubServices" :loading="msHubLoading" size="small">
+          <el-icon><Refresh /></el-icon>
+          刷新
+        </el-button>
       </div>
 
+      <!-- 加载中 -->
+      <div v-if="msHubLoading" class="ms-hub-loading">
+        <el-icon class="is-loading" style="font-size:28px;color:#409eff"><Loading /></el-icon>
+        <span>正在获取服务列表...</span>
+      </div>
+
+      <!-- 错误 -->
+      <div v-else-if="msHubError" class="ms-hub-error">
+        <el-icon style="font-size:20px;color:#f56c6c"><CircleClose /></el-icon>
+        <span>{{ msHubError }}</span>
+      </div>
+
+      <!-- 服务列表 -->
+      <div v-else class="ms-hub-list">
+        <div v-if="filteredMsServices.length === 0" class="ms-hub-empty">
+          暂无匹配的服务
+        </div>
+        <div
+          v-for="svc in filteredMsServices"
+          :key="svc.id"
+          class="ms-hub-row"
+        >
+          <div class="ms-hub-info">
+            <div class="ms-hub-name">{{ svc.chinese_name || svc.name }}</div>
+            <div class="ms-hub-id">{{ svc.name }}</div>
+            <div class="ms-hub-desc" :title="svc.description">{{ svc.description || '—' }}</div>
+          </div>
+          <div class="ms-hub-actions">
+            <el-tag
+              v-if="isAlreadyImported(svc)"
+              size="small"
+              type="success"
+            >已导入</el-tag>
+            <el-button
+              v-else
+              size="small"
+              type="primary"
+              @click="importMsService(svc)"
+              :loading="svc._importing"
+            >
+              <el-icon><Download /></el-icon>
+              导入
+            </el-button>
+          </div>
+        </div>
+      </div>
     </div>
+
+    <template #footer>
+      <div style="display:flex;align-items:center;justify-content:space-between;width:100%">
+        <span style="font-size:12px;color:#909399">
+          共 {{ msHubServices.length }} 个可用服务，Token 将自动注入到每个服务的环境变量
+        </span>
+        <el-button @click="showMsHubDialog = false">关闭</el-button>
+      </div>
+    </template>
+  </el-dialog>
+
+</div>
 
     <!-- 添加/编辑对话框 -->
     <el-dialog
@@ -271,7 +413,8 @@ import { ref, computed, onMounted, reactive } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   Search, Plus, Link, Delete, QuestionFilled, Warning,
-  Connection, TopRight, Edit, MoreFilled
+  Connection, TopRight, Edit, MoreFilled, CircleCheck, CircleClose, InfoFilled,
+  Download, Refresh, Loading
 } from '@element-plus/icons-vue'
 import axios from 'axios'
 
@@ -283,14 +426,26 @@ const searchQuery = ref('')
 
 // ModelScope
 const msApiKey = ref('')
-const msServiceName = ref('')
-const msDisplayName = ref('')
-const msAdding = ref(false)
+const msHubLoading = ref(false)
+const msHubError = ref('')
+const msHubServices = ref([])
+const msHubSearch = ref('')
+const showMsHubDialog = ref(false)
+
+// OpenCode sync
+const ocSyncStatus = ref(null)
+const ocSyncing = ref(false)
+const codebotStatus = ref(null)
+const registeringCodebotBridge = ref(false)
 
 // 对话框
 const showDialog = ref(false)
 const editingServer = ref(null)
 const formRef = ref(null)
+
+// 测试对话框
+const showTestDialog = ref(false)
+const testResult = ref(null)
 
 // ── 表单 ──────────────────────────────────────────────────────────────────
 const defaultForm = () => ({
@@ -328,17 +483,28 @@ const filteredServers = computed(() => {
   )
 })
 
+const ocSyncButtonLabel = computed(() => {
+  if (!ocSyncStatus.value) return '同步到 OpenCode'
+  if (ocSyncStatus.value.in_sync) return 'OpenCode 已接管'
+  const directCount = ocSyncStatus.value.direct_entries_in_opencode?.length || 0
+  if (!ocSyncStatus.value.bridge_registered) return '注册 Codebot Bridge'
+  if (directCount > 0) return `清理直连项 (${directCount})`
+  return '同步到 OpenCode'
+})
+
 // ── 加载 ──────────────────────────────────────────────────────────────────
 const loadServers = async () => {
   loading.value = true
   try {
     const res = await axios.get('/api/mcp')
-    servers.value = (res.data.data.items || []).map(s => ({ ...s, _toggling: false, _deleting: false }))
+    servers.value = (res.data.data.items || []).map(s => ({ ...s, _toggling: false, _deleting: false, _testing: false }))
   } catch {
     ElMessage.error('加载 MCP 服务器列表失败')
   } finally {
     loading.value = false
   }
+  // 顺便刷新 opencode 同步状态
+  loadOcSyncStatus()
 }
 
 const loadMsApiKey = async () => {
@@ -350,30 +516,120 @@ const loadMsApiKey = async () => {
   }
 }
 
-// ── ModelScope ────────────────────────────────────────────────────────────
-const addMsServer = async () => {
-  const svc = msServiceName.value.trim()
-  if (!svc) { ElMessage.warning('请输入服务名称'); return }
-  msAdding.value = true
+// ── ModelScope Hub ────────────────────────────────────────────────────────
+const filteredMsServices = computed(() => {
+  const q = msHubSearch.value.trim().toLowerCase()
+  if (!q) return msHubServices.value
+  return msHubServices.value.filter(s =>
+    (s.name || '').toLowerCase().includes(q) ||
+    (s.chinese_name || '').toLowerCase().includes(q) ||
+    (s.description || '').toLowerCase().includes(q)
+  )
+})
+
+const isAlreadyImported = (svc) =>
+  servers.value.some(s => s.url === svc.url || s.service_id === svc.id)
+
+const loadMsHubServices = async () => {
+  msHubLoading.value = true
+  msHubError.value = ''
   try {
-    const url = `https://mcp.api-inference.modelscope.cn/sse/${svc}`
-    const name = msDisplayName.value.trim() || svc
-    await axios.post('/api/mcp', {
-      name,
-      description: `ModelScope MCP: ${svc}`,
-      transport: 'sse',
-      url,
-      env: { MODELSCOPE_API_KEY: msApiKey.value },
-      enabled: true,
-    })
-    ElMessage.success(`ModelScope MCP「${name}」已添加`)
-    msServiceName.value = ''
-    msDisplayName.value = ''
-    await loadServers()
+    const res = await axios.get('/api/mcp/modelscope/services')
+    msHubServices.value = (res.data?.data?.services || []).map(s => ({ ...s, _importing: false }))
   } catch (err) {
-    ElMessage.error(err?.response?.data?.detail || '添加失败')
+    msHubError.value = err?.response?.data?.detail || '获取服务列表失败，请检查 API Key 是否有效'
   } finally {
-    msAdding.value = false
+    msHubLoading.value = false
+  }
+}
+
+const openMsHubDialog = async () => {
+  showMsHubDialog.value = true
+  if (msHubServices.value.length === 0) {
+    await loadMsHubServices()
+  }
+}
+
+const importMsService = async (svc) => {
+  svc._importing = true
+  try {
+    const res = await axios.post('/api/mcp/modelscope/import', {
+      name: svc.chinese_name || svc.name,
+      service_id: svc.id,
+      url: svc.url,
+      description: svc.description || `ModelScope MCP: ${svc.name}`,
+    })
+    if (res.data.success) {
+      ElMessage.success(`「${svc.chinese_name || svc.name}」已成功导入`)
+      await loadServers()
+    } else {
+      ElMessage.warning(res.data.message || '导入失败')
+    }
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.detail || '导入失败')
+  } finally {
+    svc._importing = false
+  }
+}
+
+// ── OpenCode CLI 同步 ─────────────────────────────────────────────────────
+const ocSyncTooltip = computed(() => {
+  if (!ocSyncStatus.value) return ''
+  const { in_sync, bridge_registered, direct_entries_in_opencode, opencode_config_path } = ocSyncStatus.value
+  if (in_sync) return `OpenCode 当前仅保留 codebot bridge\n路径: ${opencode_config_path}`
+  if (!bridge_registered) return '当前尚未将 codebot bridge 写入 OpenCode 配置'
+  const names = (direct_entries_in_opencode || []).map(s => s.name).join(', ')
+  return names
+    ? `OpenCode 配置中仍存在以下直连 MCP 条目，建议切换为由 Codebot 统一代理：\n${names}`
+    : '重新写入 Codebot bridge 到 OpenCode 配置'
+})
+
+const loadOcSyncStatus = async () => {
+  try {
+    const res = await axios.get('/api/mcp/opencode/sync-status')
+    const data = res.data?.data
+    if (data?.has_opencode) {
+      ocSyncStatus.value = data
+    } else {
+      ocSyncStatus.value = null  // opencode 未安装，不显示按钮
+    }
+  } catch {
+    ocSyncStatus.value = null
+  }
+}
+
+const loadCodebotStatus = async () => {
+  try {
+    const res = await axios.get('/api/mcp/codebot/status')
+    codebotStatus.value = res.data?.data ?? null
+  } catch {
+    codebotStatus.value = null
+  }
+}
+
+const syncToOpencode = async () => {
+  ocSyncing.value = true
+  try {
+    const res = await axios.post('/api/mcp/opencode/sync')
+    ElMessage.success(res.data?.message || '同步成功')
+    await loadOcSyncStatus()
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.detail || '同步失败')
+  } finally {
+    ocSyncing.value = false
+  }
+}
+
+const registerCodebotBridge = async () => {
+  registeringCodebotBridge.value = true
+  try {
+    const res = await axios.post('/api/mcp/codebot/register')
+    ElMessage.success(res.data?.message || '写入成功')
+    await Promise.all([loadCodebotStatus(), loadOcSyncStatus(), loadServers()])
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.detail || '写入失败')
+  } finally {
+    registeringCodebotBridge.value = false
   }
 }
 
@@ -481,9 +737,31 @@ const deleteServer = async (server) => {
 const addEnvPair = () => envPairs.value.push({ key: '', value: '' })
 const removeEnvPair = (idx) => envPairs.value.splice(idx, 1)
 
+// ── 测试 MCP 连接 ──────────────────────────────────────────────────────────
+const testServer = async (server) => {
+  server._testing = true
+  testResult.value = null
+  try {
+    const res = await axios.post(`/api/mcp/${server.id}/test`)
+    testResult.value = res.data
+    showTestDialog.value = true
+  } catch (err) {
+    testResult.value = {
+      success: false,
+      message: err?.response?.data?.detail || err?.response?.data?.message || '测试请求失败',
+      tools: []
+    }
+    showTestDialog.value = true
+  } finally {
+    server._testing = false
+  }
+}
+
 onMounted(() => {
   loadServers()
   loadMsApiKey()
+  loadOcSyncStatus()
+  loadCodebotStatus()
 })
 </script>
 
@@ -548,6 +826,39 @@ onMounted(() => {
   flex-direction: column;
   gap: 16px;
   min-height: 0;
+}
+
+.codebot-bridge-card {
+  background: linear-gradient(135deg, #f4f8ff 0%, #f8fbff 100%);
+  border: 1px solid #d9e6ff;
+  border-radius: 14px;
+  padding: 16px 18px;
+}
+
+.bridge-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #1f2d3d;
+}
+
+.bridge-desc {
+  margin-top: 6px;
+  font-size: 13px;
+  color: #5f6b7a;
+}
+
+.bridge-meta {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #409eff;
+  word-break: break-all;
+}
+
+.bridge-actions {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 /* ── ModelScope 卡片 ──────────────────────────────────────────────────── */
@@ -713,9 +1024,9 @@ onMounted(() => {
 .col-name    { width: 160px; flex-shrink: 0; padding-right: 12px; }
 .col-desc    { flex: 1; min-width: 0; padding-right: 12px; }
 .col-type    { width: 70px; flex-shrink: 0; padding-right: 12px; }
-.col-cmd     { width: 260px; flex-shrink: 0; padding-right: 12px; min-width: 0; overflow: hidden; }
+.col-cmd     { width: 220px; flex-shrink: 0; padding-right: 12px; min-width: 0; overflow: hidden; }
 .col-status  { width: 70px; flex-shrink: 0; padding-right: 12px; }
-.col-actions { width: 80px; flex-shrink: 0; display: flex; gap: 6px; justify-content: flex-end; }
+.col-actions { width: 130px; flex-shrink: 0; display: flex; gap: 6px; justify-content: flex-end; align-items: center; }
 
 .server-name {
   font-size: 13px;
@@ -776,12 +1087,79 @@ onMounted(() => {
 
 /* 操作按钮 */
 .action-edit,
-.action-more {
+.action-more,
+.action-test {
   padding: 5px 8px;
   border-color: #e4e7ed;
 }
 .action-edit:hover { border-color: #409eff; color: #409eff; }
+.action-test { font-size: 12px; }
+.action-test:hover { border-color: #67c23a; color: #67c23a; }
 .action-more:hover { border-color: #c0c4cc; background: #f5f7fa; }
+
+/* ── 测试结果 ────────────────────────────────────────────────────────── */
+.test-result {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.test-status {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 8px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.test-ok {
+  background: #f0f9eb;
+  color: #67c23a;
+  border: 1px solid #b3e19d;
+}
+
+.test-fail {
+  background: #fef0f0;
+  color: #f56c6c;
+  border: 1px solid #fbc4c4;
+}
+
+.test-warn {
+  background: #fdf6ec;
+  color: #e6a23c;
+  border: 1px solid #f5dab1;
+}
+
+.test-status-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.test-status-text {
+  flex: 1;
+  word-break: break-all;
+}
+
+.test-tools-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #303133;
+  margin-bottom: 8px;
+}
+
+.test-tools-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.test-tool-tag {
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 12px;
+}
 
 /* ── 空状态 ──────────────────────────────────────────────────────────── */
 .empty-state {
@@ -847,4 +1225,102 @@ onMounted(() => {
   text-decoration: none;
 }
 .link:hover { text-decoration: underline; }
+
+/* ── ModelScope Hub 对话框 ───────────────────────────────────────────── */
+.ms-hub-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 520px;
+}
+
+.ms-hub-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ms-hub-search {
+  flex: 1;
+}
+
+.ms-hub-loading,
+.ms-hub-error,
+.ms-hub-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 40px 20px;
+  color: #909399;
+  font-size: 14px;
+}
+
+.ms-hub-error {
+  color: #f56c6c;
+}
+
+.ms-hub-list {
+  overflow-y: auto;
+  max-height: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+}
+
+.ms-hub-row {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  gap: 12px;
+  border-bottom: 1px solid #f2f4f7;
+  transition: background 0.15s;
+}
+
+.ms-hub-row:last-child {
+  border-bottom: none;
+}
+
+.ms-hub-row:hover {
+  background: #fafbff;
+}
+
+.ms-hub-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.ms-hub-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: #303133;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ms-hub-id {
+  font-size: 11px;
+  color: #909399;
+  font-family: 'Consolas', 'Monaco', monospace;
+  margin-top: 1px;
+}
+
+.ms-hub-desc {
+  font-size: 12px;
+  color: #606266;
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ms-hub-actions {
+  flex-shrink: 0;
+  width: 80px;
+  display: flex;
+  justify-content: flex-end;
+}
 </style>

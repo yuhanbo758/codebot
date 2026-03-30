@@ -1,12 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
-import MemoryView from '@/views/Memory.vue'
-import ActiveMemoriesView from '@/components/ActiveMemories.vue'
-import MemorySearchView from '@/components/MemorySearch.vue'
-import ArchivedMemoriesView from '@/components/ArchivedMemories.vue'
-import BackupRestoreView from '@/components/BackupRestore.vue'
-import MemoryConfigView from '@/components/MemoryConfig.vue'
-
 const routes = [
   {
     path: '/',
@@ -20,7 +13,7 @@ const routes = [
   {
     path: '/memory',
     name: 'Memory',
-    component: MemoryView,
+    component: () => import('@/views/Memory.vue'),
     children: [
       {
         path: '',
@@ -29,27 +22,27 @@ const routes = [
       {
         path: 'active',
         name: 'ActiveMemories',
-        component: ActiveMemoriesView
+        component: () => import('@/components/ActiveMemories.vue')
       },
       {
         path: 'search',
         name: 'MemorySearch',
-        component: MemorySearchView
+        component: () => import('@/components/MemorySearch.vue')
       },
       {
         path: 'archived',
         name: 'ArchivedMemories',
-        component: ArchivedMemoriesView
+        component: () => import('@/components/ArchivedMemories.vue')
       },
       {
         path: 'backup',
         name: 'MemoryBackup',
-        component: BackupRestoreView
+        component: () => import('@/components/BackupRestore.vue')
       },
       {
         path: 'config',
         name: 'MemoryConfig',
-        component: MemoryConfigView
+        component: () => import('@/components/MemoryConfig.vue')
       }
     ]
   },

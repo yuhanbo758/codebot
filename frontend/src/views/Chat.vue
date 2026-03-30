@@ -86,6 +86,17 @@
       <!-- 主聊天区域 -->
       <el-main>
         <div class="chat-main" v-if="currentConversationId">
+          <div v-if="thirdPartyStatus" class="third-party-banner">
+            <el-tag size="small" :type="thirdPartyStatus.opencode_connected ? 'success' : 'info'">
+              {{ thirdPartyStatus.opencode_connected ? 'OpenCode 已连接' : 'OpenCode 未连接' }}
+            </el-tag>
+            <el-tag size="small" :type="thirdPartyStatus.bridge_status?.registered ? 'success' : 'warning'">
+              {{ thirdPartyStatus.bridge_status?.registered ? 'Bridge 已注册' : 'Bridge 待注册' }}
+            </el-tag>
+            <el-tag size="small" type="info">
+              代理 {{ thirdPartyStatus.proxied_server_count || 0 }} 个 MCP
+            </el-tag>
+          </div>
           <!-- 消息列表 -->
           <div class="message-list" ref="messageListRef" @scroll.passive="onMessageListScroll">
             <template v-for="msg in messages" :key="msg.id">
@@ -498,6 +509,7 @@ let queueStatusTimer = null
 const shouldAutoScroll = ref(true)
 const nowTick = ref(Date.now())
 let timeRefreshTimer = null
+const thirdPartyStatus = ref(null)
 
 // ── 附件管理 ─────────────────────────────────────────────────────────────────
 const attachedFiles = ref([])  // [{name, type, content, is_text}]
@@ -1159,6 +1171,15 @@ const loadModels = async () => {
   }
 }
 
+const loadThirdPartyStatus = async () => {
+  try {
+    const response = await axios.get('/api/mcp/codebot/status')
+    thirdPartyStatus.value = response.data?.data ?? null
+  } catch {
+    thirdPartyStatus.value = null
+  }
+}
+
 // 创建新对话
 const createNewConversation = async () => {
   try {
@@ -1626,6 +1647,7 @@ onMounted(() => {
   loadConversations(true)
   loadModels()
   loadCommands()
+  loadThirdPartyStatus()
   queueStatusTimer = setInterval(() => {
     if (currentConversationId.value) {
       fetchQueueStatus(currentConversationId.value, { reloadOnFinish: true })
@@ -1777,6 +1799,17 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   height: 100%;
+}
+
+.third-party-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: #f4f8ff;
+  border-bottom: 1px solid #e4ecff;
+  color: #3f5873;
+  font-size: 13px;
 }
 
 .message-list {
