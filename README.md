@@ -28,7 +28,7 @@
 - Python 3.11+
 - Node.js 18+
 - OpenCode CLI
-  - `opencode serve` 默认端口 4096（<http://127.0.0.1:4096）>
+  - `opencode serve` 建议监听 `http://127.0.0.1:11200`
 ### 安装
 
 #### Windows
@@ -57,10 +57,10 @@ chmod +x scripts/install.sh
 opencode serve
 
 # 或指定端口与监听地址（推荐）
-opencode serve --port 4096 --hostname 127.0.0.1
+opencode serve --port 11200 --hostname 127.0.0.1
 ```
 
-应用程序配置文件（设置 → 通用设置 → 配置文件 → `config.json`）里的 `server_url` 需要与 `opencode serve` 保持一致（端口/地址一致）。如果连不上，请优先检查该配置项。桌面端启动后端时会自动尝试拉起 OpenCode 服务，端口优先级为 `127.0.0.1:1120` → 配置端口 → `127.0.0.1:4096`。若 `1120` 被其他进程占用，会直接回退到后续候选端口，不会改用 `1121/1122` 这类随机端口。这样可优先为 Codebot 单独使用 1120，不干扰已有的 `4096` 服务。
+应用程序配置文件（设置 → 通用设置 → 配置文件 → `config.json`）里的 `server_url` 需要与 `opencode serve` 保持一致（端口/地址一致）。如果连不上，请优先检查该配置项。桌面端启动后端时会自动尝试拉起 OpenCode 服务，默认优先级为 `127.0.0.1:11200` → 配置文件中的 `server_url` 端口 → `127.0.0.1:11201`。如需覆盖默认值，可设置环境变量 `CODEBOT_OPENCODE_PREFERRED_PORT` 与 `CODEBOT_OPENCODE_FALLBACK_PORT`。
 启动后，Codebot 会自动把以下内容同步到 OpenCode：
 
 - Codebot 自身的第三方 MCP 入口：`/api/mcp/codebot/sse`
@@ -96,7 +96,7 @@ opencode serve --port 4096 --hostname 127.0.0.1
 
 - 新建 → 操作选择“启动程序”
 - 程序/脚本填：`C:\Users\Administrator\Scripts\opencode.cmd`（根据你的实际路径；可打开 cmd 运行 `where opencode` 查找位置）
-- 添加参数填：`serve --port 4096 --hostname 127.0.0.1`
+- 添加参数填：`serve --port 11200 --hostname 127.0.0.1`
 - 起始位置填：`C:\Users\Administrator` 或你的工作目录
 
 条件 / 设置：
@@ -128,12 +128,12 @@ npm start
 ```
 
 开发模式下（从源码运行），Electron 默认使用 `venv\\Scripts\\python.exe`（若存在）启动 `backend\\main.py`，以确保后端代码变更立即生效；如需强制使用 `backend\\dist\\codebot-backend.exe`，可设置环境变量 `CODEBOT_BACKEND_MODE=exe`。
-Electron 会优先使用应用内置的 `opencode` 可执行文件（`electron/vendor/opencode` 或打包后的 `resources/opencode`）自动拉起 `opencode serve`；若内置文件不可用或不可执行，会自动回退到系统 PATH 中的 `opencode`。桌面端会强制开启 OpenCode 自动拉起，并优先尝试 1120（回退配置端口与 4096）。
+Electron 会优先使用应用内置的 `opencode` 可执行文件（`electron/vendor/opencode` 或打包后的 `resources/opencode`）自动拉起 `opencode serve`；若内置文件不可用或不可执行，会自动回退到系统 PATH 中的 `opencode`。桌面端会强制开启 OpenCode 自动拉起，并优先尝试 11200（随后回退到配置端口与 11201）。
 
 ### Windows 沙箱现状
 
 - 沙箱已重构为**工作目录隔离**模式，移除 QEMU 依赖，开箱即用，无需安装任何额外软件
-- AI 生成的代码在独立的 `data/sandbox/workspace/` 目录中执行，通过 `asyncio` 子进程运行，带超时控制
+- AI 生成的代码默认在独立的 `data/sandbox_workspace/` 目录中执行；如设置了 `sandbox.workspace_dir`，则改用自定义目录，通过 `asyncio` 子进程运行，带超时控制
 - 执行结果实时返回，支持 `stdout`/`stderr`/`exit_code` 完整输出
 - 旧版 QEMU 相关端点（`/install-qemu`、`/start`、`/stop`）保留但返回本地模式说明，保持 API 向后兼容
 
@@ -143,8 +143,8 @@ Electron 会优先使用应用内置的 `opencode` 可执行文件（`electron/v
 - **局域网访问**: http\://<你的 IP>:8080
 - **移动端**: 使用手机浏览器访问局域网地址
 
-OpenCode Server 默认地址：<http://127.0.0.1:4096（由> `opencode serve` 提供 OpenAPI）
-`server_url` 建议填写 OpenCode Server 的 HTTP 地址（例如 `http://127.0.0.1:4096`），后端会自动规范化为可访问的 HTTP 基础地址。连不上的话请优先检查 `config.json` 的 `server_url` 是否与 `opencode serve` 一致。
+OpenCode Server 默认地址：<http://127.0.0.1:11200>（由 `opencode serve` 提供 HTTP API）
+`server_url` 建议填写 OpenCode Server 的 HTTP 地址（例如 `http://127.0.0.1:11200`），后端会自动规范化为可访问的 HTTP 基础地址。连不上的话请优先检查 `config.json` 的 `server_url` 是否与 `opencode serve` 一致。
 如果 OpenCode 未连接，不会在应用启动时弹窗打扰；当你在聊天中创建定时任务/保存记忆时，会优先使用本地规则解析并直接落库到“定时任务/记忆”，仅在解析失败且 OpenCode 可用时，才会通过 OpenCode HTTP API 请求获取结构化结果。意图识别阶段要求 OpenCode 输出结构化 JSON，若输出不符合格式会自动重试一次。后端会将 OpenCode Server 输出写入 `logs/opencode_server.*.log` 便于排查。
 提醒类定时任务在 OpenCode 未连接时也会按计划执行并发送应用内通知；创建任务也不依赖 OpenCode（支持 `20:05` 与 `20：05`）。
 
@@ -446,7 +446,10 @@ codebot/
 
 ### 日志配置
 
-- 日志保留天数：默认 30 天（0=永久）
+- 任务日志保留天数：默认 30 天（0=永久）
+- 聊天日志保留天数：默认 30 天（0=永久）
+- 系统日志保留天数：默认 7 天
+- 日志级别：支持 `DEBUG` / `INFO` / `WARNING` / `ERROR`
 - 可手动清理旧日志
 
 ### 开源前隐私检查
@@ -534,12 +537,19 @@ npm run build
 ### 记忆 API
 
 - `GET /api/memory/memories` - 获取记忆列表（支持 `category` 参数按类别过滤）
+- `GET /api/memory/memories/archived` - 获取归档记忆列表
+- `GET /api/memory/storage-status` - 获取记忆存储诊断信息
 - `POST /api/memory/memories` - 创建记忆
 - `GET /api/memory/memories/search` - 搜索记忆
+- `POST /api/memory/memories/{memory_id}/archive` - 归档记忆
+- `POST /api/memory/memories/{memory_id}/restore` - 恢复归档记忆
+- `DELETE /api/memory/memories/{memory_id}` - 删除记忆
 - `GET /api/memory/hints` - 根据当前输入返回相关记忆提示（供前端实时展示）
 - `POST /api/memory/export` - 导出记忆为 ZIP 文件（保存至服务端 `data/backups/`）
 - `POST /api/memory/import` - 上传 ZIP 备份文件并恢复（multipart/form-data）
 - `POST /api/memory/cleanup` - 手动触发清理（支持 `cleanup_archived_memories` 参数）
+- `GET /api/memory/config` - 获取记忆配置
+- `PUT /api/memory/config` - 更新记忆配置
 - `POST /api/memory/organize` - 手动触发记忆整理（后台异步执行）
 - `GET /api/memory/organize/status` - 查询整理任务状态及上次运行时间
 
@@ -547,40 +557,81 @@ npm run build
 
 - `GET /api/scheduler/tasks` - 获取任务列表
 - `POST /api/scheduler/tasks` - 创建任务
+- `GET /api/scheduler/tasks/archived` - 获取已归档任务
+- `GET /api/scheduler/tasks/{task_id}` - 获取任务详情
 - `PUT /api/scheduler/tasks/{id}` - 更新任务
 - `DELETE /api/scheduler/tasks/{id}` - 删除任务
+- `POST /api/scheduler/tasks/{task_id}/run` - 立即执行任务
+- `POST /api/scheduler/tasks/{task_id}/archive` - 归档任务
 - `POST /api/scheduler/ai-generate` - AI 生成 Cron 表达式
 
 ### 技能 API
 
 - `GET /api/skills` - 获取技能列表
 - `POST /api/skills` - 创建技能
-- `DELETE /api/skills/{name}` - 删除技能
+- `PATCH /api/skills/{skill_id}` - 更新技能元数据
+- `DELETE /api/skills/{skill_id}` - 删除技能
+- `GET /api/skills/{skill_id}/content` - 读取 SKILL.md 内容
+- `PUT /api/skills/{skill_id}/content` - 更新 SKILL.md 内容
+- `POST /api/skills/generate` - 从对话生成技能
+- `POST /api/skills/sync-to-opencode` - 批量同步技能到 OpenCode
+- `POST /api/skills/{skill_id}/sync-to-opencode` - 同步单个技能到 OpenCode
+- `GET /api/skills/opencode-sync-status` - 获取技能同步状态
 
 ### MCP API
 
-- `GET /api/mcp/servers` - 获取 MCP 服务器列表
-- `POST /api/mcp/servers` - 添加 MCP 服务器
-- `PUT /api/mcp/servers/{id}` - 更新 MCP 服务器配置
-- `DELETE /api/mcp/servers/{id}` - 删除 MCP 服务器
+- `GET /api/mcp` - 获取 MCP 服务器列表
+- `POST /api/mcp` - 添加 MCP 服务器
+- `GET /api/mcp/{server_id}` - 获取单个 MCP 服务器
+- `PATCH /api/mcp/{server_id}` - 更新 MCP 服务器配置
+- `DELETE /api/mcp/{server_id}` - 删除 MCP 服务器
+- `POST /api/mcp/{server_id}/test` - 测试 MCP 服务器连接
+- `POST /api/mcp/{server_id}/toggle` - 启用或禁用 MCP 服务器
+- `POST /api/mcp/batch-delete` - 批量删除 MCP 服务器
+- `GET /api/mcp/modelscope/services` - 获取可导入的 ModelScope MCP 服务
+- `POST /api/mcp/modelscope/import` - 导入 ModelScope MCP 服务
+- `GET /api/mcp/opencode/sync-status` - 获取 OpenCode MCP 同步状态
+- `POST /api/mcp/opencode/sync` - 将 Codebot bridge 同步到 OpenCode 配置
+- `GET /api/mcp/codebot/status` - 获取 Codebot bridge 状态
+- `GET /api/mcp/codebot/opencode-entry` - 获取写入 OpenCode 的 bridge 配置
+- `POST /api/mcp/codebot/register` - 注册 Codebot bridge
+- `GET /api/mcp/codebot/sse` - Codebot 自身 MCP SSE 入口
+- `POST /api/mcp/codebot/messages` - Codebot 自身 MCP 消息入口
 
 ### 通知 API
 
 - `GET /api/notifications` - 获取通知列表
-- `POST /api/notifications/{id}/read` - 标记通知已读
-- `POST /api/notifications/read-all` - 全部标记已读
+- `GET /api/notifications/unread-count` - 获取未读数量
+- `PUT /api/notifications/{id}/read` - 标记通知已读
+- `PUT /api/notifications/read-all` - 全部标记已读
+- `GET /api/notifications/config` - 获取通知配置
+- `PUT /api/notifications/config` - 更新通知配置
+- `POST /api/notifications/test-email` - 发送测试邮件
 
 ### 沙箱 API
 
 - `GET /api/sandbox/status` - 获取沙箱状态
-- `POST /api/sandbox/start` - 启动沙箱 VM
-- `POST /api/sandbox/stop` - 停止沙箱 VM
-- `POST /api/sandbox/execute` - 在沙箱中执行命令
+- `POST /api/sandbox/prepare` - 初始化沙箱工作目录
+- `GET /api/sandbox/config` - 获取沙箱配置
+- `PATCH /api/sandbox/config` - 更新沙箱配置
+- `POST /api/sandbox/start` - 兼容接口，确保本地隔离模式已就绪
+- `POST /api/sandbox/stop` - 兼容接口，停止本地模式沙箱状态
+- `POST /api/sandbox/test` - 执行沙箱冒烟测试
+- `POST /api/sandbox/install-qemu` - 兼容接口，本地模式下返回说明
 
 ### 日志 API
 
-- `GET /api/logs` - 获取执行日志列表
-- `DELETE /api/logs/cleanup` - 清理过期日志
+- `GET /api/logs/task-logs` - 获取任务日志列表
+- `DELETE /api/logs/task-logs/{log_id}` - 删除单条任务日志
+- `POST /api/logs/task-logs/batch-delete` - 批量删除任务日志
+- `GET /api/logs/chat-logs` - 获取聊天日志列表
+- `GET /api/logs/chat-logs/{log_id}` - 获取聊天日志详情
+- `DELETE /api/logs/chat-logs/{log_id}` - 删除单条聊天日志
+- `POST /api/logs/chat-logs/batch-delete` - 批量删除聊天日志
+- `POST /api/logs/chat-logs/cleanup` - 清理过期聊天日志
+- `GET /api/logs/config` - 获取日志配置
+- `PUT /api/logs/config` - 更新日志配置
+- `POST /api/logs/cleanup` - 清理过期任务日志
 
 ## 🤝 贡献
 
