@@ -201,21 +201,39 @@ async def check_and_install_opencode() -> bool:
     return await install_opencode()
 
 
-async def start_opencode_server(port: int = 1120) -> int:
-    """启动 OpenCode Server，返回实际监听的端口号（失败返回 0）。"""
+async def start_opencode_server(port: int = 11200) -> int:
+    """
+    启动 codebot 专用的 OpenCode Server，返回实际监听的端口号（失败返回 0）。
+
+    重要：此函数仅启动 codebot 捆绑/管理的 opencode 实例。
+    - 若端口已是 codebot 自己管理的健康 opencode 服务（_opencode_server_process 存活），直接复用。
+    - 若端口被外部进程占用（如 OpenCode 桌面应用），则跳过，由上层选择备用端口，
+      避免 Codebot 与外部 opencode 实例共享服务导致 Bad Request 错误。
+    - 若端口被占用但健康检查失败（非 opencode 服务），同样跳过。
+    """
     try:
         global _opencode_server_process
 
-        # 1. 先检查指定端口是否已有正常运行的 OpenCode 服务
-        base_url = f"http://127.0.0.1:{port}"
-        if await _is_opencode_http_ready(base_url):
-            logger.info(f"OpenCode Server 已在运行 ({base_url})")
-            return port
-
-        # 2. 若指定端口被其他进程占用，直接返回失败，由上层决定下一候选端口
+        # 若指定端口已被占用，先检查是否是 codebot 自己管理的进程
         if _is_port_open("127.0.0.1", port):
-            logger.warning(f"端口 {port} 已被非 OpenCode 进程占用，跳过该端口")
-            return 0
+            base_url_check = f"http://127.0.0.1:{port}"
+            if await _is_opencode_http_ready(base_url_check):
+                # 检查是否是 codebot 自己管理的进程（进程仍然存活）
+                if _opencode_server_process is not None and _opencode_server_process.poll() is None:
+                    logger.info(f"端口 {port} 已是 codebot 管理的健康 OpenCode 服务，直接复用")
+                    return port
+                else:
+                    # 端口被外部进程占用（如 OpenCode 桌面应用）
+                    # 不能复用：外部实例有独立的 session 状态和配置，
+                    # 共享会导致 API 请求冲突（Bad Request）
+                    logger.warning(
+                        f"端口 {port} 被外部 OpenCode 进程占用（可能是 OpenCode 桌面应用），"
+                        f"跳过此端口，将使用备用端口启动 codebot 专用实例"
+                    )
+                    return 0
+            else:
+                logger.warning(f"端口 {port} 已被占用但非 OpenCode 服务，跳过")
+                return 0
 
         commands = _collect_opencode_commands()
         if not commands:
@@ -227,22 +245,40 @@ async def start_opencode_server(port: int = 1120) -> int:
             settings.LOGS_DIR.mkdir(parents=True, exist_ok=True)
             stdout_path = settings.LOGS_DIR / "opencode_server.stdout.log"
             stderr_path = settings.LOGS_DIR / "opencode_server.stderr.log"
+            # codebot 专用 opencode 配置目录（与系统级 ~/.config/opencode/ 隔离）
+            opencode_config_dir = str(settings.DATA_DIR / "opencode-config")
         except Exception:
             stdout_path = Path.cwd() / "opencode_server.stdout.log"
             stderr_path = Path.cwd() / "opencode_server.stderr.log"
             stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            opencode_config_dir = str(Path.home() / ".codebot" / "opencode-config")
+
+        # 确保 opencode 配置目录存在
+        Path(opencode_config_dir).mkdir(parents=True, exist_ok=True)
+
+        # 构建子进程环境变量：
+        # - XDG_CONFIG_HOME 覆盖配置主目录，opencode 将在其下建立 opencode/opencode.json
+        # - 保留原有环境，以免 PATH 等必要变量丢失
+        proc_env = dict(os.environ)
+        # opencode 遵循 XDG Base Directory 规范，配置读写路径为 $XDG_CONFIG_HOME/opencode/
+        # 将其重定向到 codebot 数据目录下，与系统级 ~/.config/opencode/ 完全隔离
+        xdg_config_parent = str(Path(opencode_config_dir).parent)
+        proc_env["XDG_CONFIG_HOME"] = xdg_config_parent
+        # 同时设置 OPENCODE_CONFIG_HOME（opencode 未来可能支持的专属变量）
+        proc_env["OPENCODE_CONFIG_HOME"] = opencode_config_dir
 
         stdout_file = open(stdout_path, "a", encoding="utf-8")
         stderr_file = open(stderr_path, "a", encoding="utf-8")
+        base_url = f"http://127.0.0.1:{port}"
         for command in commands:
             try:
-                base_url = f"http://127.0.0.1:{port}"
                 proc = subprocess.Popen(
                     [*command, "serve", "--port", str(port), "--hostname", "127.0.0.1"],
                     stdin=subprocess.DEVNULL,
                     stdout=stdout_file,
                     stderr=stderr_file,
-                    cwd=str(Path.home())
+                    cwd=str(Path.home()),
+                    env=proc_env,
                 )
                 for _ in range(30):
                     if await _is_opencode_http_ready(base_url):

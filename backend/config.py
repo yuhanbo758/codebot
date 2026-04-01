@@ -28,6 +28,7 @@ class MemoryConfig(BaseModel):
 class LogConfig(BaseModel):
     """日志配置"""
     task_log_retention_days: int = Field(ge=0, le=365, default=30)
+    chat_log_retention_days: int = Field(ge=0, le=365, default=30)
     system_log_retention_days: int = Field(ge=1, le=90, default=7)
     log_level: str = "INFO"
 
@@ -63,7 +64,7 @@ class LarkBotConfig(BaseModel):
 
 class OpenCodeConfig(BaseModel):
     """OpenCode 配置"""
-    server_url: str = "http://127.0.0.1:1120"
+    server_url: str = "http://127.0.0.1:11200"
     auto_install: bool = True
     auto_start: bool = True
 

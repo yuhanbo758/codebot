@@ -505,6 +505,8 @@ const runtimeEventSeqSeen = ref({})
 const runtimeAssistantIdByConversation = ref({})
 const activeStreamByConversation = ref({})
 const runtimeReloadDoneByConversation = ref({})
+// 每个对话的 event 气泡缓存，用于切换对话后恢复推理过程展示
+const perConversationEventMessages = ref({})
 let queueStatusTimer = null
 const shouldAutoScroll = ref(true)
 const nowTick = ref(Date.now())
@@ -996,6 +998,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
   if (currentConversationId.value !== conversationId) return
   const seen = new Set(runtimeEventSeqSeen.value[conversationId] || [])
   let assistantMsg = null
+  const newEventMsgs = []
   for (const event of (events || [])) {
     const seq = Number(event?.seq || 0)
     if (seq > 0 && seen.has(seq)) continue
@@ -1017,6 +1020,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
       } else {
         messages.value.push(eventMsg)
       }
+      newEventMsgs.push(eventMsg)
       continue
     }
     if (event?.type === 'done' && assistantMsg) {
@@ -1037,6 +1041,18 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
       } else {
         assistantMsg.content = event.message || '执行失败'
         assistantMsg.streaming = false
+      }
+    }
+  }
+  // 缓存新增的 event 消息，确保切换对话后可以恢复
+  if (newEventMsgs.length > 0) {
+    const existing = perConversationEventMessages.value[conversationId] || []
+    const existingIds = new Set(existing.map((e) => e.id))
+    const toAdd = newEventMsgs.filter((e) => !existingIds.has(e.id))
+    if (toAdd.length > 0) {
+      perConversationEventMessages.value = {
+        ...perConversationEventMessages.value,
+        [conversationId]: [...existing, ...toAdd]
       }
     }
   }
@@ -1076,18 +1092,30 @@ const fetchQueueStatus = async (conversationId, options = {}) => {
       queuedCount.value = queued
     }
     setConversationLoadingState(key, running)
-    if (!activeStreamByConversation.value[key]) {
+    // 跳过 applyRuntimeEvents：流式传输进行中 OR 流刚结束等待 reload OR reload 已完成
+    const skipRuntimeApply = activeStreamByConversation.value[key]
+      || runtimeReloadDoneByConversation.value[key] === 'pending'
+      || runtimeReloadDoneByConversation.value[key] === true
+    if (!skipRuntimeApply) {
       applyRuntimeEvents(key, runtimeEvents, runtimeContent, running)
     }
     const shouldReloadAfterRuntime = options.reloadOnFinish
       && !running
       && currentConversationId.value === key
       && !activeStreamByConversation.value[key]
-      && !runtimeReloadDoneByConversation.value[key]
-      && (previousRunning || hasDoneEvent || Boolean(runtimeAssistantIdByConversation.value[key]))
+      && runtimeReloadDoneByConversation.value[key] !== true
+      && (previousRunning || hasDoneEvent || Boolean(runtimeAssistantIdByConversation.value[key])
+        || runtimeReloadDoneByConversation.value[key] === 'pending')
     if (shouldReloadAfterRuntime) {
       const msgResp = await axios.get(`/api/chat/conversations/${key}/messages`)
-      messages.value = msgResp.data?.data?.items || []
+      const dbMessages = msgResp.data?.data?.items || []
+      // 流结束后从 DB 加载最终消息，不再重新注入缓存的 event 气泡。
+      // event 气泡是流式传输期间的临时 UI 元素，流结束后不需要保留。
+      // 清除该对话的 event 缓存，防止重复注入。
+      messages.value = dbMessages
+      const updatedCache = { ...perConversationEventMessages.value }
+      delete updatedCache[key]
+      perConversationEventMessages.value = updatedCache
       runtimeAssistantIdByConversation.value = { ...runtimeAssistantIdByConversation.value, [key]: null }
       runtimeEventSeqSeen.value = { ...runtimeEventSeqSeen.value, [key]: [] }
       runtimeReloadDoneByConversation.value = { ...runtimeReloadDoneByConversation.value, [key]: true }
@@ -1199,7 +1227,20 @@ const selectConversation = async (conversationId) => {
   localStorage.setItem(LAST_CONVERSATION_KEY, String(conversationId))
   try {
     const response = await axios.get(`/api/chat/conversations/${conversationId}/messages`)
-    messages.value = response.data.data.items || []
+    const dbMessages = response.data.data.items || []
+    // 恢复该对话已缓存的 event 气泡（推理过程），仅在流式传输仍在进行中时
+    // 如果 runtimeReloadDone 已为 true，说明流已结束并已做过 DB reload，不需要再注入缓存
+    const cachedEvents = perConversationEventMessages.value[conversationId] || []
+    const streamDone = Boolean(runtimeReloadDoneByConversation.value[conversationId])
+    if (cachedEvents.length > 0 && !streamDone) {
+      messages.value = [...dbMessages, ...cachedEvents].sort((a, b) => {
+        const ta = Date.parse(a.created_at) || 0
+        const tb = Date.parse(b.created_at) || 0
+        return ta - tb
+      })
+    } else {
+      messages.value = dbMessages
+    }
     runtimeAssistantIdByConversation.value = { ...runtimeAssistantIdByConversation.value, [conversationId]: null }
     runtimeEventSeqSeen.value = { ...runtimeEventSeqSeen.value, [conversationId]: [] }
     runtimeReloadDoneByConversation.value = { ...runtimeReloadDoneByConversation.value, [conversationId]: false }
@@ -1423,6 +1464,10 @@ const sendMessage = async () => {
             } else {
               messages.value.push(eventMsg)
             }
+            // 同步缓存到 perConversationEventMessages，确保切换对话后可以恢复
+            const convEvents = perConversationEventMessages.value[conversationId] || []
+            convEvents.push(eventMsg)
+            perConversationEventMessages.value = { ...perConversationEventMessages.value, [conversationId]: convEvents }
             scheduleStreamScroll()
           }
           return
@@ -1440,6 +1485,8 @@ const sendMessage = async () => {
       })
     } finally {
       activeStreamByConversation.value = { ...activeStreamByConversation.value, [conversationId]: false }
+      // 标记该对话"等待 reload"，阻止 applyRuntimeEvents 在 reload 前重复注入 events
+      runtimeReloadDoneByConversation.value = { ...runtimeReloadDoneByConversation.value, [conversationId]: 'pending' }
     }
 
     queuedCount.value = Math.max(0, queuedCount.value - 1)

@@ -276,14 +276,103 @@ class MemoryManager:
         cursor.execute("DELETE FROM messages WHERE id = ?", (message_id,))
         self.sqlite_db.commit()
     
+    # 语义去重阈值：ChromaDB 距离低于此值视为"相同或高度相似"的记忆
+    _DEDUP_DISTANCE_THRESHOLD = 0.25
+
     async def save_long_term_memory(
         self,
         content: str,
         category: str = "habit",
         metadata: Dict = None
     ):
-        """保存长期记忆"""
-        # 保存到 SQLite
+        """
+        保存长期记忆（带语义去重）。
+
+        保存前先用 ChromaDB 向量搜索检查是否存在相同/高度相似的记忆：
+          - 若存在高度相似记忆且新内容更完善 → 更新已有记忆
+          - 若存在几乎完全相同的记忆 → 跳过，不重复写入
+          - 否则 → 正常新增
+        """
+        if not content or not content.strip():
+            return
+
+        # ── 语义去重：查询 ChromaDB 是否已有相似记忆 ──
+        try:
+            results = self.memory_collection.query(
+                query_texts=[content],
+                n_results=3,
+            )
+            if results and results.get("documents") and results["documents"][0]:
+                for doc, meta, dist in zip(
+                    results["documents"][0],
+                    results["metadatas"][0],
+                    results["distances"][0],
+                ):
+                    if dist > self._DEDUP_DISTANCE_THRESHOLD:
+                        continue  # 不够相似，跳过
+
+                    existing_id = meta.get("memory_id")
+                    if not existing_id:
+                        continue
+
+                    # 检查该记忆是否仍在活跃状态（未归档）
+                    cursor = self.sqlite_db.cursor()
+                    row = cursor.execute(
+                        "SELECT id, content, is_archived FROM long_term_memories WHERE id = ?",
+                        (existing_id,),
+                    ).fetchone()
+                    if not row or row["is_archived"]:
+                        continue
+
+                    existing_content = str(row["content"] or "")
+
+                    # 若新内容完全被已有内容覆盖（子串），直接跳过
+                    if content.strip() in existing_content or existing_content in content.strip():
+                        if len(content.strip()) <= len(existing_content):
+                            logger.debug(
+                                f"[memory_manager] 跳过重复记忆（已有更完整版本），"
+                                f"existing_id={existing_id}, dist={dist:.4f}"
+                            )
+                            return
+
+                    # 新内容比已有内容更长/更完善 → 就地更新
+                    if len(content.strip()) > len(existing_content):
+                        merged_meta = {}
+                        try:
+                            old_meta_str = cursor.execute(
+                                "SELECT metadata FROM long_term_memories WHERE id = ?",
+                                (existing_id,),
+                            ).fetchone()
+                            if old_meta_str and old_meta_str["metadata"]:
+                                merged_meta = json.loads(old_meta_str["metadata"])
+                        except Exception:
+                            pass
+                        merged_meta.update(metadata or {})
+                        merged_meta["improved_at"] = datetime.now().isoformat()
+                        merged_meta["improved_from"] = existing_content[:200]
+                        await self.update_long_term_memory(
+                            memory_id=int(existing_id),
+                            content=content,
+                            metadata=merged_meta,
+                        )
+                        logger.info(
+                            f"[memory_manager] 更新已有记忆（内容更完善），"
+                            f"memory_id={existing_id}, dist={dist:.4f}"
+                        )
+                        return
+
+                    # 距离极近（几乎完全相同）→ 跳过
+                    if dist < 0.10:
+                        logger.debug(
+                            f"[memory_manager] 跳过几乎完全相同的记忆，"
+                            f"existing_id={existing_id}, dist={dist:.4f}"
+                        )
+                        return
+        except Exception as dedup_err:
+            # 去重失败不阻塞保存
+            logger.warning(f"[memory_manager] 语义去重检查失败（继续保存）: {dedup_err}")
+
+        # ── 正常新增 ──
         cursor = self.sqlite_db.cursor()
         cursor.execute(
             """INSERT INTO long_term_memories (category, content, metadata) 

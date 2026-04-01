@@ -742,6 +742,49 @@ async def sync_skills_to_opencode():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/{skill_id:path}/sync-to-opencode")
+async def sync_single_skill_to_opencode(skill_id: str):
+    """
+    将单个 codebot 技能（内置/自动生成/聊天生成）同步到 opencode ~/.agents/skills/ 目录。
+    支持 builtin:、auto:、chat 来源技能。
+    """
+    try:
+        # 解析技能目录名
+        if skill_id.startswith("builtin:"):
+            slug = skill_id[len("builtin:"):].strip()
+        elif skill_id.startswith("auto:"):
+            slug = skill_id[len("auto:"):].strip()
+        else:
+            # 普通 JSON 技能（如 chat 生成的），skill_id 就是 UUID，不是目录型
+            raise HTTPException(status_code=400, detail="该技能类型不支持同步到 OpenCode（仅支持内置或自动生成技能）")
+
+        if not slug:
+            raise HTTPException(status_code=400, detail="无效的技能 ID")
+
+        src = settings.SKILLS_DIR / slug
+        if not src.is_dir() or not (src / "SKILL.md").exists():
+            raise HTTPException(status_code=404, detail=f"技能目录不存在或缺少 SKILL.md：{slug}")
+
+        ok = _sync_skill_to_opencode(slug)
+        if not ok:
+            raise HTTPException(status_code=500, detail="同步失败，请检查 opencode 技能目录权限")
+
+        dest_name = _get_codebot_skill_slug(slug)
+        oc_dir = _opencode_agents_skills_dir()
+        return {
+            "success": True,
+            "data": {
+                "slug": slug,
+                "dest": str(oc_dir / dest_name),
+            },
+            "message": f"技能 {slug} 已同步到 OpenCode（{dest_name}）"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/opencode-sync-status")
 async def get_opencode_sync_status():
     """

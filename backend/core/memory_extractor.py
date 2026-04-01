@@ -112,6 +112,51 @@ def _dedup_with_existing(
     return filtered
 
 
+async def _dedup_with_vector_search(
+    candidates: List[Tuple[str, str]],
+    memory_manager,
+) -> List[Tuple[str, str]]:
+    """
+    使用 ChromaDB 向量搜索进行语义去重。
+    对每个候选记忆检查是否已存在高度相似的记忆，如果已存在且现有内容已足够完善则跳过。
+    注意：即使这里放行，save_long_term_memory 内部也有二次去重保护。
+    """
+    if not candidates:
+        return []
+
+    _VECTOR_DEDUP_THRESHOLD = 0.20  # 距离低于此值视为已有相同记忆
+
+    filtered = []
+    for content, category in candidates:
+        try:
+            results = memory_manager.memory_collection.query(
+                query_texts=[content],
+                n_results=1,
+            )
+            if (
+                results
+                and results.get("distances")
+                and results["distances"][0]
+                and results["distances"][0][0] < _VECTOR_DEDUP_THRESHOLD
+            ):
+                # 高度相似的记忆已存在 → 跳过
+                existing_doc = (results["documents"][0][0] if results.get("documents") and results["documents"][0] else "")
+                dist = results["distances"][0][0]
+                # 如果新内容显著长于已有（信息量更大），仍然放行让 save_long_term_memory 处理更新
+                if len(content.strip()) > len(existing_doc) * 1.3:
+                    filtered.append((content, category))
+                else:
+                    logger.debug(
+                        f"[memory_extractor] 向量去重跳过: dist={dist:.4f}, "
+                        f"content={content[:50]}"
+                    )
+                continue
+        except Exception:
+            pass
+        filtered.append((content, category))
+    return filtered
+
+
 async def extract_and_save(
     user_message: str,
     assistant_response: str,
@@ -145,6 +190,13 @@ async def extract_and_save(
 
     if existing_contents:
         candidates = _dedup_with_existing(candidates, existing_contents)
+
+    # 使用 ChromaDB 向量搜索做语义级去重（比字符串包含更精准）
+    if candidates and hasattr(memory_manager, "memory_collection"):
+        try:
+            candidates = await _dedup_with_vector_search(candidates, memory_manager)
+        except Exception as vec_err:
+            logger.debug(f"[memory_extractor] 向量去重失败（继续）: {vec_err}")
 
     if not candidates:
         return 0

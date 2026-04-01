@@ -112,6 +112,22 @@ class Database:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # 聊天日志表（记录每次聊天的内部提示词、推理过程和最终回复，供用户学习和优化）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                user_message TEXT NOT NULL,
+                internal_prompt TEXT,
+                tool_events TEXT,
+                final_reply TEXT,
+                model TEXT,
+                mode TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            )
+        """)
         
         # 创建索引
         cursor.execute("""
@@ -141,6 +157,15 @@ class Database:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_logs_started 
             ON task_logs(started_at DESC)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_logs_conversation
+            ON chat_logs(conversation_id)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_chat_logs_created
+            ON chat_logs(created_at DESC)
         """)
         
         self.conn.commit()

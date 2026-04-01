@@ -57,7 +57,7 @@ class TaskResult:
 class OpenCodeClient:
     """OpenCode HTTP 客户端"""
     
-    def __init__(self, server_url: str = "http://127.0.0.1:1120"):
+    def __init__(self, server_url: str = "http://127.0.0.1:11200"):
         self.base_url = self._normalize_http_base_url(server_url)
         self._client: Optional[httpx.AsyncClient] = None
         self.connected = False
@@ -66,7 +66,7 @@ class OpenCodeClient:
 
     def _normalize_http_base_url(self, server_url: str) -> str:
         if not server_url:
-            return "http://127.0.0.1:1120"
+            return "http://127.0.0.1:11200"
         parsed = urlparse(server_url)
         scheme = parsed.scheme or "http"
         if scheme == "":

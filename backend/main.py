@@ -26,7 +26,7 @@ from core.lark_ws_bot import LarkWsBot
 from core.scheduler import TaskScheduler
 from core.sandbox import SandboxManager
 from services.notification import NotificationService
-from utils.installer import check_and_install_opencode, start_opencode_server, stop_opencode_server, _is_opencode_http_ready
+from utils.installer import check_and_install_opencode, start_opencode_server, stop_opencode_server
 
 # 导入 API 路由
 from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router
@@ -221,17 +221,17 @@ async def lifespan(app: FastAPI):
     should_auto_start = bool(force_auto_start or app_config.opencode.auto_start or os.environ.get("CODEBOT_DATA_DIR"))
     if should_auto_start:
         parsed = urlparse(app_config.opencode.server_url)
-        configured_port = parsed.port or 1120
+        configured_port = parsed.port or 11200
         preferred_port_raw = os.environ.get("CODEBOT_OPENCODE_PREFERRED_PORT", "").strip()
         fallback_port_raw = os.environ.get("CODEBOT_OPENCODE_FALLBACK_PORT", "").strip()
         try:
-            preferred_port = int(preferred_port_raw) if preferred_port_raw else 1120
+            preferred_port = int(preferred_port_raw) if preferred_port_raw else 11200
         except Exception:
-            preferred_port = 1120
+            preferred_port = 11200
         try:
-            fallback_port = int(fallback_port_raw) if fallback_port_raw else 4096
+            fallback_port = int(fallback_port_raw) if fallback_port_raw else 11201
         except Exception:
-            fallback_port = 4096
+            fallback_port = 11201
         candidate_ports = []
         for p in [preferred_port, configured_port, fallback_port]:
             if not isinstance(p, int) or p < 1 or p > 65535:
@@ -239,14 +239,7 @@ async def lifespan(app: FastAPI):
             if p not in candidate_ports:
                 candidate_ports.append(p)
         actual_port = 0
-        reused_existing = False
         for port in candidate_ports:
-            # 先检测该端口是否已有正常运行的 OpenCode 服务（如桌面版 OpenCode）
-            if await _is_opencode_http_ready(f"http://127.0.0.1:{port}"):
-                logger.info(f"检测到已有 OpenCode 服务运行在端口 {port}，直接复用，不重复启动")
-                actual_port = port
-                reused_existing = True
-                break
             actual_port = await start_opencode_server(port)
             if actual_port:
                 break
@@ -399,7 +392,7 @@ def _is_port_available(host: str, port: int) -> bool:
 app = FastAPI(
     title="Codebot",
     description="基于 OpenCode 的个人 AI 助手",
-    version="1.1.1",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -429,7 +422,7 @@ async def health_check():
     """健康检查"""
     return {
         "status": "healthy",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "opencode_connected": opencode_ws.connected if opencode_ws else False,
         "runtime_source": "packaged" if getattr(sys, "frozen", False) else "source",
         "pid": os.getpid()

@@ -25,7 +25,6 @@ from core.opencode_ws import OpenCodeClient, _conversation_current_session, is_c
 from core.memory_extractor import extract_and_save_background
 from api.routes import scheduler as scheduler_router
 from api.routes import mcp as mcp_router
-from api.routes import skills as skills_router
 from utils.installer import start_opencode_server
 
 router = APIRouter()
@@ -128,65 +127,97 @@ def _sanitize_assistant_output(content: str) -> str:
     # ── 5. 过滤 cron 表达式行（如 "0 9 * * *"）─────────────────────────────
     text = re.sub(r"(?m)^\s*\d+\s+\d+\s+[\d*,/-]+\s+[\d*,/-]+\s+[\d*,/-]+\s*$", "", text)
 
-    # ── 6. 清除 "请只输出给用户的最终结果..." 指令句及其之前内容 ─────────────
-    instruction_idx = text.find("请只输出给用户的最终结果")
-    if instruction_idx >= 0:
-        suffix = text[instruction_idx:]
-        dot_idx = suffix.find("。")
-        if dot_idx >= 0:
-            text = suffix[dot_idx + 1:]
-        else:
-            text = ""
+    # ── 6. 检测并剥离 AI 回显的系统提示词和内部推理过程 ─────────────────────
+    # 当 AI 把内部 prompt 或推理过程与最终回复混在一起输出时，需要提取真正的回复。
+    #
+    # 策略：如果文本包含"系统提示词泄露"的特征，就尝试提取最终回复部分。
+    # 特征词覆盖中英文，包括但不限于：被回显的注入指令、AI 自我推理描述。
+    # 如果过滤后结果为空，则保留原文（宁可多显示不可不显示）。
 
-    # ── 7. 清除意图识别内部 prompt 特征（防止整段 JSON prompt 泄露）─────────
-    # 当输出以"你是意图识别"等内置 prompt 关键词开头时，直接丢弃
-    INTERNAL_PROMPT_PREFIXES = [
-        "你是意图识别",
-        "你是 Cron 表达式生成器",
-        "你是Cron表达式生成器",
-        "任务：从用户输入中提取结构化指令",
-    ]
-    stripped = text.lstrip()
-    for prefix in INTERNAL_PROMPT_PREFIXES:
-        if stripped.startswith(prefix):
-            text = ""
-            break
-
-    # ── 7b. 清除注入的系统提示词行（逐行过滤） ──────────────────────────────
-    # OpenCode 有时会把整个 prompt（含内置提示词）原样回显，需要逐行过滤掉
-    INTERNAL_PROMPT_LINES = {
-        "你正在 OpenCode 中处理用户消息。",
-        "请自主决策并持续执行，不要把流程决策反问给用户；遇到可恢复问题时优先自行切换替代方案。",
-        "当前聊天由 OpenCode 统一处理；Codebot Desktop 作为能力面板，向你提供记忆、定时任务、技能与 MCP 工具。",
-        "除非用户明确询问架构细节，否则不要在最终回答中解释内部桥接、同步或上下文包装。",
-        "请直接输出给用户的最终结果。",
-        "当前是规划模式，直接给出可执行计划，不要让用户做流程选择。",
-        "以下是与当前问题相关的用户记忆，请在回答中参考；若与用户本轮消息冲突，以用户本轮消息为准。",
-    }
-    # 同时过滤以这些前缀开头的行（如带有换行的变体）
-    INTERNAL_PROMPT_STARTSWITH = (
+    # 所有已知的系统提示词特征（中英文）——如果文本包含任何一个，说明存在泄露
+    _SYSTEM_LEAK_MARKERS = [
+        # 中文 — 注入的系统指令
         "你正在 OpenCode 中处理用户消息",
         "请自主决策并持续执行",
         "当前聊天由 OpenCode 统一处理",
         "除非用户明确询问架构细节",
         "请直接输出给用户的最终结果",
-        "当前是规划模式，直接给出可执行计划",
+        "当前是规划模式",
         "以下是与当前问题相关的用户记忆",
-    )
-    lines_out = []
-    for line in text.split("\n"):
-        stripped_line = line.strip()
-        if stripped_line in INTERNAL_PROMPT_LINES:
-            continue
-        if any(stripped_line.startswith(p) for p in INTERNAL_PROMPT_STARTSWITH):
-            continue
-        lines_out.append(line)
-    text = "\n".join(lines_out)
+        "请只输出给用户的最终结果",
+        "你是意图识别",
+        "你是 Cron 表达式生成器",
+        "你是Cron表达式生成器",
+        "任务：从用户输入中提取结构化指令",
+        "【用户消息】",
+        "【用户事实记忆",
+        "【用户个人信息】",
+        "【用户偏好】",
+        "【用户习惯】",
+        "【用户长期记忆",
+        # 英文 — OpenCode 内置系统指令
+        "you must answer concisely",
+        "You MUST answer concisely",
+        "fewer than 4 lines of text",
+        "not including tool use or code generation",
+        "unless user asks for detail",
+        "do not use emoji",
+        # AI 自我推理特征（中文）
+        "根据我的指示",
+        "根据我的指令",
+        "根据指示，我应该",
+        "根据指令，我应该",
+        "根据系统提示",
+        "根据系统指令",
+        "根据提示词",
+    ]
 
-    # ── 8. 兜底：残留 prompt 关键字则保留最后一段非空内容 ───────────────────
-    if any(tag in text.lower() for tag in ["system_policy", "conversation_context"]):
-        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-        text = lines[-1] if lines else ""
+    def _has_system_leak(t: str) -> bool:
+        tl = t.lower()
+        return any(m.lower() in tl for m in _SYSTEM_LEAK_MARKERS)
+
+    if _has_system_leak(text):
+        # 文本中有系统提示词泄露，需要提取真正的回复。
+        # 策略：按段落（双换行）或句子分割，从后往前找到第一个"干净段落"。
+        # "干净段落" = 不包含任何系统提示词特征 且 不是纯 AI 自我推理。
+
+        # AI 自我推理的句子级特征（用于逐句判断）
+        _REASONING_MARKERS = [
+            "我应该", "我需要简洁", "我需要直接", "我需要礼貌", "我需要简短",
+            "我需要友好", "我需要回应", "我需要回复",
+            "我可以简单地", "我可以直接",
+            "我不需要使用任何工具", "我不需要加载任何技能",
+            "不需要长篇大论", "不要过于啰嗦", "不需要解释",
+            "用户只是简单地说", "用户只是在问候", "这是一个简单的问候",
+            "这是一个问候", "让我先自我反思",
+            "所以我的回答应该", "我的回答应该",
+        ]
+
+        def _is_clean_text(t: str) -> bool:
+            """判断一段文本是否"干净"（不含系统提示词和推理特征）"""
+            if not t.strip():
+                return False
+            if _has_system_leak(t):
+                return False
+            tl = t.lower()
+            if any(m in tl for m in _REASONING_MARKERS):
+                return False
+            return True
+
+        # 方法1：先按段落分割（双换行），从后往前找干净段落
+        paragraphs = re.split(r"\n\s*\n", text)
+        clean_paras = [p.strip() for p in paragraphs if _is_clean_text(p)]
+
+        if clean_paras:
+            text = "\n\n".join(clean_paras)
+        else:
+            # 方法2：段落级没找到，按句子分割（中文句号/叹号/问号），从后往前找
+            sentences = re.split(r"(?<=[。！？!?])", text)
+            clean_sents = [s for s in sentences if _is_clean_text(s)]
+            if clean_sents:
+                text = "".join(clean_sents).strip()
+            # 方法3：如果所有句子都被标记为不干净，保留原文（宁可多显示）
+            # 不做任何修改，text 保持不变
 
     text = text.strip()
     return text
@@ -203,6 +234,38 @@ def _skill_content_is_noise(text: str) -> bool:
         "请只输出给用户的最终结果",
     ]
     return any(token in lower for token in blocked)
+
+
+def _save_chat_log(
+    conversation_id: int,
+    user_message: str,
+    internal_prompt: str,
+    tool_events: list,
+    final_reply: str,
+    model: Optional[str] = None,
+    mode: Optional[str] = None,
+) -> None:
+    """将本次聊天的内部提示词、推理过程和最终回复写入聊天日志表。"""
+    try:
+        conversations_db.connect()
+        cursor = conversations_db.conn.cursor()
+        cursor.execute(
+            """INSERT INTO chat_logs 
+               (conversation_id, user_message, internal_prompt, tool_events, final_reply, model, mode)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                conversation_id,
+                user_message or "",
+                internal_prompt or "",
+                json.dumps(tool_events or [], ensure_ascii=False),
+                final_reply or "",
+                model or "",
+                mode or "",
+            )
+        )
+        conversations_db.conn.commit()
+    except Exception as e:
+        logger.warning(f"保存聊天日志失败: {e}")
 
 
 def _runtime_state(conv_id: str) -> Dict[str, Any]:
@@ -599,13 +662,6 @@ def _should_use_sandbox(message: str) -> bool:
 async def _sync_codebot_as_third_party():
     mcp_router.auto_sync_mcp_to_opencode()
     mcp_router.ensure_codebot_remote_mcp_in_opencode()
-    try:
-        status = await skills_router.get_opencode_sync_status()
-        status_data = status.get("data") if isinstance(status, dict) else {}
-        if not status_data.get("in_sync", True):
-            skills_router.sync_builtin_skills_to_opencode()
-    except Exception:
-        pass
 
 
 async def _execute_opencode(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None) -> str:
@@ -666,6 +722,8 @@ async def _stream_execute_opencode_with_meta(
 
     # 消息直接发给 opencode CLI，由其通过注册的 MCP/Skills 处理
     prompt = await _build_opencode_prompt_with_memory(message, mode=mode)
+    # 首先 yield 内部提示词事件，供聊天日志记录
+    yield {"type": "internal_prompt", "prompt": prompt}
 
     client = opencode_ws
     created_client = False
@@ -999,6 +1057,45 @@ def _extract_task_content(message: str) -> str:
     return text if text else message.strip()
 
 
+def _find_duplicate_task(name: str, task_prompt: str) -> Optional[str]:
+    """检查是否已存在相同或高度相似的定时任务。
+    返回已有任务名称（如重复）或 None（不重复）。
+
+    判定逻辑：
+    - 任务名称完全相同 → 重复
+    - task_prompt 去掉 __RUN_ONCE__/__REMINDER__ 标记后完全相同 → 重复
+    - 名称相似度 > 0.8（SequenceMatcher）→ 重复
+    """
+    if not scheduler_router.scheduler:
+        return None
+
+    from difflib import SequenceMatcher
+
+    def _strip_markers(text: str) -> str:
+        """去掉 __RUN_ONCE__ / __REMINDER__ 前缀标记以比较实际内容"""
+        for marker in ("__RUN_ONCE__\n", "__REMINDER__\n", "__RUN_ONCE__", "__REMINDER__"):
+            text = text.replace(marker, "")
+        return text.strip()
+
+    existing_tasks = scheduler_router.scheduler.list_tasks()
+    clean_prompt = _strip_markers(task_prompt)
+    clean_name = name.strip()
+
+    for t in existing_tasks:
+        # 1. 名称完全匹配
+        if t.name.strip() == clean_name:
+            return t.name
+        # 2. prompt 内容完全匹配
+        if _strip_markers(t.task_prompt) == clean_prompt and clean_prompt:
+            return t.name
+        # 3. 名称相似度高（> 0.8）
+        ratio = SequenceMatcher(None, t.name.strip(), clean_name).ratio()
+        if ratio > 0.8:
+            return t.name
+
+    return None
+
+
 async def _try_create_scheduled_task(message: str) -> Optional[str]:
     if not _looks_like_schedule_message(message):
         return None
@@ -1035,6 +1132,11 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
                         name = f"生日提醒：{subject}每年{month}月{day}日"
                     task_prompt = f"__REMINDER__\n{remind_text}"
                     cron_expression = f"{minute} {hour} {day} {month} *"
+                    # ---- 去重检查 ----
+                    dup_name = _find_duplicate_task(name, task_prompt)
+                    if dup_name:
+                        logger.info(f"跳过重复生日提醒任务：'{name}'（已有：'{dup_name}'）")
+                        return None
                     task = scheduler_router.scheduler.create_task(
                         name=name,
                         cron_expression=cron_expression,
@@ -1047,13 +1149,6 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
                         f"Cron：{task.cron_expression}\n"
                         f"下次运行：{next_run}\n"
                         f"可在「定时任务」查看和管理。"
-                    )
-                    next_run = task.next_run.isoformat() if task.next_run else "待计算"
-                    return (
-                        f"已创建定时任务：{task.name}\n"
-                        f"Cron：{task.cron_expression}\n"
-                        f"下次运行：{next_run}\n"
-                        f"可在“定时任务”查看和管理。"
                     )
         cron_data = await scheduler_router.generate_cron_from_text(message)
         cron_expression = cron_data.get("cron") if cron_data else None
@@ -1096,6 +1191,11 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
             name = f"{name[:30]}..."
         if run_once:
             task_prompt = f"__RUN_ONCE__\n{task_prompt}"
+        # ---- 去重检查 ----
+        dup_name = _find_duplicate_task(name, task_prompt)
+        if dup_name:
+            logger.info(f"跳过重复定时任务：'{name}'（已有：'{dup_name}'）")
+            return None
         task = scheduler_router.scheduler.create_task(
             name=name,
             cron_expression=cron_expression,
@@ -1553,72 +1653,96 @@ def _materialize_reusable_skill(user_message: str, assistant_response: str) -> N
         desc = f"{desc[:180]}..."
     new_name = f"自动技能-{title}"
 
-    # 生成目录名（slug）：基于 name 的英文简写 + digest
-    digest = hashlib.sha1(f"{user_message}\n{cleaned_response[:300]}".encode("utf-8")).hexdigest()[:8]
-    slug_base = re.sub(r"[^a-z0-9_]", "_", title[:20].lower().replace(" ", "_"))
-    slug_base = re.sub(r"_+", "_", slug_base).strip("_") or "auto"
-    slug = f"auto_{slug_base}_{digest}"
+    # ── 查询所有已有技能（builtin + opencode + auto + custom），避免重复生成 ──
+    try:
+        from api.routes.skills import _list_skills
+        all_skills = _list_skills()
+    except Exception:
+        all_skills = []
 
-    settings.SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    # 检查是否存在相似技能
+    similar_skill = None
+    for skill in all_skills:
+        existing_name = skill.get("name", "")
+        existing_desc = skill.get("description", "")
+        if _skill_name_similar(existing_name, new_name) or _skill_name_similar(existing_desc, desc):
+            similar_skill = skill
+            break
 
-    # 检查是否存在相似的已有自动技能（目录格式或旧 JSON 格式），升级替代而非新增
-    # 1. 扫描目录格式的自动技能（auto_*.../SKILL.md）
-    for existing_dir in settings.SKILLS_DIR.glob("auto_*"):
-        if not existing_dir.is_dir():
-            continue
-        skill_md = existing_dir / "SKILL.md"
-        if not skill_md.exists():
-            continue
-        try:
-            content = skill_md.read_text(encoding="utf-8")
-            existing_name = ""
-            existing_desc = ""
-            if content.startswith("---"):
-                end = content.find("\n---", 3)
-                if end != -1:
-                    for line in content[3:end].splitlines():
-                        if line.startswith("name:"):
-                            existing_name = line[5:].strip().strip("\"'")
-                        elif line.startswith("description:"):
-                            existing_desc = line[12:].strip().strip("\"'")
-            if _skill_name_similar(existing_name, new_name) or _skill_name_similar(existing_desc, desc):
-                # 升级：重写 SKILL.md
+    if similar_skill:
+        skill_id = similar_skill.get("id", "")
+        # 对于 auto 类型的技能，直接更新 SKILL.md
+        if skill_id.startswith("auto:"):
+            slug = skill_id.split(":", 1)[1].strip()
+            skill_md = settings.SKILLS_DIR / slug / "SKILL.md"
+            if skill_md.exists():
                 _write_auto_skill_md(skill_md, new_name, desc, user_message, cleaned_response)
-                logger.info(f"升级已有自动技能目录: {existing_dir.name}")
+                logger.info(f"升级已有自动技能: {slug}")
                 return
-        except Exception:
-            continue
+        # 对于其他类型（builtin/opencode/custom），不覆盖，仅跳过
+        logger.info(
+            f"[skill] 跳过技能生成：已有相似技能 '{similar_skill.get('name')}' "
+            f"(id={skill_id})"
+        )
+        return
 
-    # 2. 扫描旧 JSON 格式的自动技能（auto_*.json）并迁移
-    for existing_path in settings.SKILLS_DIR.glob("auto_*.json"):
+    # ── 调用 skill-creator 技能生成新技能 ──
+    # 尝试通过 OpenCode 调用 skill-creator
+    skill_created_via_ai = False
+    if opencode_ws and getattr(opencode_ws, "connected", False):
         try:
-            with open(existing_path, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        except Exception:
-            continue
-        if _skill_name_similar(existing.get("name", ""), new_name) or \
-                _skill_name_similar(existing.get("description", ""), desc):
-            # 迁移旧 JSON：转为目录格式，删除旧 JSON
-            old_id = existing.get("id", existing_path.stem)
-            new_dir = settings.SKILLS_DIR / old_id
-            new_dir.mkdir(parents=True, exist_ok=True)
-            skill_md = new_dir / "SKILL.md"
-            _write_auto_skill_md(skill_md, new_name, desc, user_message, cleaned_response)
-            existing_path.unlink(missing_ok=True)
-            logger.info(f"迁移并升级旧 JSON 技能: {old_id}")
-            return
+            skill_creator_prompt = (
+                f"请使用 skill-creator 技能来创建一个新的 agent 技能。\n\n"
+                f"技能名称：{new_name}\n"
+                f"技能描述：{desc[:120]}\n\n"
+                f"技能应该能处理以下类型的用户需求：\n"
+                f"> {user_message[:300]}\n\n"
+                f"参考回复内容（作为技能的主要指令）：\n"
+                f"{cleaned_response[:1500]}\n\n"
+                f"请将技能文件创建在 {settings.SKILLS_DIR} 目录下。"
+            )
+            session_id = f"skill_create_{hashlib.sha1(user_message.encode()).hexdigest()[:8]}"
+            asyncio.get_event_loop().create_task(
+                _async_create_skill_via_opencode(session_id, skill_creator_prompt)
+            )
+            skill_created_via_ai = True
+            logger.info(f"[skill] 已提交 skill-creator 异步创建任务: {new_name}")
+        except Exception as ai_err:
+            logger.warning(f"[skill] 调用 skill-creator 失败，回退本地生成: {ai_err}")
 
-    # 新建目录格式自动技能
-    target_dir = settings.SKILLS_DIR / slug
-    # 避免目录冲突
-    counter = 1
-    while target_dir.exists():
-        target_dir = settings.SKILLS_DIR / f"{slug}_{counter}"
-        counter += 1
-    target_dir.mkdir(parents=True, exist_ok=True)
-    skill_md = target_dir / "SKILL.md"
-    _write_auto_skill_md(skill_md, new_name, desc, user_message, cleaned_response)
-    logger.info(f"生成新自动技能: {target_dir.name}")
+    # 如果 AI 未成功提交，回退到本地生成
+    if not skill_created_via_ai:
+        # 生成目录名（slug）：基于 name 的英文简写 + digest
+        digest = hashlib.sha1(f"{user_message}\n{cleaned_response[:300]}".encode("utf-8")).hexdigest()[:8]
+        slug_base = re.sub(r"[^a-z0-9_]", "_", title[:20].lower().replace(" ", "_"))
+        slug_base = re.sub(r"_+", "_", slug_base).strip("_") or "auto"
+        slug = f"auto_{slug_base}_{digest}"
+
+        settings.SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # 新建目录格式自动技能
+        target_dir = settings.SKILLS_DIR / slug
+        counter = 1
+        while target_dir.exists():
+            target_dir = settings.SKILLS_DIR / f"{slug}_{counter}"
+            counter += 1
+        target_dir.mkdir(parents=True, exist_ok=True)
+        skill_md = target_dir / "SKILL.md"
+        _write_auto_skill_md(skill_md, new_name, desc, user_message, cleaned_response)
+        logger.info(f"生成新自动技能（本地）: {target_dir.name}")
+
+
+async def _async_create_skill_via_opencode(session_id: str, prompt: str) -> None:
+    """异步通过 OpenCode 的 skill-creator 技能创建新技能。"""
+    try:
+        if opencode_ws and getattr(opencode_ws, "connected", False):
+            await opencode_ws.send_message(
+                session_id=session_id,
+                message=prompt,
+            )
+            logger.info(f"[skill] skill-creator 异步任务完成: {session_id}")
+    except Exception as exc:
+        logger.warning(f"[skill] skill-creator 异步任务失败: {exc}")
 
 
 def _write_auto_skill_md(skill_md_path, name: str, description: str,
@@ -2381,6 +2505,8 @@ async def send_to_opencode_stream(request: SendMessageRequest):
             raw_content = ""
             content = ""
             parts: List[dict] = []
+            internal_prompt: str = ""
+            tool_events_log: List[dict] = []
             async for stream_event in _stream_execute_opencode_with_meta(
                 full_message,
                 model=request.model,
@@ -2388,6 +2514,9 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                 conversation_id=conv_id
             ):
                 event_type = stream_event.get("type")
+                if event_type == "internal_prompt":
+                    internal_prompt = stream_event.get("prompt") or ""
+                    continue
                 if event_type == "content_delta":
                     raw_content = stream_event.get("content") or f"{raw_content}{stream_event.get('delta', '')}"
                     next_content = _sanitize_assistant_output(raw_content)
@@ -2406,6 +2535,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                     part = stream_event.get("part")
                     if isinstance(part, dict):
                         parts.append(part)
+                        tool_events_log.append(part)
                         converted = _part_to_stream_event(part)
                         if converted is not None:
                             _runtime_append_event(conv_id, converted)
@@ -2452,6 +2582,20 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                     user_message=request.message,
                     assistant_response=content
                 )
+
+            # 保存聊天日志（内部提示词 + 推理过程 + 最终回复）
+            try:
+                _save_chat_log(
+                    conversation_id=request.conversation_id,
+                    user_message=request.message,
+                    internal_prompt=internal_prompt,
+                    tool_events=tool_events_log,
+                    final_reply=content,
+                    model=request.model,
+                    mode=request.mode,
+                )
+            except Exception as _log_err:
+                logger.warning(f"聊天日志保存失败（跳过）: {_log_err}")
 
             asyncio.create_task(_drain_queue(conv_id, request.conversation_id))
             _runtime_append_event(conv_id, {"type": "done", "content": content or ""})
@@ -2669,9 +2813,9 @@ async def get_models():
         ok = await client.try_connect(attempts=2, delay=0.3, open_timeout=1.0)
         if not ok:
             parsed = urlparse(app_config.opencode.server_url or "")
-            configured_port = parsed.port or 1120
+            configured_port = parsed.port or 11200
             candidate_ports = []
-            for p in [1120, configured_port, 4096]:
+            for p in [11200, configured_port, 11201]:
                 if isinstance(p, int) and 1 <= p <= 65535 and p not in candidate_ports:
                     candidate_ports.append(p)
             actual_port = 0

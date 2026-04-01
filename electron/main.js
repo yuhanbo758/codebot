@@ -266,7 +266,7 @@ function showAbout() {
   const { dialog } = require('electron');
   dialog.showMessageBox({
     title: '关于 Codebot',
-    message: 'Codebot v1.0.0',
+    message: 'Codebot v2.1.0',
     detail: '基于 OpenCode 的个人 AI 助手\n\n© 2024'
   });
 }

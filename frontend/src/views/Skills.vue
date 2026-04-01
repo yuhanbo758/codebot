@@ -27,17 +27,6 @@
           <el-button @click="toggleBatchMode">
             {{ batchMode ? '退出批量' : '批量处理' }}
           </el-button>
-          <el-tooltip v-if="ocSyncStatus !== null" :content="ocSyncTooltip" placement="bottom">
-            <el-button
-              :type="ocSyncStatus?.in_sync ? 'success' : 'warning'"
-              plain
-              :loading="ocSyncing"
-              @click="syncSkillsToOpencode"
-            >
-              <el-icon><Refresh /></el-icon>
-              {{ ocSyncStatus?.in_sync ? 'OpenCode 已同步' : `同步到 OpenCode (${ocSyncStatus?.not_synced?.length ?? '?'} 待同步)` }}
-            </el-button>
-          </el-tooltip>
           <el-button type="success" @click="showGenerateDialog = true">
             <el-icon><MagicStick /></el-icon>
             生成技能
@@ -48,7 +37,7 @@
           </el-button>
         </div>
       </div>
-      <div class="skills-subtitle">管理 Codebot 的技能。内置技能和自动生成技能仅供 Codebot 内部使用；OpenCode 技能由 OpenCode CLI 自身管理（位于 ~/.agents/skills/）。</div>
+      <div class="skills-subtitle">管理 Codebot 的技能。内置技能和自动生成技能仅供 Codebot 内部使用；OpenCode 技能由 OpenCode CLI 自身管理（位于 ~/.agents/skills/）。可点击操作列中的「同步」按钮，将内置或自动生成技能同步到 OpenCode CLI 的 skills 目录，以供 OpenCode CLI 直接调用。</div>
     </div>
 
     <!-- 可滚动表格区域 -->
@@ -78,16 +67,18 @@
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="220">
+        <el-table-column label="操作" width="260">
           <template #default="{ row }">
-            <!-- builtin: 支持编辑 SKILL.md，不支持卸载 -->
+            <!-- builtin: 支持编辑 SKILL.md，不支持卸载，支持同步到 OpenCode -->
             <template v-if="row.id?.startsWith('builtin:')">
               <el-button size="small" type="primary" plain @click="openEditDialog(row)">编辑</el-button>
+              <el-button size="small" type="warning" plain @click="syncSingleSkill(row)" :loading="row.syncing">同步</el-button>
               <el-text type="info" size="small" style="margin-left:8px">内置</el-text>
             </template>
-            <!-- auto: 自动生成，支持编辑和删除 -->
+            <!-- auto: 自动生成，支持编辑、删除和同步到 OpenCode -->
             <template v-else-if="row.id?.startsWith('auto:')">
               <el-button size="small" type="primary" plain @click="openEditDialog(row)">编辑</el-button>
+              <el-button size="small" type="warning" plain @click="syncSingleSkill(row)" :loading="row.syncing">同步</el-button>
               <el-button size="small" type="danger" plain @click="deleteSkill(row)" :loading="row.deleting">删除</el-button>
             </template>
             <!-- custom: 外部目录只读 -->
@@ -222,7 +213,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Download, Search, MagicStick, Link, Refresh } from '@element-plus/icons-vue'
+import { Download, Search, MagicStick, Link } from '@element-plus/icons-vue'
 import axios from 'axios'
 
 const skills = ref([])
@@ -461,42 +452,21 @@ const batchDelete = async () => {
   }
 }
 
-// ── opencode 同步状态 ─────────────────────────────────────────────────────
-const ocSyncStatus = ref(null)
-const ocSyncing = ref(false)
-
-const ocSyncTooltip = computed(() => {
-  if (!ocSyncStatus.value) return ''
-  if (ocSyncStatus.value.in_sync) return 'Codebot 提供给 OpenCode 的技能已全部同步'
-  const names = (ocSyncStatus.value.not_synced || []).join(', ')
-  return `点击将以下技能同步到 OpenCode:\n${names}`
-})
-
-const loadOcSyncStatus = async () => {
+// ── opencode 单个技能同步 ─────────────────────────────────────────────────
+const syncSingleSkill = async (skill) => {
+  skill.syncing = true
   try {
-    const res = await axios.get('/api/skills/opencode-sync-status')
-    ocSyncStatus.value = res.data?.data ?? null
-  } catch {
-    ocSyncStatus.value = null
-  }
-}
-
-const syncSkillsToOpencode = async () => {
-  ocSyncing.value = true
-  try {
-    const res = await axios.post('/api/skills/sync-to-opencode')
+    const res = await axios.post(`/api/skills/${encodeURIComponent(skill.id)}/sync-to-opencode`)
     ElMessage.success(res.data?.message || '同步成功')
-    await loadOcSyncStatus()
   } catch (err) {
     ElMessage.error(err?.response?.data?.detail || '同步失败')
   } finally {
-    ocSyncing.value = false
+    skill.syncing = false
   }
 }
 
 onMounted(() => {
   loadSkills()
-  loadOcSyncStatus()
 })
 </script>
 

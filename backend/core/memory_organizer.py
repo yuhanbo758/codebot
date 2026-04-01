@@ -19,7 +19,7 @@
 import asyncio
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from loguru import logger
 from core.memory_extractor import extract_and_save
@@ -201,12 +201,20 @@ async def organize_memories(
             summary["chat_memories_saved"] = int(chat_stats.get("saved_memories", 0))
             summary["tasks_created"] = int(chat_stats.get("tasks_created", 0))
             summary["skills_materialized"] = int(chat_stats.get("skills_materialized", 0))
+
+        # ── 自动清理过期日志 ──
+        cleanup_stats = _auto_cleanup_old_logs()
+        summary["task_logs_cleaned"] = cleanup_stats.get("task_logs", 0)
+        summary["chat_logs_cleaned"] = cleanup_stats.get("chat_logs", 0)
+
         summary["finished_at"] = datetime.now().isoformat()
         logger.info(
             f"[memory_organizer] 整理完成 — 总条数: {summary['total']}, "
             f"更新: {summary['updated']}, 归档: {summary['archived']}, "
             f"使用AI: {summary['used_ai']}, 聊天扫描: {summary['chat_messages_scanned']}, "
-            f"新增记忆: {summary['chat_memories_saved']}, 新任务: {summary['tasks_created']}"
+            f"新增记忆: {summary['chat_memories_saved']}, 新任务: {summary['tasks_created']}, "
+            f"清理任务日志: {summary.get('task_logs_cleaned', 0)}, "
+            f"清理聊天日志: {summary.get('chat_logs_cleaned', 0)}"
         )
 
         # 更新上次运行时间
@@ -270,45 +278,67 @@ async def _apply_ai_result(
             logger.warning(f"[memory_organizer] 处理条目 {item} 时出错: {item_err}")
 
 
-def _ensure_organizer_state_table(memory_manager):
-    cursor = memory_manager.sqlite_db.cursor()
-    cursor.execute(
-        """CREATE TABLE IF NOT EXISTS memory_organizer_state (
-               state_key TEXT PRIMARY KEY,
-               state_value TEXT,
-               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-           )"""
-    )
-    memory_manager.sqlite_db.commit()
+# ── 自动清理过期日志 ─────────────────────────────────────────────────────────
 
+def _auto_cleanup_old_logs() -> Dict[str, int]:
+    """在自动整理时清理超出保留天数的任务执行日志和聊天日志。
 
-def _get_last_processed_message_id(memory_manager) -> int:
-    _ensure_organizer_state_table(memory_manager)
-    cursor = memory_manager.sqlite_db.cursor()
-    row = cursor.execute(
-        "SELECT state_value FROM memory_organizer_state WHERE state_key = ?",
-        ("last_processed_message_id",),
-    ).fetchone()
-    if not row:
-        return 0
+    读取 LogConfig 中的 task_log_retention_days 和 chat_log_retention_days，
+    删除超出保留期的旧日志。0 表示永久保留不清理。
+    """
+    import sqlite3
+    from config import app_config, settings
+
+    result = {"task_logs": 0, "chat_logs": 0}
+
+    # ── 清理任务执行日志 ──
     try:
-        return max(0, int(row["state_value"]))
-    except Exception:
-        return 0
+        days = app_config.logs.task_log_retention_days
+        if days > 0:
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            conn = sqlite3.connect(str(settings.DATA_DIR / "scheduled_tasks.db"))
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM task_logs WHERE started_at < ?", (cutoff,))
+            result["task_logs"] = cursor.rowcount
+            conn.commit()
+            conn.close()
+            if result["task_logs"] > 0:
+                logger.info(f"[memory_organizer] 自动清理 {result['task_logs']} 条过期任务日志（>{days}天）")
+    except Exception as e:
+        logger.warning(f"[memory_organizer] 清理任务日志失败: {e}")
+
+    # ── 清理聊天日志 ──
+    try:
+        days = app_config.logs.chat_log_retention_days
+        if days > 0:
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            conn = sqlite3.connect(str(settings.DATA_DIR / "conversations.db"))
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM chat_logs WHERE created_at < ?", (cutoff,))
+            result["chat_logs"] = cursor.rowcount
+            conn.commit()
+            conn.close()
+            if result["chat_logs"] > 0:
+                logger.info(f"[memory_organizer] 自动清理 {result['chat_logs']} 条过期聊天日志（>{days}天）")
+    except Exception as e:
+        logger.warning(f"[memory_organizer] 清理聊天日志失败: {e}")
+
+    return result
 
 
-def _set_last_processed_message_id(memory_manager, message_id: int):
-    _ensure_organizer_state_table(memory_manager)
-    cursor = memory_manager.sqlite_db.cursor()
-    cursor.execute(
-        """INSERT OR REPLACE INTO memory_organizer_state (state_key, state_value, updated_at)
-           VALUES (?, ?, CURRENT_TIMESTAMP)""",
-        ("last_processed_message_id", str(int(message_id))),
-    )
-    memory_manager.sqlite_db.commit()
+# ── 聊天整理时间窗口说明 ──
+# 不再使用 last_processed_message_id 做增量追踪，
+# 改为基于 organize_last_run 的时间窗口过滤（只扫描最近一个周期的消息）。
 
 
 async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[str, int]:
+    """扫描最近一个整理周期内的聊天消息，提取记忆 / 创建任务 / 沉淀技能。
+
+    时间窗口逻辑：
+      - 从 organize_last_run（上次整理完成时间）到当前时间
+      - 如果 organize_last_run 不存在或超过 24h，则回退到 24h 前
+      - 只处理此时间窗口内的 messages，不再处理更早的历史
+    """
     stats = {"scanned": 0, "saved_memories": 0, "tasks_created": 0, "skills_materialized": 0}
     try:
         from api.routes import chat as chat_router
@@ -316,25 +346,39 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
         logger.warning(f"[memory_organizer] 无法导入 chat 路由，跳过聊天整理: {exc}")
         return stats
 
-    last_id = _get_last_processed_message_id(memory_manager)
+    # ── 计算时间窗口 ──
+    now = datetime.now()
+    window_start = now - timedelta(hours=24)  # 默认：24h 前
+    try:
+        from config import app_config
+        last_run_str = app_config.memory.organize_last_run
+        if last_run_str:
+            last_run_dt = datetime.fromisoformat(last_run_str)
+            # 只有在 24h 以内才使用 organize_last_run，否则用 24h 兜底
+            if (now - last_run_dt).total_seconds() <= 86400 + 3600:  # 25h 容差
+                window_start = last_run_dt
+    except Exception:
+        pass
+
+    window_start_iso = window_start.isoformat()
+    logger.info(f"[memory_organizer] 聊天整理时间窗口: {window_start_iso} → {now.isoformat()}")
+
     cursor = memory_manager.sqlite_db.cursor()
     rows = cursor.execute(
         """SELECT id, conversation_id, role, content
            FROM messages
-           WHERE id > ?
+           WHERE created_at >= ?
            ORDER BY id ASC
            LIMIT 2000""",
-        (last_id,),
+        (window_start_iso,),
     ).fetchall()
     if not rows:
         return stats
 
     assistant_by_conv: Dict[int, List[Dict]] = {}
     user_rows: List[Dict] = []
-    max_id = last_id
     for row in rows:
         item = dict(row)
-        max_id = max(max_id, int(item["id"]))
         conv_id = int(item["conversation_id"])
         role = str(item.get("role") or "")
         if role == "assistant":
@@ -354,6 +398,8 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
             if int(cand["id"]) > user_id:
                 assistant_text = str(cand.get("content") or "")
                 break
+
+        # ── 记忆提取（已内置语义去重） ──
         try:
             saved = await extract_and_save(
                 user_message=user_text,
@@ -365,6 +411,7 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
         except Exception:
             pass
 
+        # ── 定时任务创建（带去重） ──
         try:
             created = await chat_router._try_create_scheduled_task(user_text)
             if created:
@@ -372,16 +419,17 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
         except Exception:
             pass
 
+        # ── 技能自动生成（已内置全量技能去重 + skill-creator 调用） ──
         try:
+            # _materialize_reusable_skill 内部已做 _should_materialize_skill 判断
+            # 以及全量技能查重（包含 opencode/builtin/custom），无需额外检查
             chat_router._materialize_reusable_skill(
                 user_message=user_text,
                 assistant_response=assistant_text,
             )
-            stats["skills_materialized"] += 1
         except Exception:
             pass
 
-    _set_last_processed_message_id(memory_manager, max_id)
     return stats
 
 

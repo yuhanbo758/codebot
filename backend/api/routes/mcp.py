@@ -669,19 +669,28 @@ async def import_modelscope_service(request: ModelScopeImportRequest):
 
 # ── OpenCode CLI MCP 同步 ──────────────────────────────────────────────────
 
+def _codebot_opencode_config_dir() -> Path:
+    """
+    返回 codebot 专用的 opencode 配置目录。
+    使用 codebot 自己的数据目录（DATA_DIR/opencode-config），而不是用户系统级的
+    ~/.config/opencode/，从而避免与 OpenCode 原生桌面应用共享配置文件产生冲突。
+    """
+    return settings.DATA_DIR / "opencode-config"
+
+
 def _opencode_config_path() -> Optional[Path]:
-    """返回 opencode 全局配置文件路径（opencode.json）"""
-    home = Path.home()
-    # Windows / Linux / macOS 统一放在 ~/.config/opencode/opencode.json
-    candidate = home / ".config" / "opencode" / "opencode.json"
-    if candidate.exists():
-        return candidate
-    return None
+    """
+    返回 codebot 专用的 opencode 配置文件路径。
+    路径为 {CODEBOT_DATA_DIR}/opencode-config/opencode.json，与系统级
+    ~/.config/opencode/opencode.json 完全隔离，不影响 OpenCode 原生桌面应用。
+    """
+    config_dir = _codebot_opencode_config_dir()
+    return config_dir / "opencode.json"
 
 
 def _read_opencode_config() -> dict:
     path = _opencode_config_path()
-    if path is None:
+    if not path.exists():
         return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -692,8 +701,8 @@ def _read_opencode_config() -> dict:
 
 def _write_opencode_config(data: dict):
     path = _opencode_config_path()
-    if path is None:
-        raise FileNotFoundError("找不到 opencode 配置文件（~/.config/opencode/opencode.json）")
+    # 确保目录存在
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -704,8 +713,6 @@ def _remove_from_opencode_config(server_names: List[str]):
     server_names: MCP 服务器的原始名称列表（将自动转为 sanitized key）。
     """
     if not server_names:
-        return
-    if _opencode_config_path() is None:
         return
     oc_config = _read_opencode_config()
     oc_mcp = oc_config.get("mcp") or {}
@@ -791,7 +798,8 @@ def _entry_matches(expected: dict, actual: Optional[dict]) -> bool:
 
 
 def get_codebot_remote_mcp_status() -> dict:
-    has_opencode = _opencode_config_path() is not None
+    # 配置文件是否存在（codebot 专用路径）
+    has_opencode = _opencode_config_path().exists()
     expected = _build_codebot_remote_mcp_entry()
     if not has_opencode:
         return {
@@ -829,8 +837,6 @@ async def _is_opencode_connected() -> bool:
 
 
 def ensure_codebot_remote_mcp_in_opencode() -> dict:
-    if _opencode_config_path() is None:
-        return {"success": False, "changed": False, "message": "未找到 opencode 配置文件"}
     expected = _build_codebot_remote_mcp_entry()
     oc_config = _read_opencode_config()
     oc_config.setdefault("mcp", {})
@@ -892,7 +898,7 @@ async def opencode_sync_status():
     cb_servers = _read_all()
     proxyable_servers = [s for s in cb_servers if _is_proxyable_external_server(s)]
     proxy_tools = await _list_external_proxy_tool_definitions()
-    has_opencode = _opencode_config_path() is not None
+    has_opencode = _opencode_config_path().exists()
     codebot_bridge = get_codebot_remote_mcp_status()
     only_in_oc = [{"name": k, "entry": v} for k, v in oc_mcp.items() if k != CODEBOT_REMOTE_MCP_KEY]
     direct_entries_in_opencode = [item for item in only_in_oc if isinstance(item.get("entry"), dict)]
@@ -902,7 +908,7 @@ async def opencode_sync_status():
         "success": True,
         "data": {
             "has_opencode": has_opencode,
-            "opencode_config_path": str(_opencode_config_path()) if has_opencode else None,
+            "opencode_config_path": str(_opencode_config_path()),
             "opencode_mcp_count": len(oc_mcp),
             "codebot_mcp_count": len(cb_servers),
             "missing_in_opencode": [],
@@ -923,12 +929,6 @@ async def sync_to_opencode():
     """
     将 codebot 中所有 MCP 服务器同步写入 opencode CLI 配置（仅追加/更新，不删除 opencode 独有的）。
     """
-    if _opencode_config_path() is None:
-        raise HTTPException(
-            status_code=404,
-            detail="找不到 opencode 配置文件，请确认已安装 opencode CLI（配置位于 ~/.config/opencode/opencode.json）"
-        )
-
     oc_config = _read_opencode_config()
     if "mcp" not in oc_config:
         oc_config["mcp"] = {}
@@ -975,10 +975,6 @@ def auto_sync_mcp_to_opencode() -> bool:
     返回 True 表示执行了同步，False 表示无需同步或 opencode 不可用。
     """
     global _last_sync_mtime
-
-    # opencode 配置不存在则跳过（不报错）
-    if _opencode_config_path() is None:
-        return False
 
     mcp_file = settings.MCP_SERVERS_FILE
     current_mtime = 0.0
@@ -1029,9 +1025,6 @@ def full_sync_mcp_to_opencode() -> dict:
     返回同步结果 dict。
     """
     global _last_sync_mtime
-
-    if _opencode_config_path() is None:
-        return {"success": False, "message": "未找到 opencode 配置文件", "added": [], "updated": [], "removed": []}
 
     try:
         oc_config = _read_opencode_config()
