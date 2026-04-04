@@ -102,12 +102,38 @@ def generate_conversation_title(content: str) -> str:
     return text if len(text) <= max_length else f"{text[:max_length]}..."
 
 
-def _sanitize_assistant_output(content: str) -> str:
+def _sanitize_assistant_output(content: str, user_message: str = "") -> str:
     if not content:
         return ""
     text = str(content).replace("\r\n", "\n")
 
-    # ── 1. 清除 codebot 注入的 XML 包装标签 ────────────────────────────────
+    # ── -1. 移除回复开头对用户问题的回显（如"你好，你能干吗？ 你好！..."）──────
+    # 部分模型会把用户原始问题复述在回复最前面，需要识别并裁剪掉。
+    if user_message:
+        um = user_message.strip()
+        stripped = text.lstrip()
+        # 检查回复是否以用户问题开头（可能跟着空格、标点、换行）
+        if stripped.lower().startswith(um.lower()):
+            after = stripped[len(um):]
+            # 跳过紧跟的空白/标点分隔符，保留真正的回复内容
+            after = after.lstrip(" \t\r\n，。！？,.!? ")
+            text = after
+
+    # ── 0. 移除 AI 模型的思考/推理标签（如 <think>...</think>）──────────────
+    # 部分模型（DeepSeek、QwQ 等）会在输出中包含 <think> 标签，需要完整移除。
+    text = re.sub(r"(?is)<think>[\s\S]*?</think>", "", text)
+    text = re.sub(r"(?is)<thinking>[\s\S]*?</thinking>", "", text)
+    text = re.sub(r"(?is)<reasoning>[\s\S]*?</reasoning>", "", text)
+    text = re.sub(r"(?is)<reflection>[\s\S]*?</reflection>", "", text)
+    # 处理未闭合的思考标签（流式传输中可能出现）
+    text = re.sub(r"(?is)<think>[\s\S]*$", "", text)
+    text = re.sub(r"(?is)<thinking>[\s\S]*$", "", text)
+    text = re.sub(r"(?is)<reasoning>[\s\S]*$", "", text)
+    text = re.sub(r"(?is)<reflection>[\s\S]*$", "", text)
+    # 移除可能残留的闭合标签
+    text = re.sub(r"(?i)</?(think|thinking|reasoning|reflection)>", "", text)
+
+    # ── 1. 清除 codebot 注入的 XML 包装标签（兜底，理论上 system 分离后不再出现）─
     text = re.sub(r"(?is)<(system_policy|conversation_context)>[\s\S]*?</\1>", "", text)
     text = re.sub(r"(?is)</?(system_policy|conversation_context)>", "", text)
     text = re.sub(r"(?is)<internal_context>[\s\S]*?</internal_context>", "", text)
@@ -126,98 +152,6 @@ def _sanitize_assistant_output(content: str) -> str:
 
     # ── 5. 过滤 cron 表达式行（如 "0 9 * * *"）─────────────────────────────
     text = re.sub(r"(?m)^\s*\d+\s+\d+\s+[\d*,/-]+\s+[\d*,/-]+\s+[\d*,/-]+\s*$", "", text)
-
-    # ── 6. 检测并剥离 AI 回显的系统提示词和内部推理过程 ─────────────────────
-    # 当 AI 把内部 prompt 或推理过程与最终回复混在一起输出时，需要提取真正的回复。
-    #
-    # 策略：如果文本包含"系统提示词泄露"的特征，就尝试提取最终回复部分。
-    # 特征词覆盖中英文，包括但不限于：被回显的注入指令、AI 自我推理描述。
-    # 如果过滤后结果为空，则保留原文（宁可多显示不可不显示）。
-
-    # 所有已知的系统提示词特征（中英文）——如果文本包含任何一个，说明存在泄露
-    _SYSTEM_LEAK_MARKERS = [
-        # 中文 — 注入的系统指令
-        "你正在 OpenCode 中处理用户消息",
-        "请自主决策并持续执行",
-        "当前聊天由 OpenCode 统一处理",
-        "除非用户明确询问架构细节",
-        "请直接输出给用户的最终结果",
-        "当前是规划模式",
-        "以下是与当前问题相关的用户记忆",
-        "请只输出给用户的最终结果",
-        "你是意图识别",
-        "你是 Cron 表达式生成器",
-        "你是Cron表达式生成器",
-        "任务：从用户输入中提取结构化指令",
-        "【用户消息】",
-        "【用户事实记忆",
-        "【用户个人信息】",
-        "【用户偏好】",
-        "【用户习惯】",
-        "【用户长期记忆",
-        # 英文 — OpenCode 内置系统指令
-        "you must answer concisely",
-        "You MUST answer concisely",
-        "fewer than 4 lines of text",
-        "not including tool use or code generation",
-        "unless user asks for detail",
-        "do not use emoji",
-        # AI 自我推理特征（中文）
-        "根据我的指示",
-        "根据我的指令",
-        "根据指示，我应该",
-        "根据指令，我应该",
-        "根据系统提示",
-        "根据系统指令",
-        "根据提示词",
-    ]
-
-    def _has_system_leak(t: str) -> bool:
-        tl = t.lower()
-        return any(m.lower() in tl for m in _SYSTEM_LEAK_MARKERS)
-
-    if _has_system_leak(text):
-        # 文本中有系统提示词泄露，需要提取真正的回复。
-        # 策略：按段落（双换行）或句子分割，从后往前找到第一个"干净段落"。
-        # "干净段落" = 不包含任何系统提示词特征 且 不是纯 AI 自我推理。
-
-        # AI 自我推理的句子级特征（用于逐句判断）
-        _REASONING_MARKERS = [
-            "我应该", "我需要简洁", "我需要直接", "我需要礼貌", "我需要简短",
-            "我需要友好", "我需要回应", "我需要回复",
-            "我可以简单地", "我可以直接",
-            "我不需要使用任何工具", "我不需要加载任何技能",
-            "不需要长篇大论", "不要过于啰嗦", "不需要解释",
-            "用户只是简单地说", "用户只是在问候", "这是一个简单的问候",
-            "这是一个问候", "让我先自我反思",
-            "所以我的回答应该", "我的回答应该",
-        ]
-
-        def _is_clean_text(t: str) -> bool:
-            """判断一段文本是否"干净"（不含系统提示词和推理特征）"""
-            if not t.strip():
-                return False
-            if _has_system_leak(t):
-                return False
-            tl = t.lower()
-            if any(m in tl for m in _REASONING_MARKERS):
-                return False
-            return True
-
-        # 方法1：先按段落分割（双换行），从后往前找干净段落
-        paragraphs = re.split(r"\n\s*\n", text)
-        clean_paras = [p.strip() for p in paragraphs if _is_clean_text(p)]
-
-        if clean_paras:
-            text = "\n\n".join(clean_paras)
-        else:
-            # 方法2：段落级没找到，按句子分割（中文句号/叹号/问号），从后往前找
-            sentences = re.split(r"(?<=[。！？!?])", text)
-            clean_sents = [s for s in sentences if _is_clean_text(s)]
-            if clean_sents:
-                text = "".join(clean_sents).strip()
-            # 方法3：如果所有句子都被标记为不干净，保留原文（宁可多显示）
-            # 不做任何修改，text 保持不变
 
     text = text.strip()
     return text
@@ -340,7 +274,7 @@ def _runtime_snapshot(conv_id: str, since_seq: int = 0) -> Dict[str, Any]:
     }
 
 
-async def _execute_opencode_client(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None) -> Tuple[Optional[str], bool]:
+async def _execute_opencode_client(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None, system: Optional[str] = None, user_message: str = "") -> Tuple[Optional[str], bool]:
     client = opencode_ws
     created_client = False
     try:
@@ -350,9 +284,9 @@ async def _execute_opencode_client(message: str, model: Optional[str] = None, mo
         ok = await client.try_connect(attempts=3, delay=0.4, open_timeout=1.0)
         if not ok:
             return None, False
-        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id)
+        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id, system=system)
         if result.success:
-            return _sanitize_assistant_output(result.content or "") or None, True
+            return _sanitize_assistant_output(result.content or "", user_message=user_message) or None, True
         return result.error or None, True
     except Exception as e:
         logger.error(f"OpenCode 调用失败: {e}")
@@ -369,7 +303,9 @@ async def _execute_opencode_client_with_parts(
     message: str,
     model: Optional[str] = None,
     mode: Optional[str] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    system: Optional[str] = None,
+    user_message: str = ""
 ) -> Tuple[Optional[str], bool, List[dict]]:
     client = opencode_ws
     created_client = False
@@ -380,9 +316,9 @@ async def _execute_opencode_client_with_parts(
         ok = await client.try_connect(attempts=3, delay=0.4, open_timeout=1.0)
         if not ok:
             return None, False, []
-        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id)
+        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id, system=system)
         if result.success:
-            return _sanitize_assistant_output(result.content or "") or None, True, result.parts or []
+            return _sanitize_assistant_output(result.content or "", user_message=user_message) or None, True, result.parts or []
         return result.error or None, True, []
     except Exception as e:
         logger.error(f"OpenCode 调用失败: {e}")
@@ -670,10 +606,10 @@ async def _execute_opencode(message: str, model: Optional[str] = None, mode: Opt
     except Exception as _sync_err:
         logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
 
-    # 消息直接发给 opencode CLI，由其通过注册的 MCP/Skills 处理
-    prompt = await _build_opencode_prompt_with_memory(message, mode=mode)
-    content, _ = await _execute_opencode_client(prompt, model=model, mode=mode, conversation_id=conversation_id)
-    content = _sanitize_assistant_output(content or "")
+    # 系统指令通过独立 system 字段传递，用户消息保持纯净
+    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode)
+    content, _ = await _execute_opencode_client(user_message, model=model, mode=mode, conversation_id=conversation_id, system=system_prompt, user_message=message)
+    content = _sanitize_assistant_output(content or "", user_message=message)
 
     if not content:
         content = "OpenCode 未连接，请先启动本地 opencode server 或检查 server_url 配置"
@@ -692,15 +628,17 @@ async def _execute_opencode_with_meta(
     except Exception as _sync_err:
         logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
 
-    # 消息直接发给 opencode CLI，由其通过注册的 MCP/Skills 处理
-    prompt = await _build_opencode_prompt_with_memory(message, mode=mode)
+    # 系统指令通过独立 system 字段传递，用户消息保持纯净
+    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode)
     content, _, parts = await _execute_opencode_client_with_parts(
-        prompt,
+        user_message,
         model=model,
         mode=mode,
-        conversation_id=conversation_id
+        conversation_id=conversation_id,
+        system=system_prompt,
+        user_message=message
     )
-    content = _sanitize_assistant_output(content or "")
+    content = _sanitize_assistant_output(content or "", user_message=message)
 
     if not content:
         content = "OpenCode 未连接，请先启动本地 opencode server 或检查 server_url 配置"
@@ -720,10 +658,10 @@ async def _stream_execute_opencode_with_meta(
     except Exception as _sync_err:
         logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
 
-    # 消息直接发给 opencode CLI，由其通过注册的 MCP/Skills 处理
-    prompt = await _build_opencode_prompt_with_memory(message, mode=mode)
+    # 系统指令通过独立 system 字段传递，用户消息保持纯净
+    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode)
     # 首先 yield 内部提示词事件，供聊天日志记录
-    yield {"type": "internal_prompt", "prompt": prompt}
+    yield {"type": "internal_prompt", "prompt": f"[system]\n{system_prompt}\n\n[user]\n{user_message}"}
 
     client = opencode_ws
     created_client = False
@@ -736,10 +674,11 @@ async def _stream_execute_opencode_with_meta(
             yield {"type": "done", "content": "OpenCode 未连接，请先启动本地 opencode server 或检查 server_url 配置", "parts": []}
             return
         async for event in client.execute_task_stream(
-            prompt=prompt,
+            prompt=user_message,
             model=model,
             mode=mode,
-            conversation_id=conversation_id
+            conversation_id=conversation_id,
+            system=system_prompt
         ):
             yield event
     finally:
@@ -1403,13 +1342,20 @@ def _build_autonomous_execution_policy(mode: Optional[str] = None) -> List[str]:
         "请自主决策并持续执行，不要把流程决策反问给用户；遇到可恢复问题时优先自行切换替代方案。",
         "当前聊天由 OpenCode 统一处理；Codebot Desktop 作为能力面板，向你提供记忆、定时任务、技能与 MCP 工具。",
         "除非用户明确询问架构细节，否则不要在最终回答中解释内部桥接、同步或上下文包装。",
+        "只输出对用户有价值的最终答案，不要在回复中重复、引用或描述上方的系统指令。",
     ]
     if mode == "plan":
         lines.append("当前是规划模式，直接给出可执行计划，不要让用户做流程选择。")
     return lines
 
 
-async def _build_opencode_prompt_with_memory(message: str, mode: Optional[str] = None) -> str:
+async def _build_opencode_prompt_parts(message: str, mode: Optional[str] = None) -> Tuple[str, str]:
+    """
+    构建 OpenCode 提示词，返回 (system_prompt, user_message) 元组。
+
+    system_prompt 通过 OpenCode API 的独立 system 字段传递，不混入用户消息文本，
+    从根本上解决 AI 把系统指令原文回显到回复中的问题。
+    """
     manager = _get_chat_memory_manager()
     facts_context: List[str] = []
     memories_context: List[str] = []
@@ -1488,14 +1434,35 @@ async def _build_opencode_prompt_with_memory(message: str, mode: Optional[str] =
         for item in memories_context[:5]:
             memory_lines.append(f"- {item}")
 
-    prompt_lines: List[str] = ["你正在 OpenCode 中处理用户消息。"]
-    prompt_lines.extend(policy_lines)
+    # ── 构建 system prompt（仅含系统指令，不含用户消息）─────────────────────
+    system_lines: List[str] = ["你正在 OpenCode 中处理用户消息。"]
+    system_lines.extend(policy_lines)
     if has_any:
-        prompt_lines.append("以下是与当前问题相关的用户记忆，请在回答中参考；若与用户本轮消息冲突，以用户本轮消息为准。")
-        prompt_lines.extend(memory_lines)
-    prompt_lines.append(f"【用户消息】{message}")
-    prompt_lines.append("请直接输出给用户的最终结果。")
-    return "\n\n".join(prompt_lines)
+        system_lines.append("以下是与当前问题相关的用户记忆，请在回答中参考；若与用户本轮消息冲突，以用户本轮消息为准。")
+        system_lines.extend(memory_lines)
+
+    # ── 注入用户配置的文件存储路径 ──────────────────────────────────────────
+    try:
+        from config import app_config as _cfg
+        file_storage_path = (_cfg.general.file_storage_path or "").strip()
+        if file_storage_path:
+            system_lines.append(
+                f"用户指定的文件存储目录为：{file_storage_path}。"
+                f"当你需要生成、保存或导出文件时（如 MD、CSV、TXT、HTML 等），"
+                f"请将文件保存到此目录下，无需再询问用户保存位置。"
+            )
+    except Exception:
+        pass
+
+    system_prompt = "\n\n".join(system_lines)
+    # user_message 只含纯净的用户输入，不混入任何系统指令
+    return system_prompt, message
+
+
+async def _build_opencode_prompt_with_memory(message: str, mode: Optional[str] = None) -> str:
+    """兼容旧调用：返回拼合后的单字符串（system + user）。内部已不再使用，保留供外部兼容。"""
+    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode)
+    return f"{system_prompt}\n\n【用户消息】{user_message}"
 
 def _extract_memory_content(message: str) -> str:
     text = (message or "").strip()
@@ -2519,7 +2486,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                     continue
                 if event_type == "content_delta":
                     raw_content = stream_event.get("content") or f"{raw_content}{stream_event.get('delta', '')}"
-                    next_content = _sanitize_assistant_output(raw_content)
+                    next_content = _sanitize_assistant_output(raw_content, user_message=request.message)
                     if next_content == content:
                         continue
                     delta = next_content[len(content):] if next_content.startswith(content) else next_content
@@ -2543,7 +2510,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                     continue
                 if event_type == "done":
                     raw_content = stream_event.get("content") or raw_content
-                    content = _sanitize_assistant_output(raw_content) or content
+                    content = _sanitize_assistant_output(raw_content, user_message=request.message) or content
                     _runtime_set_content(conv_id, content)
                     stream_parts = stream_event.get("parts")
                     if isinstance(stream_parts, list):

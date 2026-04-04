@@ -53,6 +53,7 @@ _SYSTEM_PROMPT = """\
 async def _call_ai_organize(
     batch: List[Dict],
     opencode_ws,
+    model: Optional[str] = None,
 ) -> Optional[List[Dict]]:
     """调用 AI 整理一批记忆，返回 AI 给出的 JSON 列表，失败返回 None。"""
     if opencode_ws is None or not getattr(opencode_ws, "connected", False):
@@ -72,6 +73,7 @@ async def _call_ai_organize(
             session_id=session_id,
             message=user_content,
             system_prompt=_SYSTEM_PROMPT,
+            model=model,
         )
         if not response_text:
             return None
@@ -121,9 +123,15 @@ def _rule_based_organize(batch: List[Dict]) -> Tuple[List[Dict], List[int]]:
 async def organize_memories(
     memory_manager,
     opencode_ws=None,
+    model: Optional[str] = None,
 ) -> Dict:
     """
     对所有活跃长期记忆执行一次整理。
+
+    参数:
+      memory_manager: MemoryManager 实例
+      opencode_ws:    OpenCodeClient 实例（可为 None）
+      model:          指定用于整理的 AI 模型（格式 provider/modelID），None 表示使用默认
 
     返回摘要字典：
       {
@@ -171,7 +179,7 @@ async def organize_memories(
                 summary["batches"] += 1
 
                 if use_ai:
-                    ai_result = await _call_ai_organize(batch, opencode_ws)
+                    ai_result = await _call_ai_organize(batch, opencode_ws, model=model)
                 else:
                     ai_result = None
 
@@ -493,7 +501,8 @@ async def run_organize_loop(get_memory_manager_fn, get_opencode_ws_fn, get_confi
 
             mm = get_memory_manager_fn()
             ws = get_opencode_ws_fn()
-            asyncio.create_task(organize_memories(mm, ws))
+            organize_model = getattr(mem_cfg, "organize_model", None) or None
+            asyncio.create_task(organize_memories(mm, ws, model=organize_model))
 
         except asyncio.CancelledError:
             logger.info("[memory_organizer] 自动整理循环已停止")

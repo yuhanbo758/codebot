@@ -88,7 +88,13 @@ class OpenCodeClient:
             ""
         ))
 
-    def _build_prompt_payload(self, prompt: str, model: Optional[str] = None, mode: Optional[str] = None) -> dict:
+    def _build_prompt_payload(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        mode: Optional[str] = None,
+        system: Optional[str] = None
+    ) -> dict:
         actual_prompt = prompt
         if mode == "plan":
             actual_prompt = (
@@ -108,6 +114,8 @@ class OpenCodeClient:
                 }
             ]
         }
+        if system:
+            payload["system"] = system
         if model:
             if "/" in model:
                 provider_id, model_id = model.split("/", 1)
@@ -301,7 +309,8 @@ class OpenCodeClient:
         mode: Optional[str] = None,
         workspace: Optional[str] = None,
         timeout: int = 300,
-        conversation_id: Optional[str] = None
+        conversation_id: Optional[str] = None,
+        system: Optional[str] = None
     ) -> TaskResult:
         """
         执行任务
@@ -313,6 +322,7 @@ class OpenCodeClient:
             workspace: 工作目录
             timeout: 超时时间 (秒)
             conversation_id: 对话ID，用于追踪当前 session 以支持 abort
+            system: 系统提示词（通过 OpenCode API 的独立 system 字段传递，不混入用户消息）
         
         Returns:
             TaskResult: 任务执行结果
@@ -329,7 +339,7 @@ class OpenCodeClient:
                 conversation_id=conversation_id,
                 workspace=workspace
             )
-            payload = self._build_prompt_payload(prompt=prompt, model=model, mode=mode)
+            payload = self._build_prompt_payload(prompt=prompt, model=model, mode=mode, system=system)
             try:
                 message_response = await client.post(
                     f"{self.base_url}/session/{session_id}/message",
@@ -373,7 +383,8 @@ class OpenCodeClient:
         mode: Optional[str] = None,
         workspace: Optional[str] = None,
         timeout: int = 300,
-        conversation_id: Optional[str] = None
+        conversation_id: Optional[str] = None,
+        system: Optional[str] = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
         await self.ensure_connected()
         final_parts: List[dict] = []
@@ -389,7 +400,7 @@ class OpenCodeClient:
                 workspace=workspace
             )
 
-            payload = self._build_prompt_payload(prompt=prompt, model=model, mode=mode)
+            payload = self._build_prompt_payload(prompt=prompt, model=model, mode=mode, system=system)
 
             async with client.stream(
                 "GET",
@@ -623,6 +634,35 @@ class OpenCodeClient:
         
         # 用主模型执行任务
         return await self.execute_task(prompt, model=primary_model)
+
+    async def send_message(
+        self,
+        session_id: str,
+        message: str,
+        system_prompt: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        发送单轮消息并返回 AI 文本回复（用于内部工具调用，如记忆整理、技能创建等）。
+
+        Args:
+            session_id: 会话 ID（用于隔离上下文，每次传唯一值）
+            message:    用户消息内容
+            system_prompt: 系统提示词
+            model:      指定模型（provider/modelID），None 使用 OpenCode 默认
+
+        Returns:
+            AI 回复的文本内容，失败返回 None
+        """
+        result = await self.execute_task(
+            prompt=message,
+            model=model,
+            system=system_prompt,
+            conversation_id=session_id,
+        )
+        if result.success:
+            return result.content or ""
+        return None
 
 
 OpenCodeWebSocket = OpenCodeClient

@@ -58,6 +58,25 @@
           />
           <span class="hint">默认凌晨 03:00，建议选择空闲时段</span>
         </el-form-item>
+        <el-form-item label="整理使用模型">
+          <el-select
+            v-model="config.organize_model"
+            placeholder="使用当前聊天模型（默认）"
+            clearable
+            style="width: 320px"
+            :loading="modelsLoading"
+            @focus="loadModels"
+          >
+            <el-option label="使用当前聊天模型（默认）" value="" />
+            <el-option
+              v-for="m in availableModels"
+              :key="m.id"
+              :label="m.name"
+              :value="m.id"
+            />
+          </el-select>
+          <span class="hint">自动整理的聊天内容可能较多，可选择其他模型以规避主模型的 Token 消耗</span>
+        </el-form-item>
         <el-form-item label="上次整理时间">
           <span class="last-run-text">
             {{ lastRunText }}
@@ -110,6 +129,7 @@ const config = ref({
   organize_chat_enabled: true,
   organize_time: '03:00',
   organize_last_run: null,
+  organize_model: '',
 })
 
 // el-time-picker 需要 Date 对象或字符串 "HH:mm"
@@ -117,6 +137,10 @@ const organizeTimeDate = ref('03:00')
 
 const organizing = ref(false)
 const showOrganizeResult = ref(false)
+
+// 可用模型列表
+const availableModels = ref([])
+const modelsLoading = ref(false)
 
 const lastRunText = computed(() => {
   const t = config.value.organize_last_run
@@ -132,11 +156,28 @@ const onOrganizeTimeChange = (val) => {
   config.value.organize_time = val || '03:00'
 }
 
+const loadModels = async () => {
+  if (availableModels.value.length > 0) return
+  modelsLoading.value = true
+  try {
+    const resp = await axios.get('/api/chat/models')
+    if (resp.data?.success) {
+      availableModels.value = resp.data.data?.models || []
+    }
+  } catch (e) {
+    console.warn('加载模型列表失败:', e)
+  } finally {
+    modelsLoading.value = false
+  }
+}
+
 const loadConfig = async () => {
   try {
     const response = await axios.get('/api/memory/config')
     config.value = { ...config.value, ...response.data.data }
     organizeTimeDate.value = config.value.organize_time || '03:00'
+    // 确保 organize_model 为字符串（null → ''）
+    if (!config.value.organize_model) config.value.organize_model = ''
   } catch (error) {
     console.error('加载配置失败')
   }
@@ -145,7 +186,12 @@ const loadConfig = async () => {
 const saveConfig = async () => {
   try {
     config.value.organize_time = organizeTimeDate.value || '03:00'
-    await axios.put('/api/memory/config', config.value)
+    // 空字符串转为 null，后端以 null 表示使用默认模型
+    const payload = {
+      ...config.value,
+      organize_model: config.value.organize_model || null,
+    }
+    await axios.put('/api/memory/config', payload)
     ElMessage.success('配置已保存')
   } catch (error) {
     ElMessage.error('保存失败')
@@ -168,7 +214,10 @@ const triggerOrganize = async () => {
   }
 }
 
-onMounted(loadConfig)
+onMounted(() => {
+  loadConfig()
+  loadModels()
+})
 </script>
 
 <style scoped>

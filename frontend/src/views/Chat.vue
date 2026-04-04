@@ -437,9 +437,149 @@ const md = new MarkdownIt({
   }
 })
 
+// 自定义链接渲染：添加 target="_blank" 和 rel 属性，以及外部链接标记
+const defaultLinkRender = md.renderer.rules.link_open || function(tokens, idx, options, env, self) {
+  return self.renderToken(tokens, idx, options)
+}
+md.renderer.rules.link_open = function(tokens, idx, options, env, self) {
+  tokens[idx].attrSet('target', '_blank')
+  tokens[idx].attrSet('rel', 'noopener noreferrer')
+  tokens[idx].attrSet('class', 'external-link')
+  return defaultLinkRender(tokens, idx, options, env, self)
+}
+
 const renderMarkdown = (content) => {
   if (!content) return ''
   return md.render(content)
+}
+
+// 前端流式内容清洗：镜像后端 _sanitize_assistant_output 的核心逻辑
+// 在流式传输过程中实时剥除 think/reasoning 标签及系统提示词泄露内容
+const sanitizeStreamContent = (text, userMessage = '') => {
+  if (!text) return ''
+
+  // 移除回复开头对用户问题的回显（如"你好，你能干吗？ 你好！..."）
+  if (userMessage) {
+    const um = userMessage.trim()
+    const stripped = text.trimStart()
+    if (stripped.toLowerCase().startsWith(um.toLowerCase())) {
+      const after = stripped.slice(um.length).replace(/^[\s，。！？,.!? ]+/, '')
+      text = after
+    }
+  }
+
+  // 移除完整的思考/推理标签块
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, '')
+  text = text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+  text = text.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, '')
+  text = text.replace(/<reflection>[\s\S]*?<\/reflection>/gi, '')
+
+  // 移除未闭合的思考标签（流式中标签还未结束时）
+  text = text.replace(/<think>[\s\S]*$/gi, '')
+  text = text.replace(/<thinking>[\s\S]*$/gi, '')
+  text = text.replace(/<reasoning>[\s\S]*$/gi, '')
+  text = text.replace(/<reflection>[\s\S]*$/gi, '')
+
+  // 移除残留的单个标签
+  text = text.replace(/<\/?(think|thinking|reasoning|reflection)>/gi, '')
+
+  // 移除 codebot 注入的 XML 包装标签块
+  text = text.replace(/<(system_policy|conversation_context)>[\s\S]*?<\/\1>/gi, '')
+  text = text.replace(/<\/?(system_policy|conversation_context)>/gi, '')
+  text = text.replace(/<internal_context>[\s\S]*?<\/internal_context>/gi, '')
+  text = text.replace(/<user_message>[\s\S]*?<\/user_message>/gi, '')
+
+  // 移除内部 prompt 标记行
+  text = text.replace(/^__RUN_ONCE__.*$/gm, '')
+  text = text.replace(/^__REMINDER__.*$/gm, '')
+
+  // 移除【用户输入/消息/请求】标记行
+  text = text.replace(/^【用户(?:输入|消息|请求)】.*$/gm, '')
+
+  const _SYSTEM_LEAK_MARKERS = [
+    '你正在 OpenCode 中处理用户消息',
+    '请自主决策并持续执行',
+    '当前聊天由 OpenCode 统一处理',
+    '除非用户明确询问架构细节',
+    '请直接输出给用户的最终结果',
+    '直接输出给用户的最终回复',
+    '不要输出你的思考过程、推理步骤',
+    '不要复述系统指令或提示词内容',
+    '当前是规划模式',
+    '以下是与当前问题相关的用户记忆',
+    '请只输出给用户的最终结果',
+    '你是意图识别',
+    '你是 Cron 表达式生成器',
+    '你是Cron表达式生成器',
+    '任务：从用户输入中提取结构化指令',
+    '【用户消息】',
+    '【用户事实记忆',
+    '【用户个人信息】',
+    '【用户偏好】',
+    '【用户习惯】',
+    '【用户长期记忆',
+    '请直接输出给用户的最终结果，不要输出推理过程',
+    'you must answer concisely',
+    'You MUST answer concisely',
+    'fewer than 4 lines of text',
+    'not including tool use or code generation',
+    'unless user asks for detail',
+    'do not use emoji',
+    '根据我的指示',
+    '根据我的指令',
+    '根据指示，我应该',
+    '根据指令，我应该',
+    '根据系统提示',
+    '根据系统指令',
+    '根据提示词',
+    '根据我的风格指导',
+    '根据我的风格',
+    '根据风格指导',
+    '根据我的设定',
+    '用户指定的文件存储目录为',
+  ]
+
+  const _REASONING_MARKERS = [
+    '我应该', '我需要简洁', '我需要直接', '我需要礼貌', '我需要简短',
+    '我需要友好', '我需要回应', '我需要回复',
+    '我需要注意', '我需要遵循', '我需要记住',
+    '我可以简单地', '我可以直接',
+    '我不需要使用任何工具', '我不需要加载任何技能',
+    '不需要长篇大论', '不要过于啰嗦', '不需要解释',
+    '用户只是简单地说', '用户只是在问候', '这是一个简单的问候',
+    '这是一个问候', '让我先自我反思',
+    '所以我的回答应该', '我的回答应该',
+    '不要解释内部架构', '不要输思考过程', '直接给出最终回复',
+    '不要输出推理', '直接给出最终', '直接输出最终',
+    '简洁、直接', '避免不必要的前言或后言', '保持简短',
+    '一个词的答案最好', '少于4行', 'fewer than 4 lines',
+    '根据我的风格指导', '按照我的风格指导',
+  ]
+
+  const hasSystemLeak = (t) => {
+    const tl = t.toLowerCase()
+    return _SYSTEM_LEAK_MARKERS.some((m) => tl.includes(m.toLowerCase()))
+  }
+
+  if (hasSystemLeak(text)) {
+    const isCleanText = (t) => {
+      if (!t.trim()) return false
+      if (hasSystemLeak(t)) return false
+      const tl = t.toLowerCase()
+      return !_REASONING_MARKERS.some((m) => tl.includes(m))
+    }
+    const paragraphs = text.split(/\n\s*\n/)
+    const cleanParas = paragraphs.filter((p) => isCleanText(p))
+    if (cleanParas.length > 0) {
+      text = cleanParas.join('\n\n')
+    } else {
+      const sentences = text.split(/(?<=[。！？!?])/)
+      const cleanSents = sentences.filter((s) => isCleanText(s))
+      text = cleanSents.length > 0 ? cleanSents.join('').trim() : ''
+    }
+  }
+
+  return text
 }
 
 const copyToClipboard = async (text) => {
@@ -1024,7 +1164,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
       continue
     }
     if (event?.type === 'done' && assistantMsg) {
-      assistantMsg.content = event.content || runtimeContent || assistantMsg.content
+      assistantMsg.content = sanitizeStreamContent(event.content || runtimeContent || assistantMsg.content)
       assistantMsg.streaming = false
       continue
     }
@@ -1036,7 +1176,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
       assistantMsg = ensureRuntimeAssistant(conversationId)
       if (!assistantMsg) continue
       if (event?.type === 'done') {
-        assistantMsg.content = event.content || runtimeContent || assistantMsg.content
+        assistantMsg.content = sanitizeStreamContent(event.content || runtimeContent || assistantMsg.content)
         assistantMsg.streaming = false
       } else {
         assistantMsg.content = event.message || '执行失败'
@@ -1064,7 +1204,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
     assistantMsg = assistantMsg || ensureRuntimeAssistant(conversationId)
   }
   if (assistantMsg) {
-    if (typeof runtimeContent === 'string' && runtimeContent) assistantMsg.content = runtimeContent
+    if (typeof runtimeContent === 'string' && runtimeContent) assistantMsg.content = sanitizeStreamContent(runtimeContent)
     assistantMsg.streaming = Boolean(running)
   }
   nextTick(() => scrollToBottom())
@@ -1399,6 +1539,7 @@ const sendMessage = async () => {
       id: Date.now() + 1,
       role: 'assistant',
       content: '',
+      rawContent: '',
       tool_events: [],
       streaming: true,
       created_at: new Date().toISOString()
@@ -1411,7 +1552,11 @@ const sendMessage = async () => {
     let flushScheduled = false
     const flushPendingDelta = () => {
       if (!pendingDelta) return
-      assistantMessage.content = `${assistantMessage.content || ''}${pendingDelta}`
+      // 将新增 delta 追加到累积内容后，再整体清洗一次
+      // 整体清洗确保跨 delta 的标签（如 <think> 开始在一个 delta，结束在另一个）能被正确处理
+      const raw = `${assistantMessage.rawContent || ''}${pendingDelta}`
+      assistantMessage.rawContent = raw
+      assistantMessage.content = sanitizeStreamContent(raw, content)
       pendingDelta = ''
     }
 
@@ -1474,7 +1619,9 @@ const sendMessage = async () => {
         }
         if (event?.type === 'done') {
           flushPendingDelta()
-          assistantMessage.content = event.content || assistantMessage.content
+          // 优先使用后端返回的已清洗内容，否则使用前端实时清洗后的内容
+          const finalContent = event.content || assistantMessage.content
+          assistantMessage.content = sanitizeStreamContent(finalContent, content)
           assistantMessage.streaming = false
           if (currentConversationId.value === conversationId) scheduleStreamScroll()
           return
@@ -1695,6 +1842,7 @@ onMounted(() => {
   loadModels()
   loadCommands()
   loadThirdPartyStatus()
+  loadLinkOpenMode()
   queueStatusTimer = setInterval(() => {
     if (currentConversationId.value) {
       fetchQueueStatus(currentConversationId.value, { reloadOnFinish: true })
@@ -1703,7 +1851,61 @@ onMounted(() => {
   timeRefreshTimer = setInterval(() => {
     nowTick.value = Date.now()
   }, 30000)
+
+  // 拦截消息列表中的链接点击，使用系统浏览器打开外部链接
+  if (messageListRef.value) {
+    messageListRef.value.addEventListener('click', handleLinkClick)
+  }
 })
+
+// 处理消息区域中的链接点击
+const linkOpenMode = ref('system')
+
+// 加载链接打开方式配置，并同步通知 Electron 主进程
+const loadLinkOpenMode = async () => {
+  try {
+    const res = await fetch('/api/config/general')
+    if (res.ok) {
+      const json = await res.json()
+      if (json?.success && json?.data?.link_open_mode) {
+        linkOpenMode.value = json.data.link_open_mode
+      }
+    }
+  } catch {}
+  // 同步给 Electron 主进程，使 will-navigate / setWindowOpenHandler 也生效
+  if (window.electronAPI?.setLinkOpenMode) {
+    window.electronAPI.setLinkOpenMode(linkOpenMode.value)
+  }
+}
+
+const handleLinkClick = (e) => {
+  const link = e.target.closest('a[href]')
+  if (!link) return
+  const href = link.getAttribute('href')
+  if (!href) return
+  // 跳过锚点链接和 javascript:
+  if (href.startsWith('#') || href.startsWith('javascript:')) return
+
+  e.preventDefault()
+  e.stopPropagation()
+
+  if (linkOpenMode.value === 'builtin') {
+    // 内置浏览器：在 Electron 应用内新窗口中打开
+    if (window.electronAPI?.openBuiltin) {
+      window.electronAPI.openBuiltin(href)
+    } else {
+      // 非 Electron 环境（浏览器访问时）退化为新标签页
+      window.open(href, '_blank', 'noopener,noreferrer')
+    }
+  } else {
+    // 系统浏览器：调用系统默认浏览器打开
+    if (window.electronAPI?.openExternal) {
+      window.electronAPI.openExternal(href)
+    } else {
+      window.open(href, '_blank', 'noopener,noreferrer')
+    }
+  }
+}
 
 onUnmounted(() => {
   if (queueStatusTimer) {
@@ -1713,6 +1915,10 @@ onUnmounted(() => {
   if (timeRefreshTimer) {
     clearInterval(timeRefreshTimer)
     timeRefreshTimer = null
+  }
+  // 清除链接点击拦截
+  if (messageListRef.value) {
+    messageListRef.value.removeEventListener('click', handleLinkClick)
   }
 })
 </script>

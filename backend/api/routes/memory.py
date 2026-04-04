@@ -32,6 +32,7 @@ class MemoryConfigRequest(BaseModel):
     organize_enabled: bool = False
     organize_chat_enabled: bool = True
     organize_time: str = "03:00"
+    organize_model: Optional[str] = None
 
 
 @router.get("/memories")
@@ -309,6 +310,7 @@ async def update_memory_config(request: MemoryConfigRequest):
             organize_enabled=request.organize_enabled,
             organize_chat_enabled=request.organize_chat_enabled,
             organize_time=request.organize_time,
+            organize_model=request.organize_model,
             organize_last_run=app_config.memory.organize_last_run,  # 保持不变
         )
         
@@ -413,8 +415,15 @@ async def trigger_organize():
     except Exception:
         ws = None
 
+    # 读取配置中的整理专用模型
+    try:
+        from config import app_config as _cfg
+        organize_model = _cfg.memory.organize_model or None
+    except Exception:
+        organize_model = None
+
     manager = _get_memory_manager()
-    asyncio.create_task(organize_memories(manager, ws))
+    asyncio.create_task(organize_memories(manager, ws, model=organize_model))
 
     return {
         "success": True,

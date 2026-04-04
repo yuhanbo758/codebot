@@ -23,6 +23,7 @@ class MemoryConfig(BaseModel):
     organize_chat_enabled: bool = True
     organize_time: str = "03:00"          # 每日整理时间，格式 "HH:MM"
     organize_last_run: Optional[str] = None  # ISO datetime，上次整理时间
+    organize_model: Optional[str] = None  # 自动整理专用模型，None 表示使用当前聊天默认模型
 
 
 class LogConfig(BaseModel):
@@ -59,6 +60,14 @@ class LarkBotConfig(BaseModel):
     verify_token: str = ""
     encrypt_key: str = ""
     receive_id_type: str = "chat_id"
+
+
+class GeneralConfig(BaseModel):
+    """通用配置"""
+    # 浏览器设置: "system" = 系统默认浏览器, "builtin" = 内置浏览器
+    link_open_mode: str = "system"
+    # AI 生成文件的默认存储路径（为空则使用系统默认位置）
+    file_storage_path: str = ""
 
 
 
@@ -139,7 +148,8 @@ class SandboxConfig(BaseModel):
 
 class AppConfig(BaseModel):
     """应用配置"""
-    version: str = "2.0.0"
+    version: str = "2.2.0"
+    general: GeneralConfig = GeneralConfig()
     memory: MemoryConfig = MemoryConfig()
     logs: LogConfig = LogConfig()
     notification: NotificationConfig = NotificationConfig()

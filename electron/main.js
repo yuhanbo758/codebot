@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, dialog, ipcMain, clipboard } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, clipboard, shell, session } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const os = require('os');
@@ -7,6 +7,8 @@ const fs = require('fs');
 
 let mainWindow;
 let backendProcess;
+// 链接打开模式：'system'（默认，使用系统浏览器）或 'builtin'（应用内置浏览器窗口）
+let linkOpenMode = 'system';
 
 app.commandLine.appendSwitch('disable-http-cache');
 
@@ -17,6 +19,65 @@ ipcMain.handle('clipboard-copy', (_event, text) => {
   clipboard.writeText(text);
   return true;
 });
+
+// 用系统默认浏览器打开外部链接
+ipcMain.handle('open-external', async (_event, url) => {
+  if (typeof url !== 'string') return false;
+  try {
+    await shell.openExternal(url);
+    return true;
+  } catch {
+    return false;
+  }
+});
+
+// 设置链接打开模式（由前端在设置变更时调用）
+ipcMain.handle('set-link-open-mode', (_event, mode) => {
+  if (mode === 'builtin' || mode === 'system') {
+    linkOpenMode = mode;
+  }
+  return linkOpenMode;
+});
+
+// 在 Electron 内置浏览器窗口中打开链接
+ipcMain.handle('open-builtin', (_event, url) => {
+  if (typeof url !== 'string') return false;
+  try {
+    openBuiltinBrowserWindow(url);
+    return true;
+  } catch {
+    return false;
+  }
+});
+
+// 创建内置浏览器窗口的辅助函数
+// 使用 persist:builtin-browser 命名持久化 session，确保 Cookie 跨窗口关闭后保留
+function openBuiltinBrowserWindow(url) {
+  const builtinSession = session.fromPartition('persist:builtin-browser');
+  const browserWin = new BrowserWindow({
+    width: 1100,
+    height: 750,
+    minWidth: 640,
+    minHeight: 480,
+    title: url,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      session: builtinSession,
+    },
+  });
+  browserWin.loadURL(url);
+  // 内置浏览器窗口内部的新窗口也在同一内置浏览器中打开（同一 session，复用 cookie）
+  browserWin.webContents.setWindowOpenHandler(({ url: newUrl }) => {
+    openBuiltinBrowserWindow(newUrl);
+    return { action: 'deny' };
+  });
+  // 同步标题
+  browserWin.webContents.on('page-title-updated', (_e, title) => {
+    browserWin.setTitle(title || url);
+  });
+  return browserWin;
+}
 
 // 获取局域网 IP
 function getLocalIP() {
@@ -68,6 +129,30 @@ function createWindow() {
     });
 
   createMenu();
+
+  // 拦截窗口内导航：根据用户设置选择在内置窗口或系统浏览器中打开外部链接
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    // 允许导航回本地应用的地址
+    if (url.startsWith('http://127.0.0.1:8080') || url.startsWith('http://localhost:8080')) {
+      return;
+    }
+    event.preventDefault();
+    if (linkOpenMode === 'builtin') {
+      openBuiltinBrowserWindow(url);
+    } else {
+      shell.openExternal(url);
+    }
+  });
+
+  // 拦截 window.open() 和 target="_blank" 链接
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (linkOpenMode === 'builtin') {
+      openBuiltinBrowserWindow(url);
+    } else {
+      shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
 
   mainWindow.on('closed', () => {
     mainWindow = null;

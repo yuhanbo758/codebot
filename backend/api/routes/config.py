@@ -24,6 +24,11 @@ class LoadConfigFromPathRequest(BaseModel):
     path: str
 
 
+class GeneralConfigUpdateRequest(BaseModel):
+    link_open_mode: Optional[str] = None
+    file_storage_path: Optional[str] = None
+
+
 @router.get("/file-info")
 async def get_config_file_info():
     config_path = settings.DATA_DIR / "config.json"
@@ -121,5 +126,43 @@ async def update_skills_config(request: SkillsConfigUpdateRequest):
             "data": app_config.skills.model_dump(),
             "message": "技能目录配置已保存"
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/general")
+async def get_general_config():
+    """获取通用配置（浏览器设置、文件存储路径等）"""
+    return {
+        "success": True,
+        "data": app_config.general.model_dump()
+    }
+
+
+@router.patch("/general")
+async def update_general_config(request: GeneralConfigUpdateRequest):
+    """更新通用配置"""
+    try:
+        updates = request.model_dump(exclude_unset=True)
+        # 验证 link_open_mode
+        if "link_open_mode" in updates:
+            if updates["link_open_mode"] not in ("system", "builtin"):
+                raise HTTPException(status_code=400, detail="link_open_mode 仅支持 'system' 或 'builtin'")
+        # 验证 file_storage_path
+        if "file_storage_path" in updates and updates["file_storage_path"]:
+            p = Path(updates["file_storage_path"])
+            if not p.is_absolute():
+                raise HTTPException(status_code=400, detail="文件存储路径必须是绝对路径")
+        for k, v in updates.items():
+            if hasattr(app_config.general, k):
+                setattr(app_config.general, k, v)
+        save_config(app_config)
+        return {
+            "success": True,
+            "data": app_config.general.model_dump(),
+            "message": "通用配置已保存"
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

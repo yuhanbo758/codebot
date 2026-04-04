@@ -1,6 +1,6 @@
 <template>
   <div class="general-settings">
-    <el-form :model="form" label-width="120px">
+    <el-form :model="form" label-width="140px">
       <el-form-item label="应用名称">
         <el-input v-model="form.app_name" />
       </el-form-item>
@@ -20,6 +20,35 @@
         <el-button type="primary" @click="save">保存设置</el-button>
       </el-form-item>
     </el-form>
+
+    <el-divider />
+
+    <!-- 链接打开方式 & 文件存储路径 -->
+    <div class="section-block">
+      <div class="section-title">浏览器与文件设置</div>
+      <el-form :model="generalForm" label-width="140px">
+        <el-form-item label="链接打开方式">
+          <el-radio-group v-model="generalForm.link_open_mode">
+            <el-radio value="system">系统默认浏览器</el-radio>
+            <el-radio value="builtin">内置浏览器</el-radio>
+          </el-radio-group>
+          <div class="form-item-tip">聊天窗口中的网址链接使用哪种方式打开</div>
+        </el-form-item>
+        <el-form-item label="文件存储路径">
+          <div class="config-path-row">
+            <el-input
+              v-model="generalForm.file_storage_path"
+              placeholder="留空则使用系统默认位置"
+              clearable
+            />
+          </div>
+          <div class="form-item-tip">AI 生成的文件（如导出的 MD、CSV 等）将保存到此目录</div>
+        </el-form-item>
+        <el-form-item>
+          <el-button type="primary" @click="saveGeneralConfig" :loading="generalSaving">保存浏览器与文件设置</el-button>
+        </el-form-item>
+      </el-form>
+    </div>
 
     <el-divider />
 
@@ -119,6 +148,12 @@ const form = ref({
   compact_mode: false
 })
 
+const generalForm = ref({
+  link_open_mode: 'system',
+  file_storage_path: ''
+})
+const generalSaving = ref(false)
+
 const networkInfo = ref({ local_url: '', lan_url: '' })
 const networkLoading = ref(false)
 const networkError = ref('')
@@ -128,6 +163,44 @@ const importLoading = ref(false)
 
 const save = () => {
   ElMessage.success('设置已保存')
+}
+
+const loadGeneralConfig = async () => {
+  try {
+    const res = await fetch('/api/config/general')
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const json = await res.json()
+    if (json?.success && json?.data) {
+      generalForm.value.link_open_mode = json.data.link_open_mode || 'system'
+      generalForm.value.file_storage_path = json.data.file_storage_path || ''
+    }
+  } catch (e) {
+    console.warn('加载通用配置失败:', e)
+  }
+}
+
+const saveGeneralConfig = async () => {
+  generalSaving.value = true
+  try {
+    const res = await fetch('/api/config/general', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(generalForm.value)
+    })
+    const json = await res.json()
+    if (!res.ok || !json?.success) {
+      throw new Error(json?.detail || json?.message || `HTTP ${res.status}`)
+    }
+    // 同步链接打开模式给 Electron 主进程，使拦截器立即生效
+    if (window.electronAPI?.setLinkOpenMode) {
+      window.electronAPI.setLinkOpenMode(generalForm.value.link_open_mode || 'system')
+    }
+    ElMessage.success('浏览器与文件设置已保存')
+  } catch (e) {
+    ElMessage.error(`保存失败：${e.message}`)
+  } finally {
+    generalSaving.value = false
+  }
 }
 
 const loadNetworkInfo = async () => {
@@ -188,6 +261,7 @@ const loadConfigFromPath = async () => {
     importConfigPath.value = ''
     await loadConfigPathInfo()
     await loadNetworkInfo()
+    await loadGeneralConfig()
   } catch (e) {
     ElMessage.error(`加载失败：${e.message}`)
   } finally {
@@ -198,6 +272,7 @@ const loadConfigFromPath = async () => {
 onMounted(() => {
   loadNetworkInfo()
   loadConfigPathInfo()
+  loadGeneralConfig()
 })
 </script>
 
@@ -206,7 +281,7 @@ onMounted(() => {
   padding: 20px;
 }
 
-.network-info-section {
+.section-block {
   margin-top: 8px;
 }
 
@@ -215,6 +290,17 @@ onMounted(() => {
   font-weight: 600;
   color: #303133;
   margin-bottom: 16px;
+}
+
+.form-item-tip {
+  font-size: 12px;
+  color: #909399;
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.network-info-section {
+  margin-top: 8px;
 }
 
 .network-loading {
