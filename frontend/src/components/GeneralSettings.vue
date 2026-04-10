@@ -44,6 +44,39 @@
           </div>
           <div class="form-item-tip">AI 生成的文件（如导出的 MD、CSV 等）将保存到此目录</div>
         </el-form-item>
+        <el-form-item label="插入文件目录">
+          <div class="file-search-dirs-section">
+            <div class="form-item-tip" style="margin-bottom: 10px;">
+              配置 @ 插入文件时搜索的额外目录。聊天输入框中输入 @ 将同时搜索这些目录中的文件。
+            </div>
+            <div
+              v-for="(dir, index) in generalForm.file_search_dirs"
+              :key="index"
+              class="dir-item"
+            >
+              <el-input
+                v-model="generalForm.file_search_dirs[index]"
+                placeholder="请输入文件夹的绝对路径，如 D:\projects\my-app"
+                clearable
+                style="flex: 1"
+              >
+                <template #prefix>
+                  <el-icon><Folder /></el-icon>
+                </template>
+              </el-input>
+              <el-button
+                type="danger"
+                :icon="Delete"
+                circle
+                @click="generalForm.file_search_dirs.splice(index, 1)"
+              />
+            </div>
+            <el-button type="primary" plain @click="generalForm.file_search_dirs.push('')" style="margin-top: 4px;">
+              <el-icon><Plus /></el-icon>
+              添加目录
+            </el-button>
+          </div>
+        </el-form-item>
         <el-form-item>
           <el-button type="primary" @click="saveGeneralConfig" :loading="generalSaving">保存浏览器与文件设置</el-button>
         </el-form-item>
@@ -139,7 +172,7 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Loading, CopyDocument } from '@element-plus/icons-vue'
+import { Loading, CopyDocument, Folder, Delete, Plus } from '@element-plus/icons-vue'
 
 const form = ref({
   app_name: 'Codebot',
@@ -150,7 +183,8 @@ const form = ref({
 
 const generalForm = ref({
   link_open_mode: 'system',
-  file_storage_path: ''
+  file_storage_path: '',
+  file_search_dirs: []
 })
 const generalSaving = ref(false)
 
@@ -173,6 +207,7 @@ const loadGeneralConfig = async () => {
     if (json?.success && json?.data) {
       generalForm.value.link_open_mode = json.data.link_open_mode || 'system'
       generalForm.value.file_storage_path = json.data.file_storage_path || ''
+      generalForm.value.file_search_dirs = json.data.file_search_dirs || []
     }
   } catch (e) {
     console.warn('加载通用配置失败:', e)
@@ -380,5 +415,16 @@ onMounted(() => {
   width: 100%;
   display: flex;
   gap: 10px;
+}
+
+.file-search-dirs-section {
+  width: 100%;
+}
+
+.dir-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 </style>

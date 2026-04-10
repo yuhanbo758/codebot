@@ -68,6 +68,8 @@ class GeneralConfig(BaseModel):
     link_open_mode: str = "system"
     # AI 生成文件的默认存储路径（为空则使用系统默认位置）
     file_storage_path: str = ""
+    # @ 插入文件时的搜索目录列表（为空则只搜索项目目录/BASE_DIR）
+    file_search_dirs: List[str] = []
 
 
 

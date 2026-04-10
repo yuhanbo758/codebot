@@ -201,7 +201,18 @@ codebot/
 │   ├── pdf/SKILL.md            # PDF 处理技能
 │   ├── pptx/SKILL.md           # PowerPoint 技能
 │   ├── docx/SKILL.md           # Word 文档技能
-│   └── xlsx/SKILL.md           # Excel 技能
+│   ├── xlsx/SKILL.md           # Excel 技能
+│   ├── ai-company/SKILL.md     # AI 专家团队决策技能
+│   ├── expert-agents/SKILL.md  # 14位专家人设技能
+│   ├── code-review/SKILL.md    # 代码审查技能
+│   ├── writing-plans/SKILL.md  # 写作计划技能
+│   ├── subagent-driven-development/SKILL.md  # 子代理驱动开发技能
+│   ├── arxiv-research/SKILL.md # 论文研究技能
+│   ├── blogwatcher/SKILL.md    # 博客监控技能
+│   ├── obsidian-notes/SKILL.md # Obsidian 笔记技能
+│   ├── self-improving/SKILL.md # 自我改进技能
+│   ├── systematic-debugging/SKILL.md  # 系统化调试技能
+│   └── test-driven-development/SKILL.md  # 测试驱动开发技能
 ├── data/                       # 运行时数据目录（自动生成）
 │   ├── config.json             # 用户配置（可通过 UI 编辑）
 │   ├── conversations.db        # SQLite：对话/记忆/通知
@@ -265,7 +276,8 @@ codebot/
 - **长期记忆**: 保存用户习惯、偏好、事实信息（用于之后对话检索问答）
 - **自动提取**: 每次对话后，后台自动进行规则+AI双通道提取，识别重要信息并保存，无需依赖“记住”关键词
 - **记忆类别**: `habit`（习惯）、`preference`（偏好）、`profile`（个人信息）、`note`（笔记）、`contact`（联系人）、`address`（地址）
-- **聊天记忆分类补充**: 聊天中手动“记住”时会优先识别生日/姓名/职业/账号密码等个人信息关键词，自动归类到 `profile`
+- **聊天记忆分类补充**: 聊天中手动“记住”时会优先识别偏好（喜欢/偏好/风格/工具等）和习惯（通常/经常/常用等），再识别联系方式和地址，最后才判断个人信息，避免使用偏好被误归为个人信息或联系人
+- **AI 记忆提取增强**: AI 自动提取记忆时，系统提示词包含严格的分类边界定义和示例，确保偏好/习惯不被错误归类
 - **记忆提示**: 聊天输入时自动检索相关记忆并在输入框上方显示提示气泡，AI 回复时也会注明"根据我的记忆"
 - **记忆搜索**: 语义搜索相关记忆
 - **记忆归档**: 自动或手动归档旧记忆，支持按类别过滤查看
@@ -308,7 +320,7 @@ codebot/
 
 ### 5. 技能系统
 
-- **内置技能**: `web_search`（网页搜索）、`web_fetch`（抓取网页）、`news`（新闻获取）、`file_reader`（文件读取）、`pdf`（PDF 处理）、`docx`（Word 文档）、`pptx`（PowerPoint，含缩略图脚本）、`xlsx`（Excel，含重算脚本）
+- **内置技能**: `web_search`（网页搜索）、`web_fetch`（抓取网页）、`news`（新闻获取）、`file_reader`（文件读取）、`pdf`（PDF 处理）、`docx`（Word 文档）、`pptx`（PowerPoint，含缩略图脚本）、`xlsx`（Excel，含重算脚本）、`ai-company`（AI 专家团队决策）、`expert-agents`（14位专家人设）、`code-review`（代码审查）、`writing-plans`（写作计划）、`subagent-driven-development`（子代理驱动开发）、`arxiv-research`（论文研究）、`blogwatcher`（博客监控）、`obsidian-notes`（Obsidian 笔记）、`self-improving`（自我改进）、`systematic-debugging`（系统化调试）、`test-driven-development`（测试驱动开发）
 - **技能定义**: Markdown 文件（`SKILL.md`）带 YAML front-matter（`name`、`description`），自动匹配用户提示
 - **自动调度**: `tool_dispatcher.py` 通过关键词 + 语义匹配，将 `SKILL.md` 内容注入到对应请求的提示词中
 - **低干扰注入**: 仅在高相关度下启用技能上下文，降低无关技能误触发

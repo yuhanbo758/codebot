@@ -27,6 +27,7 @@ class LoadConfigFromPathRequest(BaseModel):
 class GeneralConfigUpdateRequest(BaseModel):
     link_open_mode: Optional[str] = None
     file_storage_path: Optional[str] = None
+    file_search_dirs: Optional[List[str]] = None
 
 
 @router.get("/file-info")
@@ -153,6 +154,11 @@ async def update_general_config(request: GeneralConfigUpdateRequest):
             p = Path(updates["file_storage_path"])
             if not p.is_absolute():
                 raise HTTPException(status_code=400, detail="文件存储路径必须是绝对路径")
+        # 验证 file_search_dirs
+        if "file_search_dirs" in updates and updates["file_search_dirs"]:
+            for d in updates["file_search_dirs"]:
+                if d and not Path(d).is_absolute():
+                    raise HTTPException(status_code=400, detail=f"文件搜索目录必须是绝对路径: {d}")
         for k, v in updates.items():
             if hasattr(app_config.general, k):
                 setattr(app_config.general, k, v)

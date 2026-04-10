@@ -63,8 +63,9 @@ class SendMessageRequest(BaseModel):
     conversation_id: int
     message: str
     model: Optional[str] = None
-    mode: Optional[str] = None  # agent mode: "plan" or "build"
+    mode: Optional[str] = None  # agent mode: "plan", "build", or "agent"
     attached_files: Optional[List[AttachedFile]] = None
+    project_dir: Optional[str] = None  # 用户选择的项目文件夹路径
 
 class UpdateTitleRequest(BaseModel):
     title: str
@@ -86,20 +87,56 @@ class SkillGenerateRequest(BaseModel):
     enabled: bool = True
     message_limit: int = 50
 
-def generate_conversation_title(content: str) -> str:
-    text = _sanitize_assistant_output(content)
-    text = " ".join(text.strip().split())
-    text = re.sub(r"`{1,3}[\s\S]*?`{1,3}", "", text).strip()
-    for sep in ["\n", "。", "！", "？", "；", ";"]:
-        if sep in text:
-            text = text.split(sep, 1)[0].strip()
-            break
-    if any(token in text.lower() for token in ["system_policy", "conversation_context", "internal_context"]):
-        text = ""
-    if not text:
-        return "新对话"
+def generate_conversation_title(content: str, user_message: str = "") -> str:
+    """生成对话标题：优先从用户消息提取核心主题，回退到AI回复首句。
+    去除冗余前缀（"用户想要"、"好的我来帮你"等），直接以功能/用途命名。"""
     max_length = 20
-    return text if len(text) <= max_length else f"{text[:max_length]}..."
+
+    # ── 冗余前缀模式（中英文），匹配后去除 ────────────────────────
+    _VERBOSE_PREFIXES = re.compile(
+        r"^(?:"
+        r"用户(?:想要?|需要|希望|要求|请求|说|问|提到|提出|想让我|让我|要我)"
+        r"|(?:好的?|嗯|OK|Sure)[，,。.!！]?\s*(?:我来|让我|我帮你?|我将|下面我)"
+        r"|(?:我来|让我|我帮你?|我将|下面我|我会|我可以)(?:帮你?|为你?|给你?)?"
+        r"|(?:当然|没问题|可以|好嘞|好呀|好吧|好哒|行)[，,。.!！]?\s*"
+        r"|(?:Hello|Hi|你好|您好)[，,。.!！]?\s*"
+        r")\s*",
+        re.IGNORECASE,
+    )
+
+    def _extract_title(raw: str) -> str:
+        """从原始文本中提取简洁标题。"""
+        text = " ".join(raw.strip().split())
+        # 去除代码块
+        text = re.sub(r"`{1,3}[\s\S]*?`{1,3}", "", text).strip()
+        # 取第一句
+        for sep in ["\n", "。", "！", "？", "；", ";", ".", "!", "?"]:
+            if sep in text:
+                text = text.split(sep, 1)[0].strip()
+                break
+        # 去除冗余前缀
+        text = _VERBOSE_PREFIXES.sub("", text).strip()
+        # 去除开头的标点符号残留
+        text = re.sub(r"^[，,。.!！？?；;：:\-—]+", "", text).strip()
+        # 安全检测
+        if any(tok in text.lower() for tok in ["system_policy", "conversation_context", "internal_context"]):
+            return ""
+        return text
+
+    # 策略1：优先从用户消息提取标题（用户意图最直接）
+    if user_message:
+        title = _extract_title(user_message)
+        if title and len(title) >= 2:
+            return title if len(title) <= max_length else f"{title[:max_length]}..."
+
+    # 策略2：从AI回复提取标题
+    if content:
+        sanitized = _sanitize_assistant_output(content)
+        title = _extract_title(sanitized)
+        if title and len(title) >= 2:
+            return title if len(title) <= max_length else f"{title[:max_length]}..."
+
+    return "新对话"
 
 
 def _sanitize_assistant_output(content: str, user_message: str = "") -> str:
@@ -600,14 +637,14 @@ async def _sync_codebot_as_third_party():
     mcp_router.ensure_codebot_remote_mcp_in_opencode()
 
 
-async def _execute_opencode(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None) -> str:
+async def _execute_opencode(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None, project_dir: Optional[str] = None) -> str:
     try:
         await _sync_codebot_as_third_party()
     except Exception as _sync_err:
         logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
 
     # 系统指令通过独立 system 字段传递，用户消息保持纯净
-    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode)
+    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode, project_dir=project_dir)
     content, _ = await _execute_opencode_client(user_message, model=model, mode=mode, conversation_id=conversation_id, system=system_prompt, user_message=message)
     content = _sanitize_assistant_output(content or "", user_message=message)
 
@@ -621,7 +658,8 @@ async def _execute_opencode_with_meta(
     message: str,
     model: Optional[str] = None,
     mode: Optional[str] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    project_dir: Optional[str] = None
 ) -> Tuple[str, List[dict]]:
     try:
         await _sync_codebot_as_third_party()
@@ -629,7 +667,7 @@ async def _execute_opencode_with_meta(
         logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
 
     # 系统指令通过独立 system 字段传递，用户消息保持纯净
-    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode)
+    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode, project_dir=project_dir)
     content, _, parts = await _execute_opencode_client_with_parts(
         user_message,
         model=model,
@@ -651,7 +689,8 @@ async def _stream_execute_opencode_with_meta(
     message: str,
     model: Optional[str] = None,
     mode: Optional[str] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    project_dir: Optional[str] = None
 ):
     try:
         await _sync_codebot_as_third_party()
@@ -659,7 +698,7 @@ async def _stream_execute_opencode_with_meta(
         logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
 
     # 系统指令通过独立 system 字段传递，用户消息保持纯净
-    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode)
+    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode, project_dir=project_dir)
     # 首先 yield 内部提示词事件，供聊天日志记录
     yield {"type": "internal_prompt", "prompt": f"[system]\n{system_prompt}\n\n[user]\n{user_message}"}
 
@@ -749,7 +788,10 @@ async def _try_ai_route_action(message: str) -> Tuple[Optional[str], bool]:
         "2) action=create_scheduled_task 时，task.task_prompt 必须是未来执行时要做的事（例如“提醒用户：xxx”），不要在 reply 中输出任何自然语言回复。\n"
         "3) 如果用户表达“今天/明天/后天/只提醒一次/仅一次”，则 run_once=true。\n"
         "4) task.cron 是标准 5 段 cron（分 时 日 月 周），能给则给；不确定就把时间表达写入 task.cron_prompt。\n"
-        "5) action=save_memory 时，将要记住的核心内容放入 memory.content，不要生成多余回复。\n"
+        "5) action=save_memory 时，将要记住的核心内容放入 memory.content，不要生成多余回复。"
+        "memory.category 必须准确选择：preference=喜好/偏爱/风格/工具偏好；habit=日常习惯/行为模式；"
+        "profile=仅限姓名/年龄/生日/职业等身份信息；contact=仅限电话/邮箱/微信等联系方式；"
+        "address=仅限物理地址；note=其他备忘。不要把偏好或习惯归为profile或contact！\n"
         "6) 只允许输出 JSON，对 JSON 以外的任何字符都视为失败。\n"
         f"用户输入：{message}"
     )
@@ -1346,10 +1388,51 @@ def _build_autonomous_execution_policy(mode: Optional[str] = None) -> List[str]:
     ]
     if mode == "plan":
         lines.append("当前是规划模式，直接给出可执行计划，不要让用户做流程选择。")
+        lines.append(
+            "当你在规划过程中遇到需要用户确认的关键决策点时（例如技术选型、实现方案二选一、是否包含某功能等），"
+            "请在回复末尾使用以下格式提供可点击的选项供用户快速选择：\n"
+            "<!-- options\n- 选项A的描述\n- 选项B的描述\n- 选项C的描述\n-->\n"
+            "注意：只在确实需要用户决策时才提供选项，不要每次都加。选项文字要简洁明确，通常2-5个选项。"
+        )
+    elif mode == "agent":
+        lines.append("当前是智能体模式（Agent Mode）。你应该像一个高级 AI 智能体那样工作。")
     return lines
 
 
-async def _build_opencode_prompt_parts(message: str, mode: Optional[str] = None) -> Tuple[str, str]:
+def _load_agent_mode_skill_content() -> str:
+    """加载 Agent 模式所需的技能内容（self-improving、expert-agents、ai-company）。"""
+    from pathlib import Path as _Path
+
+    skill_sections: List[str] = []
+
+    # 优先从用户数据目录读取，回退到源 skills/ 目录
+    source_skills_dir = _Path(__file__).parent.parent.parent / "skills"
+
+    for skill_name, intro in [
+        ("self-improving", "以下是自我改进技能指导，请在工作前后自我反思："),
+        ("expert-agents", "以下是可调用的专家代理人格，需要时可切换视角分析问题："),
+        ("ai-company", "以下是 AI 专家团队编排流程，用于多视角决策和产品评估："),
+    ]:
+        skill_path = source_skills_dir / skill_name / "SKILL.md"
+        if skill_path.exists():
+            try:
+                content = skill_path.read_text(encoding="utf-8")
+                # 去掉 YAML front-matter
+                if content.startswith("---"):
+                    end_idx = content.find("---", 3)
+                    if end_idx != -1:
+                        content = content[end_idx + 3:].strip()
+                # 截断过长内容（每个技能最多2000字符）
+                if len(content) > 2000:
+                    content = content[:2000] + "\n... (内容已截断)"
+                skill_sections.append(f"## {skill_name}\n{intro}\n{content}")
+            except Exception:
+                pass
+
+    return "\n\n".join(skill_sections)
+
+
+async def _build_opencode_prompt_parts(message: str, mode: Optional[str] = None, project_dir: Optional[str] = None) -> Tuple[str, str]:
     """
     构建 OpenCode 提示词，返回 (system_prompt, user_message) 元组。
 
@@ -1441,18 +1524,39 @@ async def _build_opencode_prompt_parts(message: str, mode: Optional[str] = None)
         system_lines.append("以下是与当前问题相关的用户记忆，请在回答中参考；若与用户本轮消息冲突，以用户本轮消息为准。")
         system_lines.extend(memory_lines)
 
-    # ── 注入用户配置的文件存储路径 ──────────────────────────────────────────
-    try:
-        from config import app_config as _cfg
-        file_storage_path = (_cfg.general.file_storage_path or "").strip()
-        if file_storage_path:
+    # ── 注入文件存储/项目目录（项目目录优先）──────────────────────────────
+    if project_dir and project_dir.strip():
+        system_lines.append(
+            f"用户当前工作项目目录为：{project_dir.strip()}。"
+            f"所有文件操作（读取、搜索、创建、编辑、保存、导出）请基于此项目目录进行，"
+            f"除非用户明确指定其他路径。"
+        )
+    else:
+        try:
+            from config import app_config as _cfg
+            file_storage_path = (_cfg.general.file_storage_path or "").strip()
+            if file_storage_path:
+                system_lines.append(
+                    f"用户指定的文件存储目录为：{file_storage_path}。"
+                    f"当你需要生成、保存或导出文件时（如 MD、CSV、TXT、HTML 等），"
+                    f"请将文件保存到此目录下，无需再询问用户保存位置。"
+                )
+        except Exception:
+            pass
+
+    # ── Agent 模式：注入自我改进、专家代理、AI 团队技能 ───────────────────────
+    if mode == "agent":
+        agent_skills = _load_agent_mode_skill_content()
+        if agent_skills:
             system_lines.append(
-                f"用户指定的文件存储目录为：{file_storage_path}。"
-                f"当你需要生成、保存或导出文件时（如 MD、CSV、TXT、HTML 等），"
-                f"请将文件保存到此目录下，无需再询问用户保存位置。"
+                "=== Agent 模式技能指导 ===\n"
+                "你现在处于智能体（Agent）模式。请遵循以下技能指导来提升工作质量：\n"
+                "1. 开始工作前先自我反思：回顾相关记忆、评估任务复杂度\n"
+                "2. 完成工作后自我批评：检查潜在问题、评估输出质量\n"
+                "3. 需要多视角分析时，调用专家代理获取不同领域的意见\n"
+                "4. 将学到的经验教训记录到记忆中，持续改进\n\n"
+                f"{agent_skills}"
             )
-    except Exception:
-        pass
 
     system_prompt = "\n\n".join(system_lines)
     # user_message 只含纯净的用户输入，不混入任何系统指令
@@ -1486,12 +1590,31 @@ def _extract_memory_content(message: str) -> str:
 
 def _guess_memory_category(message: str, content: str) -> str:
     text = f"{message} {content}".strip()
-    if any(key in text for key in ["生日", "个人信息", "姓名", "名字", "年龄", "职业", "工作", "学校", "身份", "身份证", "账号", "账户", "密码", "口令"]):
-        return "profile"
-    if any(key in text for key in ["地址", "住址", "位置", "地点"]):
-        return "address"
+    # ── preference（偏好）── 优先匹配，避免被 profile 抢走
+    if any(key in text for key in [
+        "喜欢", "偏好", "偏爱", "偏向", "倾向", "首选", "爱用", "不喜欢",
+        "讨厌", "不想", "不爱", "不习惯", "风格", "方式", "模式", "格式",
+        "回复风格", "编程语言", "框架", "工具", "编辑器", "IDE", "主题",
+    ]):
+        return "preference"
+    # ── habit（习惯）──
+    if any(key in text for key in [
+        "习惯", "通常", "一般", "平时", "经常", "常常", "总是", "每天",
+        "每次", "常用", "惯用", "日常", "作息", "规律",
+    ]):
+        return "habit"
+    # ── contact（联系方式）── 必须在 profile 之前，关键词不会误伤
     if any(key in text for key in ["电话", "手机号", "联系方式", "号码", "微信", "邮箱"]):
         return "contact"
+    # ── address（地址）──
+    if any(key in text for key in ["地址", "住址", "位置", "地点"]):
+        return "address"
+    # ── profile（个人信息）── 仅限真正的身份/人口学信息
+    if any(key in text for key in [
+        "生日", "个人信息", "姓名", "名字", "年龄", "身份", "身份证",
+        "账号", "账户", "密码", "口令", "职业", "工作", "学校", "职位",
+    ]):
+        return "profile"
     return "note"
 
 
@@ -2219,6 +2342,13 @@ async def get_slash_commands():
             "icon": "Tools",
             "type": "action",
         },
+        {
+            "name": "agent",
+            "label": "/agent",
+            "description": "切换到智能体模式（Agent）：自我反思与专家协作",
+            "icon": "UserFilled",
+            "type": "action",
+        },
     ]
 
     # 把技能列表附加为子命令
@@ -2244,44 +2374,79 @@ async def get_slash_commands():
 
 
 @router.get("/files/search")
-async def search_files(query: str = "", limit: int = 20):
+async def search_files(query: str = "", limit: int = 20, project_dir: str = ""):
     """
-    @文件搜索：在工作目录中搜索文件（用于前端 @ 触发）。
+    @文件搜索：在工作目录、配置的额外目录以及当前项目目录中搜索文件（用于前端 @ 触发）。
     """
     import glob as glob_module
+    from pathlib import Path as _Path
 
-    base_dir = settings.BASE_DIR
+    # 收集所有要搜索的根目录
+    search_roots: list[tuple[_Path, str]] = []   # (abs_path, label_prefix)
+
+    # 1) 默认 BASE_DIR
+    search_roots.append((settings.BASE_DIR, ""))
+
+    # 2) 配置的额外 file_search_dirs
+    try:
+        cfg = app_config
+        extra_dirs = cfg.general.file_search_dirs or []
+        for d in extra_dirs:
+            p = _Path(d)
+            if p.is_absolute() and p.is_dir():
+                search_roots.append((p, f"[{p.name}] "))
+    except Exception:
+        pass
+
+    # 3) 前端传来的 project_dir
+    if project_dir:
+        pd = _Path(project_dir)
+        if pd.is_absolute() and pd.is_dir():
+            # 去重：如果已经在 search_roots 中则跳过
+            existing = {str(r[0].resolve()) for r in search_roots}
+            if str(pd.resolve()) not in existing:
+                search_roots.append((pd, f"[{pd.name}] "))
+
     results = []
+    seen = set()
 
     try:
-        # 递归搜索常见文件类型
         patterns = ["**/*.md", "**/*.txt", "**/*.py", "**/*.js", "**/*.ts",
                     "**/*.json", "**/*.yaml", "**/*.yml", "**/*.csv",
                     "**/*.xlsx", "**/*.docx", "**/*.pdf"]
-        seen = set()
-        for pattern in patterns:
-            for path in base_dir.glob(pattern):
-                # 排除 node_modules / .git / __pycache__ / data
-                parts = path.parts
-                if any(p in parts for p in ("node_modules", ".git", "__pycache__",
-                                            "dist", "build", ".venv", "venv")):
-                    continue
-                rel = str(path.relative_to(base_dir)).replace("\\", "/")
-                if rel in seen:
-                    continue
-                # 关键词过滤
-                if query and query.lower() not in rel.lower():
-                    continue
-                seen.add(rel)
-                results.append({
-                    "path": rel,
-                    "name": path.name,
-                    "ext": path.suffix.lower(),
-                })
-                if len(results) >= limit:
-                    break
+        skip_dirs = {"node_modules", ".git", "__pycache__", "dist", "build", ".venv", "venv"}
+
+        for root_path, label in search_roots:
             if len(results) >= limit:
                 break
+            for pattern in patterns:
+                if len(results) >= limit:
+                    break
+                for path in root_path.glob(pattern):
+                    parts = path.parts
+                    if any(p in skip_dirs for p in parts):
+                        continue
+                    try:
+                        rel = str(path.relative_to(root_path)).replace("\\", "/")
+                    except ValueError:
+                        continue
+                    # 用 absolute path 去重
+                    abs_key = str(path.resolve())
+                    if abs_key in seen:
+                        continue
+                    # 关键词过滤
+                    if query and query.lower() not in rel.lower():
+                        continue
+                    seen.add(abs_key)
+                    results.append({
+                        "path": label + rel,
+                        "abs_path": str(path),
+                        "name": path.name,
+                        "ext": path.suffix.lower(),
+                        "root": str(root_path),
+                    })
+                    if len(results) >= limit:
+                        break
     except Exception as e:
         logger.warning(f"文件搜索失败: {e}")
 
@@ -2292,15 +2457,35 @@ async def search_files(query: str = "", limit: int = 20):
 
 
 @router.post("/read_file")
-async def read_file_content(path: str = Body(..., embed=True)):
+async def read_file_content(path: str = Body(..., embed=True), abs_path: str = Body(None, embed=True)):
     """
-    读取指定相对路径的文件内容，供 @ 文件插入使用。
+    读取指定路径的文件内容，供 @ 文件插入使用。
+    支持两种方式：
+    1. abs_path: 由文件搜索返回的绝对路径（需要在允许的目录范围内）
+    2. path: 相对于 BASE_DIR 的相对路径（兼容旧逻辑）
     """
     try:
-        base_dir = settings.BASE_DIR
-        full_path = (base_dir / path).resolve()
-        # 安全检查：不允许读取 base_dir 以外的文件
-        if not str(full_path).startswith(str(base_dir.resolve())):
+        from pathlib import Path as _Path
+
+        # 构建允许的目录白名单
+        allowed_roots = [settings.BASE_DIR.resolve()]
+        try:
+            cfg = app_config
+            for d in (cfg.general.file_search_dirs or []):
+                p = _Path(d)
+                if p.is_absolute() and p.is_dir():
+                    allowed_roots.append(p.resolve())
+        except Exception:
+            pass
+
+        # 优先使用 abs_path
+        if abs_path:
+            full_path = _Path(abs_path).resolve()
+        else:
+            full_path = (settings.BASE_DIR / path).resolve()
+
+        # 安全检查：必须在允许的目录之一内
+        if not any(str(full_path).startswith(str(root)) for root in allowed_roots):
             raise HTTPException(status_code=403, detail="不允许读取此路径")
         if not full_path.exists() or not full_path.is_file():
             raise HTTPException(status_code=404, detail="文件不存在")
@@ -2351,6 +2536,7 @@ async def send_to_opencode(request: SendMessageRequest):
             "message": full_message,
             "model": request.model,
             "mode": request.mode,
+            "project_dir": request.project_dir,
         })
         return {
             "success": True,
@@ -2369,7 +2555,8 @@ async def send_to_opencode(request: SendMessageRequest):
             full_message,
             model=request.model,
             mode=request.mode,
-            conversation_id=conv_id
+            conversation_id=conv_id,
+            project_dir=request.project_dir
         )
 
         if content:
@@ -2382,7 +2569,7 @@ async def send_to_opencode(request: SendMessageRequest):
             if conversation:
                 existing_title = conversation.get("title") or ""
                 if existing_title == "新对话" or existing_title.strip() == "":
-                    new_title = generate_conversation_title(content)
+                    new_title = generate_conversation_title(content, user_message=request.message)
                     await memory_manager.update_conversation_title(request.conversation_id, new_title)
 
             # 后台自动提取用户习惯/偏好（不阻塞响应）
@@ -2478,7 +2665,8 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                 full_message,
                 model=request.model,
                 mode=request.mode,
-                conversation_id=conv_id
+                conversation_id=conv_id,
+                project_dir=request.project_dir
             ):
                 event_type = stream_event.get("type")
                 if event_type == "internal_prompt":
@@ -2534,7 +2722,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                 if conversation:
                     existing_title = conversation.get("title") or ""
                     if existing_title == "新对话" or existing_title.strip() == "":
-                        new_title = generate_conversation_title(content)
+                        new_title = generate_conversation_title(content, user_message=request.message)
                         await memory_manager.update_conversation_title(request.conversation_id, new_title)
 
                 asyncio.create_task(
@@ -2629,7 +2817,8 @@ async def _drain_queue(conv_id: str, conversation_id: int):
                 task["message"],
                 model=task.get("model"),
                 mode=task.get("mode"),
-                conversation_id=conv_id
+                conversation_id=conv_id,
+                project_dir=task.get("project_dir")
             )
             if content:
                 await memory_manager.save_message(

@@ -18,7 +18,12 @@ from loguru import logger
 
 
 def _get_skills_dir() -> Path:
-    return Path(__file__).parent.parent.parent / "skills"
+    """Return the skills directory, consistent with settings.SKILLS_DIR."""
+    try:
+        from config import settings as _settings
+        return _settings.SKILLS_DIR
+    except Exception:
+        return Path(__file__).parent.parent.parent / "skills"
 
 
 def _read_skill_markdown(path: Path) -> Tuple[str, str, str]:
@@ -121,6 +126,13 @@ def _load_all_skills() -> List[dict]:
                 })
     except Exception:
         pass
+
+    # ── 去重：builtin 优先于 opencode ──────────────────────────────────────
+    builtin_names = {s["id"].split(":", 1)[1] for s in skills if s.get("source") == "builtin"}
+    skills = [
+        s for s in skills
+        if not (s.get("source") == "opencode" and s["id"].split(":", 1)[1] in builtin_names)
+    ]
 
     return skills
 

@@ -50,6 +50,17 @@ ipcMain.handle('open-builtin', (_event, url) => {
   }
 });
 
+// 选择文件夹对话框（用于项目目录选择等）
+ipcMain.handle('dialog:selectFolder', async (_event, options) => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: (options && options.title) || '选择文件夹',
+    properties: ['openDirectory'],
+    defaultPath: (options && options.defaultPath) || undefined,
+  });
+  if (result.canceled || !result.filePaths.length) return null;
+  return result.filePaths[0];
+});
+
 // 创建内置浏览器窗口的辅助函数
 // 使用 persist:builtin-browser 命名持久化 session，确保 Cookie 跨窗口关闭后保留
 function openBuiltinBrowserWindow(url) {

@@ -249,6 +249,14 @@ def _list_skills() -> List[dict]:
     items.extend(_list_auto_skills())
     items.extend(_list_opencode_skills())
     items.extend(_list_custom_dir_skills())
+
+    # ── 去重：builtin 优先于 opencode，同名技能只保留 builtin ──
+    builtin_names = {it["id"].split(":", 1)[1] for it in items if it.get("source") == "builtin"}
+    items = [
+        it for it in items
+        if not (it.get("source") == "opencode" and it["id"].split(":", 1)[1] in builtin_names)
+    ]
+
     items.sort(key=lambda x: x.get("installed_at", ""), reverse=True)
     return items
 

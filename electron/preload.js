@@ -17,6 +17,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 通知主进程链接打开模式（'system' 或 'builtin'），让主进程的拦截器知道如何处理
   setLinkOpenMode: (mode) => ipcRenderer.invoke('set-link-open-mode', mode),
   
+  // 选择文件夹（用于项目目录选择等）
+  selectFolder: (options) => ipcRenderer.invoke('dialog:selectFolder', options),
+
   // 系统信息
   getPlatform: () => require('process').platform,
   getVersion: () => ipcRenderer.invoke('get-version'),

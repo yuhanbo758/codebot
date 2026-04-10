@@ -37,10 +37,21 @@
             </el-button>
           </div>
         </div>
+
+        <!-- 对话搜索框 -->
+        <div class="conversation-search">
+          <el-input
+            v-model="conversationSearchQuery"
+            placeholder="搜索对话..."
+            clearable
+            size="small"
+            :prefix-icon="Search"
+          />
+        </div>
         
         <div class="conversation-list">
           <div
-            v-for="conv in conversations"
+            v-for="conv in filteredConversations"
             :key="conv.id"
             class="conversation-item"
             :class="{ active: currentConversationId === conv.id, 'batch-selected': selectedConvIds.includes(conv.id) }"
@@ -79,7 +90,8 @@
             </div>
           </div>
           
-          <el-empty v-if="conversations.length === 0" description="暂无对话" />
+          <el-empty v-if="filteredConversations.length === 0 && !conversationSearchQuery" description="暂无对话" />
+          <el-empty v-else-if="filteredConversations.length === 0 && conversationSearchQuery" description="无匹配对话" />
         </div>
       </el-aside>
       
@@ -117,6 +129,19 @@
                 <div class="message-content">
                   <div v-if="msg.streaming" class="message-text streaming-text">{{ msg.content }}</div>
                   <div v-else class="message-text markdown-body" v-html="renderMarkdown(msg.content)"></div>
+                  <!-- Plan 模式交互选项 -->
+                  <div v-if="!msg.streaming && msg.role === 'assistant' && extractOptions(msg.content).length > 0" class="plan-options">
+                    <div class="plan-options-label">请选择：</div>
+                    <div class="plan-options-btns">
+                      <el-button
+                        v-for="(opt, oi) in extractOptions(msg.content)"
+                        :key="oi"
+                        size="small"
+                        round
+                        @click="onOptionClick(opt)"
+                      >{{ opt }}</el-button>
+                    </div>
+                  </div>
                   <div class="message-footer">
                     <div class="message-time">{{ formatDate(msg.created_at) }}</div>
                     <div class="message-actions">
@@ -206,6 +231,10 @@
                   <el-option value="plan" label="Plan">
                     <span class="agent-option-name">Plan</span>
                     <span class="agent-option-desc">规划模式，拆解步骤后输出计划</span>
+                  </el-option>
+                  <el-option value="agent" label="Agent">
+                    <span class="agent-option-name">Agent</span>
+                    <span class="agent-option-desc">智能体模式，自我反思与专家协作</span>
                   </el-option>
                 </el-select>
                 <el-divider direction="vertical" />
@@ -337,6 +366,12 @@
             />
             <div class="input-actions">
               <div class="input-actions-left">
+                <el-tooltip :content="currentProjectDir ? ('项目: ' + currentProjectDir) : '选择项目文件夹'" placement="top">
+                  <el-button @click="selectProjectFolder" :type="currentProjectDir ? 'success' : 'default'">
+                    <el-icon><FolderOpened /></el-icon>
+                    {{ currentProjectDir ? projectDirName : '项目' }}
+                  </el-button>
+                </el-tooltip>
                 <el-button @click="triggerFileUpload" :loading="uploadingFile" title="上传文件（支持图片、文档、代码等）">
                   <el-icon><Paperclip /></el-icon>
                   附件
@@ -413,7 +448,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted, nextTick, computed, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Grid, Delete, Refresh, VideoPlay, VideoPause, Upload, Close, Document, Paperclip, Picture } from '@element-plus/icons-vue'
+import { Grid, Delete, Refresh, VideoPlay, VideoPause, Upload, Close, Document, Paperclip, Picture, Search, FolderOpened } from '@element-plus/icons-vue'
 import axios from 'axios'
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js'
@@ -450,7 +485,28 @@ md.renderer.rules.link_open = function(tokens, idx, options, env, self) {
 
 const renderMarkdown = (content) => {
   if (!content) return ''
-  return md.render(content)
+  // 渲染前移除 options 注释块，避免在 HTML 中残留
+  const cleaned = (content || '').replace(/<!--\s*options\s*\n[\s\S]*?-->/g, '')
+  return md.render(cleaned)
+}
+
+/**
+ * 从消息内容中提取 <!-- options\n- 选项A\n- 选项B\n--> 中的选项列表
+ */
+const extractOptions = (content) => {
+  if (!content) return []
+  const match = content.match(/<!--\s*options\s*\n([\s\S]*?)-->/)
+  if (!match) return []
+  const lines = match[1].split('\n').map(l => l.trim()).filter(l => l.startsWith('- '))
+  return lines.map(l => l.replace(/^-\s*/, '').trim()).filter(Boolean)
+}
+
+/**
+ * 点击选项按钮：将选项内容填入输入框并发送
+ */
+const onOptionClick = (optionText) => {
+  inputMessage.value = optionText
+  nextTick(() => sendMessage())
 }
 
 // 前端流式内容清洗：镜像后端 _sanitize_assistant_output 的核心逻辑
@@ -625,6 +681,20 @@ const messageListRef = ref(null)
 const inputRef = ref(null)
 const fileInputRef = ref(null)
 
+// 对话搜索
+const conversationSearchQuery = ref('')
+const filteredConversations = computed(() => {
+  const q = conversationSearchQuery.value.trim()
+  if (!q) return conversations.value
+  // 按空格分词（支持中英文），所有词必须同时匹配标题（AND 逻辑）
+  const tokens = q.split(/[\s\u3000]+/).filter(Boolean).map(t => t.toLowerCase())
+  if (tokens.length === 0) return conversations.value
+  return conversations.value.filter(conv => {
+    const title = (conv.title || '').toLowerCase()
+    return tokens.every(tok => title.includes(tok))
+  })
+})
+
 // 生成技能
 const showSkillDialog = ref(false)
 const generatingSkill = ref(false)
@@ -634,6 +704,59 @@ const skillGenDescription = ref('')
 const AGENT_MODE_KEY = 'codebot:agentMode'
 const agentMode = ref(localStorage.getItem(AGENT_MODE_KEY) || 'build')
 watch(agentMode, (val) => { localStorage.setItem(AGENT_MODE_KEY, val) })
+
+// 项目文件夹
+const PROJECT_DIR_KEY = 'codebot:projectDir'
+const currentProjectDir = ref(localStorage.getItem(PROJECT_DIR_KEY) || '')
+const projectDirName = computed(() => {
+  if (!currentProjectDir.value) return ''
+  const parts = currentProjectDir.value.replace(/[\\/]+$/, '').split(/[\\/]/)
+  return parts[parts.length - 1] || ''
+})
+watch(currentProjectDir, (val) => {
+  if (val) localStorage.setItem(PROJECT_DIR_KEY, val)
+  else localStorage.removeItem(PROJECT_DIR_KEY)
+})
+
+async function selectProjectFolder() {
+  // 如果已选择项目，点击时提供取消选项
+  if (currentProjectDir.value) {
+    try {
+      await ElMessageBox.confirm(
+        `当前项目: ${currentProjectDir.value}`,
+        '项目文件夹',
+        { confirmButtonText: '重新选择', cancelButtonText: '取消选择', distinguishCancelAndClose: true }
+      )
+      // 用户点了"重新选择"
+    } catch (action) {
+      if (action === 'cancel') {
+        currentProjectDir.value = ''
+        ElMessage.info('已取消项目选择')
+      }
+      return
+    }
+  }
+  // 调用 Electron 文件夹选择对话框
+  if (window.electronAPI && window.electronAPI.selectFolder) {
+    const dir = await window.electronAPI.selectFolder({ title: '选择项目文件夹' })
+    if (dir) {
+      currentProjectDir.value = dir
+      ElMessage.success(`项目已设置: ${projectDirName.value}`)
+    }
+  } else {
+    // 非 Electron 环境（浏览器）- 使用输入框手动输入
+    ElMessageBox.prompt('请输入项目文件夹完整路径', '选择项目', {
+      inputValue: currentProjectDir.value,
+      confirmButtonText: '确定',
+      cancelButtonText: '取消'
+    }).then(({ value }) => {
+      if (value && value.trim()) {
+        currentProjectDir.value = value.trim()
+        ElMessage.success(`项目已设置: ${projectDirName.value}`)
+      }
+    }).catch(() => {})
+  }
+}
 
 // 终止任务
 const aborting = ref(false)
@@ -779,6 +902,7 @@ const selectCommand = (cmd) => {
   if (cmd.type === 'action') {
     if (cmd.name === 'plan') { agentMode.value = 'plan'; ElMessage.success('已切换到 Plan 模式') }
     else if (cmd.name === 'build') { agentMode.value = 'build'; ElMessage.success('已切换到 Build 模式') }
+    else if (cmd.name === 'agent') { agentMode.value = 'agent'; ElMessage.success('已切换到 Agent 模式') }
     else if (cmd.name === 'clear') { inputMessage.value = '' }
     else if (cmd.name === 'memory') {
       inputMessage.value += '显示与当前话题相关的记忆'
@@ -802,7 +926,11 @@ let _atSearchTimer = null
 const searchAtFiles = async (query) => {
   atLoading.value = true
   try {
-    const res = await axios.get('/api/chat/files/search', { params: { query, limit: 15 } })
+    const params = { query, limit: 15 }
+    if (currentProjectDir.value) {
+      params.project_dir = currentProjectDir.value
+    }
+    const res = await axios.get('/api/chat/files/search', { params })
     atFiles.value = res.data?.data?.files || []
   } catch (e) {
     atFiles.value = []
@@ -823,7 +951,9 @@ const selectAtFile = async (file) => {
 
   // 读取文件内容并加入附件
   try {
-    const res = await axios.post('/api/chat/read_file', { path: file.path })
+    const payload = { path: file.path }
+    if (file.abs_path) payload.abs_path = file.abs_path
+    const res = await axios.post('/api/chat/read_file', payload)
     if (res.data?.success) {
       // 避免重复附加
       if (!attachedFiles.value.find(f => f.name === res.data.data.name && f.content === res.data.data.content)) {
@@ -1503,6 +1633,7 @@ const sendMessage = async () => {
         model: selectedModel.value || null,
         mode: agentMode.value || null,
         attached_files: filesToSend.length > 0 ? filesToSend : null,
+        project_dir: currentProjectDir.value || null,
       })
       if (response.data?.data?.queued) {
         queuedCount.value += 1
@@ -1578,6 +1709,7 @@ const sendMessage = async () => {
         model: selectedModel.value || null,
         mode: agentMode.value || null,
         attached_files: filesToSend.length > 0 ? filesToSend : null,
+        project_dir: currentProjectDir.value || null,
       }, async (event) => {
         if (event?.type === 'queued') {
           queuedCount.value += 1
@@ -1988,6 +2120,11 @@ onUnmounted(() => {
   border: 1px solid #b3d8ff;
 }
 
+.conversation-search {
+  padding: 8px 12px;
+  border-bottom: 1px solid #e4e7ed;
+}
+
 .conversation-list {
   flex: 1;
   overflow-y: auto;
@@ -2219,6 +2356,31 @@ onUnmounted(() => {
   margin-top: 4px;
   height: 20px;
   gap: 8px;
+}
+
+.plan-options {
+  margin-top: 12px;
+  padding: 10px 14px;
+  background: #f0f7ff;
+  border-radius: 8px;
+  border: 1px solid #d4e5f7;
+}
+
+.plan-options-label {
+  font-size: 12px;
+  color: #606266;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+
+.plan-options-btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.plan-options-btns .el-button {
+  font-size: 13px;
 }
 
 .message-actions {

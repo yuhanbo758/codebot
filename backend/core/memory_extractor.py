@@ -54,12 +54,20 @@ _EXTRACTION_RULES: List[Tuple[re.Pattern, str]] = [
 _MIN_CONTENT_LEN = 4
 _SKIP_KEYWORDS = {"一下", "这里", "那里", "这个", "那个", "什么", "怎么"}
 _AI_MAX_ITEMS = 5
-_AI_EXTRACT_SYSTEM_PROMPT = """你是记忆抽取助手。请从用户消息中提取“值得长期记住”的信息，规则：
+_AI_EXTRACT_SYSTEM_PROMPT = """你是记忆抽取助手。请从用户消息中提取"值得长期记住"的信息，规则：
 1) 仅提取稳定或高价值信息：偏好、习惯、身份信息、联系方式、地址、长期计划、明确备忘。
 2) 忽略一次性闲聊、无关寒暄、临时状态。
 3) 分类只允许：habit, preference, profile, note, contact, address。
 4) 返回 JSON 数组，每项为 {"content":"...", "category":"..."}。
-5) 不要输出任何解释文字。"""
+5) 不要输出任何解释文字。
+
+分类边界（严格遵守）：
+- preference（偏好）：用户喜欢/不喜欢什么、偏爱的风格/工具/语言/框架/方式。例如"喜欢简洁回复""偏好Python""爱用VSCode"。
+- habit（习惯）：用户日常行为模式、经常做的事。例如"每天早上跑步""常用Python编程""习惯用Markdown写笔记"。
+- profile（个人信息）：仅限身份/人口学信息，如姓名、年龄、生日、职业、学校、公司。不要把使用偏好或行为习惯归为profile！
+- contact（联系人）：仅限电话号码、邮箱地址、微信号等明确的联系方式。
+- address（地址）：仅限物理地址（家庭、公司、收货地址等）。
+- note（笔记）：不属于以上任何类别的备忘、计划、提醒。"""
 
 
 def _clean(text: str) -> str:
