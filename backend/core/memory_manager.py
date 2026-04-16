@@ -119,6 +119,8 @@ class MemoryManager:
             cursor.execute("ALTER TABLE conversations ADD COLUMN is_group BOOLEAN DEFAULT 0")
         if "share_id" not in existing:
             cursor.execute("ALTER TABLE conversations ADD COLUMN share_id TEXT")
+        if "project_dir" not in existing:
+            cursor.execute("ALTER TABLE conversations ADD COLUMN project_dir TEXT")
 
     def _ensure_long_term_memory_columns(self, cursor: sqlite3.Cursor):
         columns = cursor.execute("PRAGMA table_info(long_term_memories)").fetchall()
@@ -131,12 +133,12 @@ class MemoryManager:
                 "WHERE updated_at IS NULL"
             )
     
-    async def create_conversation(self, title: str = "新对话") -> int:
+    async def create_conversation(self, title: str = "新对话", project_dir: str = None) -> int:
         """创建对话"""
         cursor = self.sqlite_db.cursor()
         cursor.execute(
-            "INSERT INTO conversations (title) VALUES (?)",
-            (title,)
+            "INSERT INTO conversations (title, project_dir) VALUES (?, ?)",
+            (title, project_dir)
         )
         self.sqlite_db.commit()
         conversation_id = cursor.lastrowid
@@ -186,6 +188,15 @@ class MemoryManager:
         cursor.execute(
             "UPDATE conversations SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (title, conversation_id)
+        )
+        self.sqlite_db.commit()
+
+    async def update_conversation_project_dir(self, conversation_id: int, project_dir: str = None):
+        """更新对话关联的项目目录"""
+        cursor = self.sqlite_db.cursor()
+        cursor.execute(
+            "UPDATE conversations SET project_dir = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (project_dir, conversation_id)
         )
         self.sqlite_db.commit()
 

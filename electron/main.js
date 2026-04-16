@@ -5,12 +5,30 @@ const os = require('os');
 const http = require('http');
 const fs = require('fs');
 
+const BACKEND_URL = 'http://127.0.0.1:8080';
+const FRONTEND_DEV_URL = 'http://127.0.0.1:3000';
+
+function isInternalAppUrl(url) {
+  return url.startsWith(BACKEND_URL)
+    || url.startsWith('http://localhost:8080')
+    || url.startsWith(FRONTEND_DEV_URL)
+    || url.startsWith('http://localhost:3000');
+}
+
+// 显式隔离 Electron 的会话数据目录，避免开发态和打包态混用缓存数据。
+const codebotUserDataDir = path.join(app.getPath('appData'), 'codebot');
+app.setPath('userData', codebotUserDataDir);
+app.setPath('sessionData', path.join(codebotUserDataDir, 'session'));
+
 let mainWindow;
 let backendProcess;
 // 链接打开模式：'system'（默认，使用系统浏览器）或 'builtin'（应用内置浏览器窗口）
 let linkOpenMode = 'system';
 
 app.commandLine.appendSwitch('disable-http-cache');
+// 防止与其他 Electron 应用（如 OpenCode 桌面端）同时运行时
+// Chromium 出现 "Network service crashed, restarting service" 错误
+app.commandLine.appendSwitch('disable-gpu-sandbox');
 
 ipcMain.handle('clipboard-copy', (_event, text) => {
   if (typeof text !== 'string') {
@@ -117,12 +135,19 @@ function createWindow() {
     icon: path.join(__dirname, '..', 'logo.ico'),
   });
 
+  mainWindow.loadFile(path.join(__dirname, 'loading.html')).catch((error) => {
+    console.error(`[window] 加载启动页失败: ${error.message || error}`);
+  });
+
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    console.error(`[window] 页面加载失败: ${validatedURL} (${errorCode}) ${errorDescription}`);
+  });
+
   startBackend()
     .then(() => waitForBackendReady())
     .then(async () => {
       const localIP = getLocalIP();
-      const url = 'http://127.0.0.1:8080';
-      await mainWindow.webContents.session.clearCache();
+      const url = await resolveRendererUrl();
       await mainWindow.loadURL(url);
       
       console.log(`
@@ -136,6 +161,23 @@ function createWindow() {
       `);
     })
     .catch((error) => {
+      console.error(`[window] 后端启动链路失败: ${error.message || error}`);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.executeJavaScript(`
+          document.title = 'Codebot 启动失败';
+          document.body.innerHTML = ` + JSON.stringify(`
+            <main style="font-family:Segoe UI,PingFang SC,Microsoft YaHei,sans-serif;min-height:100vh;margin:0;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#e2e8f0;">
+              <section style="width:min(560px,calc(100vw - 48px));padding:32px;border-radius:20px;background:rgba(15,23,42,.88);border:1px solid rgba(248,113,113,.28);box-shadow:0 20px 60px rgba(0,0,0,.35);">
+                <h1 style="margin:0 0 12px;font-size:28px;color:#f8fafc;">Codebot 启动失败</h1>
+                <p style="margin:0 0 14px;line-height:1.7;color:#cbd5e1;">后端服务没有在预期时间内就绪，请查看日志后重试。</p>
+                <pre style="margin:0;padding:16px;border-radius:14px;background:#111827;color:#fca5a5;white-space:pre-wrap;word-break:break-word;">${escapeHtml(error.message || String(error))}</pre>
+              </section>
+            </main>
+          `) + `;
+        `).catch((renderError) => {
+          console.error(`[window] 渲染启动失败页失败: ${renderError.message || renderError}`);
+        });
+      }
       dialog.showErrorBox('服务启动失败', error.message || '无法连接到后端服务');
     });
 
@@ -144,7 +186,7 @@ function createWindow() {
   // 拦截窗口内导航：根据用户设置选择在内置窗口或系统浏览器中打开外部链接
   mainWindow.webContents.on('will-navigate', (event, url) => {
     // 允许导航回本地应用的地址
-    if (url.startsWith('http://127.0.0.1:8080') || url.startsWith('http://localhost:8080')) {
+    if (isInternalAppUrl(url)) {
       return;
     }
     event.preventDefault();
@@ -186,8 +228,7 @@ async function startBackend() {
         return;
       }
       if (runtimeSource === 'source') {
-        console.log('[backend] 开发模式检测到源码后端且 OpenCode 已连接，跳过启动');
-        return;
+        console.log('[backend] 开发模式检测到源码后端，准备重启以加载最新代码');
       }
     }
     if (payload?.pid) {
@@ -212,6 +253,7 @@ async function startBackend() {
   const frontendDist = app.isPackaged
     ? path.join(process.resourcesPath || '', 'frontend-dist')
     : path.join(repoRoot, 'frontend', 'dist');
+  const docsSource = path.join(repoRoot, 'README.md');
 
   // userData = %APPDATA%\codebot，始终可写
   const userDataDir = app.getPath('userData');
@@ -240,6 +282,7 @@ async function startBackend() {
     CODEBOT_FRONTEND_DIST: frontendDist,
     CODEBOT_DATA_DIR: userDataDir,
     CODEBOT_RESOURCES_DIR: resourcesDir,
+    CODEBOT_DOCS_SOURCE: docsSource,
     CODEBOT_OPENCODE_PATH: opencodePath,
     CODEBOT_FORCE_OPENCODE_AUTOSTART: '1',
     CODEBOT_OPENCODE_PREFERRED_PORT: '1120',
@@ -255,6 +298,10 @@ async function startBackend() {
   // 开发模式（npm start / electron . ）始终使用 Python 源码，确保加载最新修改
 
   if (isDev) {
+    const devServerReady = await checkFrontendDevServer().then(() => true).catch(() => false);
+    if (!devServerReady) {
+      await ensureFrontendDist(repoRoot);
+    }
     const venvPython = path.join(repoRoot, 'venv', 'Scripts', 'python.exe');
     const { spawnSync } = require('child_process');
     const venvOk = fs.existsSync(venvPython) &&
@@ -318,7 +365,7 @@ async function startBackend() {
 
 function checkHealth() {
   return new Promise((resolve, reject) => {
-    const req = http.get('http://127.0.0.1:8080/api/health', (res) => {
+    const req = http.get(`${BACKEND_URL}/api/health`, (res) => {
       let data = '';
       res.on('data', (chunk) => (data += chunk));
       res.on('end', () => {
@@ -343,6 +390,74 @@ function checkHealth() {
       req.destroy(new Error('健康检查超时'));
     });
   });
+}
+
+function checkFrontendDevServer() {
+  return new Promise((resolve, reject) => {
+    const req = http.get(FRONTEND_DEV_URL, (res) => {
+      if (res.statusCode && res.statusCode >= 200 && res.statusCode < 500) {
+        resolve(true);
+        res.resume();
+        return;
+      }
+      reject(new Error(`前端开发服务不可用: ${res.statusCode}`));
+    });
+    req.on('error', (err) => reject(err));
+    req.setTimeout(1000, () => {
+      req.destroy(new Error('前端开发服务超时'));
+    });
+  });
+}
+
+async function resolveRendererUrl() {
+  if (!app.isPackaged) {
+    try {
+      await checkFrontendDevServer();
+      return FRONTEND_DEV_URL;
+    } catch (_) {}
+  }
+  return BACKEND_URL;
+}
+
+function ensureFrontendDist(repoRoot) {
+  return new Promise((resolve, reject) => {
+    const buildCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+    const buildArgs = ['run', 'build'];
+    const buildCwd = path.join(repoRoot, 'frontend');
+    const useShell = process.platform === 'win32';
+    console.log('[frontend] 开始构建前端资源...');
+    const buildProcess = spawn(buildCmd, buildArgs, {
+      cwd: buildCwd,
+      env: { ...process.env },
+      stdio: 'pipe',
+      detached: false,
+      shell: useShell,
+    });
+    let stderr = '';
+    buildProcess.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    buildProcess.on('error', (error) => {
+      reject(error);
+    });
+    buildProcess.on('exit', (code) => {
+      if (code === 0) {
+        console.log('[frontend] 前端资源构建完成');
+        resolve();
+        return;
+      }
+      reject(new Error(stderr.trim() || `前端构建失败，退出码 ${code}`));
+    });
+  });
+}
+
+function escapeHtml(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 async function waitForBackendReady() {

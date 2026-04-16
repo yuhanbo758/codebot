@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Codebot 启动中</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #0b1220;
+      color: #e5eefc;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background:
+        radial-gradient(circle at top, rgba(59, 130, 246, 0.28), transparent 38%),
+        linear-gradient(160deg, #08101d, #101a2d 55%, #0f172a);
+    }
+
+    .panel {
+      width: min(560px, calc(100vw - 48px));
+      padding: 32px;
+      border-radius: 24px;
+      background: rgba(15, 23, 42, 0.82);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+      backdrop-filter: blur(14px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .logo {
+      width: 42px;
+      height: 42px;
+      border-radius: 12px;
+      display: grid;
+      place-items: center;
+      font-size: 20px;
+      font-weight: 700;
+      color: #fff;
+      background: linear-gradient(135deg, #3b82f6, #22c55e);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.15;
+      font-weight: 650;
+    }
+
+    p {
+      margin: 0;
+      color: #bfdbfe;
+      line-height: 1.7;
+      font-size: 14px;
+    }
+
+    .status {
+      margin-top: 24px;
+      padding: 16px 18px;
+      border-radius: 16px;
+      background: rgba(30, 41, 59, 0.75);
+      border: 1px solid rgba(96, 165, 250, 0.22);
+    }
+
+    .status-label {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      font-size: 14px;
+      color: #dbeafe;
+    }
+
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      border: 2px solid rgba(191, 219, 254, 0.25);
+      border-top-color: #60a5fa;
+      animation: spin 0.9s linear infinite;
+    }
+
+    .hint {
+      margin-top: 18px;
+      font-size: 12px;
+      color: #93c5fd;
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="panel">
+    <div class="brand">
+      <div class="logo">C</div>
+      <div>
+        <h1>Codebot</h1>
+        <p>正在准备后端服务、OpenCode 连接和本地资源。</p>
+      </div>
+    </div>
+    <section class="status">
+      <div class="status-label">
+        <span class="spinner"></span>
+        <span>窗口已打开，服务继续在后台启动</span>
+      </div>
+      <p>如果是开发模式首次启动，前端构建和 Python 环境检查可能需要几十秒。</p>
+    </section>
+    <p class="hint">提示：只要这个窗口还在变化，程序通常没有卡死。</p>
+  </main>
+</body>
+</html>

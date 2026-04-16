@@ -21,6 +21,7 @@ from config import app_config, settings, McpServerConfig
 from core.memory_manager import MemoryManager
 from core.opencode_ws import OpenCodeClient
 from api.routes import scheduler as scheduler_router
+from api.routes import gateway as gateway_router
 from api.routes import skills as skills_router
 
 router = APIRouter()
@@ -822,18 +823,35 @@ def get_codebot_remote_mcp_status() -> dict:
     }
 
 
-async def _is_opencode_connected() -> bool:
-    client = OpenCodeClient(app_config.opencode.server_url)
-    try:
-        return await client.try_connect(attempts=1, delay=0)
-    except Exception:
-        return False
-    finally:
-        if getattr(client, "connected", False):
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+async def _get_opencode_connection_snapshot() -> dict:
+    shared_client = getattr(gateway_router, "opencode_ws", None)
+    shared_connected = bool(getattr(shared_client, "connected", False)) if shared_client else False
+    detected_connected = False
+
+    if shared_client is not None:
+        try:
+            detected_connected = await shared_client.try_connect(attempts=2, delay=0.25, open_timeout=1.5)
+        except Exception:
+            detected_connected = False
+    else:
+        client = OpenCodeClient(app_config.opencode.server_url)
+        try:
+            detected_connected = await client.try_connect(attempts=2, delay=0.25, open_timeout=1.5)
+        except Exception:
+            detected_connected = False
+        finally:
+            if getattr(client, "connected", False):
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+    # 展示层优先采用共享客户端当前状态，并用实时探测结果补强，减少瞬时抖动。
+    return {
+        "shared_connected": shared_connected,
+        "detected_connected": detected_connected,
+        "connected": bool(shared_connected or detected_connected),
+    }
 
 
 def ensure_codebot_remote_mcp_in_opencode() -> dict:
@@ -1625,7 +1643,7 @@ async def get_codebot_third_party_status():
     skills_sync = await skills_router.get_opencode_sync_status()
     proxied_servers = [server for server in _read_all() if _is_proxyable_external_server(server)]
     proxy_tools = await _list_external_proxy_tool_definitions()
-    opencode_connected = await _is_opencode_connected()
+    opencode_status = await _get_opencode_connection_snapshot()
     skills_sync_data = skills_sync.get("data") if isinstance(skills_sync, dict) else {}
     return {
         "success": True,
@@ -1637,7 +1655,8 @@ async def get_codebot_third_party_status():
             "message_url_template": f"http://{_codebot_bind_host()}:{app_config.network.port}/api/mcp/codebot/messages?sessionId={{session_id}}",
             "bridge_status": get_codebot_remote_mcp_status(),
             "opencode_server_url": app_config.opencode.server_url,
-            "opencode_connected": opencode_connected,
+            "opencode_connected": opencode_status["connected"],
+            "opencode_status": opencode_status,
             "skills_sync": skills_sync_data,
             "builtin_skill_count": int(skills_sync_data.get("total_codebot") or 0),
             "synced_skill_count": int(skills_sync_data.get("total_synced") or 0),

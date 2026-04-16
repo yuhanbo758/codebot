@@ -111,6 +111,8 @@ class SandboxManager:
         self._workspace.mkdir(parents=True, exist_ok=True)
         self._status.workspace_dir = str(self._workspace)
         self._status.ready = True
+        self._current_proc: Optional[asyncio.subprocess.Process] = None
+        self._proc_lock = asyncio.Lock()
 
         logger.info(f"沙箱管理器初始化（本地隔离模式），工作目录：{self._workspace}")
 
@@ -140,7 +142,12 @@ class SandboxManager:
         logger.debug("stop_vm 调用（本地模式，无操作）")
 
     async def shutdown(self):
-        """应用关闭时清理资源。本地模式下无需清理。"""
+        """应用关闭时清理资源。"""
+        async with self._proc_lock:
+            proc = self._current_proc
+            self._current_proc = None
+        if proc and proc.returncode is None:
+            _kill_process_tree(proc)
         logger.debug("沙箱管理器关闭")
 
     def update_config(self, config):
@@ -246,17 +253,34 @@ class SandboxManager:
         """
         # 构建执行环境（参考 LobsterAI 的环境变量处理）
         exec_env = _build_exec_env(env)
+        proc = None
 
         logger.debug(f"沙箱执行命令（cwd={cwd}）: {command[:200]}")
 
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(cwd),
-                env=exec_env,
-            )
+            async with self._proc_lock:
+                running = self._current_proc
+                if running and running.returncode is None:
+                    return SandboxResult(
+                        success=False,
+                        error="已有沙箱任务正在执行，请等待当前任务完成",
+                        exit_code=409,
+                        execution_mode="local",
+                    )
+
+                creationflags = 0
+                if sys.platform == "win32":
+                    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(cwd),
+                    env=exec_env,
+                    creationflags=creationflags,
+                )
+                self._current_proc = proc
 
             try:
                 stdout, stderr = await asyncio.wait_for(
@@ -264,7 +288,7 @@ class SandboxManager:
                     timeout=timeout,
                 )
             except asyncio.TimeoutError:
-                _kill_process(proc)
+                _kill_process_tree(proc)
                 return SandboxResult(
                     success=False,
                     error=f"命令执行超时（{timeout}秒）",
@@ -321,6 +345,10 @@ class SandboxManager:
                 exit_code=1,
                 execution_mode="local",
             )
+        finally:
+            async with self._proc_lock:
+                if proc is not None and self._current_proc is proc:
+                    self._current_proc = None
 
 
 # ── 辅助函数 ────────────────────────────────────────────────────────────────
@@ -361,3 +389,26 @@ def _kill_process(proc) -> None:
         proc.kill()
     except Exception:
         pass
+
+
+def _kill_process_tree(proc) -> None:
+    """尽量终止整个进程树，避免 Windows 下 shell 子进程残留。"""
+    try:
+        pid = int(getattr(proc, "pid", 0) or 0)
+    except Exception:
+        pid = 0
+
+    if pid and sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+            return
+        except Exception:
+            pass
+
+    _kill_process(proc)

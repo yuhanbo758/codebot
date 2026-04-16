@@ -68,6 +68,7 @@
                 <span class="conversation-title-text">{{ conv.title }}</span>
                 <el-tag v-if="conv.is_pinned" size="small" type="info">置顶</el-tag>
                 <el-tag v-if="conv.is_group" size="small" type="success">群聊</el-tag>
+                <el-tag v-if="conv.project_dir" size="small" type="warning" :title="conv.project_dir">📁</el-tag>
               </div>
               <div class="conversation-time">{{ formatDate(conv.updated_at) }}</div>
             </div>
@@ -108,6 +109,19 @@
             <el-tag size="small" type="info">
               代理 {{ thirdPartyStatus.proxied_server_count || 0 }} 个 MCP
             </el-tag>
+            <el-tag size="small" type="info">
+              工具 {{ thirdPartyStatus.proxied_tool_count || 0 }} 个
+            </el-tag>
+            <el-button
+              size="small"
+              text
+              :loading="thirdPartyStatusRefreshing"
+              @click="refreshThirdPartyConnections"
+              title="刷新 OpenCode / Bridge / MCP 连接状态"
+              class="refresh-btn"
+            >
+              <el-icon><Refresh /></el-icon>
+            </el-button>
           </div>
           <!-- 消息列表 -->
           <div class="message-list" ref="messageListRef" @scroll.passive="onMessageListScroll">
@@ -680,6 +694,72 @@ const loadingCounts = ref({})
 const messageListRef = ref(null)
 const inputRef = ref(null)
 const fileInputRef = ref(null)
+const conversationTitleRefreshTimers = new Map()
+
+const isPlaceholderConversationTitle = (title) => {
+  const normalized = String(title || '').trim()
+  return !normalized || normalized === '新对话'
+}
+
+const stopConversationTitleRefresh = (conversationId) => {
+  const timer = conversationTitleRefreshTimers.get(conversationId)
+  if (!timer) return
+  clearTimeout(timer)
+  conversationTitleRefreshTimers.delete(conversationId)
+}
+
+const patchConversation = (conversationId, patch) => {
+  const idx = conversations.value.findIndex((item) => item.id === conversationId)
+  if (idx === -1) return
+  const updated = [...conversations.value]
+  updated[idx] = { ...updated[idx], ...patch }
+  conversations.value = updated
+}
+
+const refreshConversationTitleOnce = async (conversationId) => {
+  const response = await axios.get(`/api/chat/conversations/${conversationId}`)
+  const conversation = response.data?.data
+  if (!conversation) return false
+  patchConversation(conversationId, conversation)
+  return !isPlaceholderConversationTitle(conversation.title)
+}
+
+const scheduleConversationTitleRefresh = (conversationId, attempts = 20, delay = 1500) => {
+  if (!conversationId || attempts <= 0) return
+  const currentConversation = conversations.value.find((item) => item.id === conversationId)
+  if (currentConversation && !isPlaceholderConversationTitle(currentConversation.title)) {
+    stopConversationTitleRefresh(conversationId)
+    return
+  }
+  if (conversationTitleRefreshTimers.has(conversationId)) return
+
+  const poll = async (remaining) => {
+    try {
+      const resolved = await refreshConversationTitleOnce(conversationId)
+      if (resolved) {
+        stopConversationTitleRefresh(conversationId)
+        return
+      }
+    } catch {}
+
+    if (remaining <= 1) {
+      stopConversationTitleRefresh(conversationId)
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      conversationTitleRefreshTimers.delete(conversationId)
+      poll(remaining - 1)
+    }, delay)
+    conversationTitleRefreshTimers.set(conversationId, timer)
+  }
+
+  const timer = window.setTimeout(() => {
+    conversationTitleRefreshTimers.delete(conversationId)
+    poll(attempts)
+  }, 800)
+  conversationTitleRefreshTimers.set(conversationId, timer)
+}
 
 // 对话搜索
 const conversationSearchQuery = ref('')
@@ -705,17 +785,24 @@ const AGENT_MODE_KEY = 'codebot:agentMode'
 const agentMode = ref(localStorage.getItem(AGENT_MODE_KEY) || 'build')
 watch(agentMode, (val) => { localStorage.setItem(AGENT_MODE_KEY, val) })
 
-// 项目文件夹
-const PROJECT_DIR_KEY = 'codebot:projectDir'
-const currentProjectDir = ref(localStorage.getItem(PROJECT_DIR_KEY) || '')
+// 项目文件夹（每个对话独立）
+const currentProjectDir = ref('')
 const projectDirName = computed(() => {
   if (!currentProjectDir.value) return ''
   const parts = currentProjectDir.value.replace(/[\\/]+$/, '').split(/[\\/]/)
   return parts[parts.length - 1] || ''
 })
-watch(currentProjectDir, (val) => {
-  if (val) localStorage.setItem(PROJECT_DIR_KEY, val)
-  else localStorage.removeItem(PROJECT_DIR_KEY)
+watch(currentProjectDir, async (val, oldVal) => {
+  // 当项目目录变化时，同步到后端对话记录
+  if (currentConversationId.value && val !== oldVal) {
+    try {
+      await axios.patch(`/api/chat/conversations/${currentConversationId.value}/project_dir`, {
+        project_dir: val || null
+      })
+    } catch (e) {
+      console.warn('同步项目目录到后端失败', e)
+    }
+  }
 })
 
 async function selectProjectFolder() {
@@ -774,7 +861,9 @@ let queueStatusTimer = null
 const shouldAutoScroll = ref(true)
 const nowTick = ref(Date.now())
 let timeRefreshTimer = null
+let thirdPartyStatusTimer = null
 const thirdPartyStatus = ref(null)
+const thirdPartyStatusRefreshing = ref(false)
 
 // ── 附件管理 ─────────────────────────────────────────────────────────────────
 const attachedFiles = ref([])  // [{name, type, content, is_text}]
@@ -1053,12 +1142,23 @@ const availableModels = ref(
 const modelsLoading = ref(false)
 const modelSearchQuery = ref('')
 
+const syncChatDefaultModel = async (modelId) => {
+  try {
+    await fetch('/api/config/general', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_default_model: modelId || '' })
+    })
+  } catch {}
+}
+
 watch(selectedModel, (val) => {
   if (val) {
     localStorage.setItem(LAST_MODEL_KEY, val)
   } else {
     localStorage.removeItem(LAST_MODEL_KEY)
   }
+  syncChatDefaultModel(val || '')
 })
 
 // 按 provider 分组
@@ -1389,6 +1489,7 @@ const fetchQueueStatus = async (conversationId, options = {}) => {
       runtimeAssistantIdByConversation.value = { ...runtimeAssistantIdByConversation.value, [key]: null }
       runtimeEventSeqSeen.value = { ...runtimeEventSeqSeen.value, [key]: [] }
       runtimeReloadDoneByConversation.value = { ...runtimeReloadDoneByConversation.value, [key]: true }
+      scheduleConversationTitleRefresh(key, 20, 1500)
       await nextTick()
       scrollToBottom()
     } else if (running) {
@@ -1422,6 +1523,16 @@ const loadConversations = async (autoSelect = false) => {
   try {
     const response = await axios.get('/api/chat/conversations')
     conversations.value = response.data.data.items || []
+    if (currentConversationId.value) {
+      const currentConversation = conversations.value.find((item) => item.id === currentConversationId.value)
+      if (currentConversation) {
+        if (isPlaceholderConversationTitle(currentConversation.title)) {
+          scheduleConversationTitleRefresh(currentConversationId.value)
+        } else {
+          stopConversationTitleRefresh(currentConversationId.value)
+        }
+      }
+    }
     if (autoSelect && !currentConversationId.value && conversations.value.length > 0) {
       const lastIdRaw = localStorage.getItem(LAST_CONVERSATION_KEY)
       const lastId = lastIdRaw ? Number(lastIdRaw) : null
@@ -1478,6 +1589,18 @@ const loadThirdPartyStatus = async () => {
   }
 }
 
+const refreshThirdPartyConnections = async () => {
+  thirdPartyStatusRefreshing.value = true
+  try {
+    await Promise.all([loadThirdPartyStatus(), loadModels()])
+    ElMessage.success('连接状态已刷新')
+  } catch {
+    ElMessage.error('刷新连接状态失败')
+  } finally {
+    thirdPartyStatusRefreshing.value = false
+  }
+}
+
 // 创建新对话
 const createNewConversation = async () => {
   try {
@@ -1496,6 +1619,11 @@ const selectConversation = async (conversationId) => {
   currentConversationId.value = conversationId
   localStorage.setItem(LAST_CONVERSATION_KEY, String(conversationId))
   try {
+    // 加载对话详情以获取 project_dir
+    const convResponse = await axios.get(`/api/chat/conversations/${conversationId}`)
+    const convData = convResponse.data?.data
+    currentProjectDir.value = convData?.project_dir || ''
+
     const response = await axios.get(`/api/chat/conversations/${conversationId}/messages`)
     const dbMessages = response.data.data.items || []
     // 恢复该对话已缓存的 event 气泡（推理过程），仅在流式传输仍在进行中时
@@ -1515,6 +1643,9 @@ const selectConversation = async (conversationId) => {
     runtimeEventSeqSeen.value = { ...runtimeEventSeqSeen.value, [conversationId]: [] }
     runtimeReloadDoneByConversation.value = { ...runtimeReloadDoneByConversation.value, [conversationId]: false }
     await fetchQueueStatus(conversationId)
+    if (isPlaceholderConversationTitle(convData?.title) && dbMessages.length > 0) {
+      scheduleConversationTitleRefresh(conversationId)
+    }
     await nextTick()
     scrollToBottom()
   } catch (error) {
@@ -1770,6 +1901,11 @@ const sendMessage = async () => {
 
     queuedCount.value = Math.max(0, queuedCount.value - 1)
     await loadConversations()
+    // Force-restart title polling after stream ends (loadConversations may have started
+    // a poll with default params; cancel it and restart with a longer 30s window to cover
+    // slow AI title generation which can take up to 30s on the backend).
+    stopConversationTitleRefresh(conversationId)
+    scheduleConversationTitleRefresh(conversationId, 20, 1500)
 
   } catch (error) {
     ElMessage.error('发送消息失败')
@@ -1841,6 +1977,7 @@ const deleteConversation = async (conversationId) => {
       type: 'warning'
     })
     await axios.delete(`/api/chat/conversations/${conversationId}`)
+    stopConversationTitleRefresh(conversationId)
     if (currentConversationId.value === conversationId) {
       currentConversationId.value = null
       messages.value = []
@@ -1867,6 +2004,7 @@ const renameConversation = async (conversationId, currentTitle) => {
       return
     }
     await axios.patch(`/api/chat/conversations/${conversationId}/title`, { title: newTitle })
+    stopConversationTitleRefresh(conversationId)
     await loadConversations()
     ElMessage.success('标题已更新')
   } catch (error) {
@@ -1889,6 +2027,7 @@ const togglePinConversation = async (conversationId, pinned) => {
 const archiveConversation = async (conversationId) => {
   try {
     await axios.post(`/api/chat/conversations/${conversationId}/archive`, { archived: true })
+    stopConversationTitleRefresh(conversationId)
     if (currentConversationId.value === conversationId) {
       currentConversationId.value = null
       messages.value = []
@@ -1983,6 +2122,9 @@ onMounted(() => {
   timeRefreshTimer = setInterval(() => {
     nowTick.value = Date.now()
   }, 30000)
+  thirdPartyStatusTimer = setInterval(() => {
+    loadThirdPartyStatus()
+  }, 10000)
 
   // 拦截消息列表中的链接点击，使用系统浏览器打开外部链接
   if (messageListRef.value) {
@@ -2001,6 +2143,12 @@ const loadLinkOpenMode = async () => {
       const json = await res.json()
       if (json?.success && json?.data?.link_open_mode) {
         linkOpenMode.value = json.data.link_open_mode
+      }
+      if (json?.success && typeof json?.data?.chat_default_model === 'string') {
+        const backendModel = json.data.chat_default_model
+        if (backendModel && !selectedModel.value) {
+          selectedModel.value = backendModel
+        }
       }
     }
   } catch {}
@@ -2048,10 +2196,18 @@ onUnmounted(() => {
     clearInterval(timeRefreshTimer)
     timeRefreshTimer = null
   }
+  if (thirdPartyStatusTimer) {
+    clearInterval(thirdPartyStatusTimer)
+    thirdPartyStatusTimer = null
+  }
   // 清除链接点击拦截
   if (messageListRef.value) {
     messageListRef.value.removeEventListener('click', handleLinkClick)
   }
+  for (const timer of conversationTitleRefreshTimers.values()) {
+    clearTimeout(timer)
+  }
+  conversationTitleRefreshTimers.clear()
 })
 </script>
 

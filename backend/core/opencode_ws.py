@@ -56,6 +56,10 @@ class TaskResult:
 
 class OpenCodeClient:
     """OpenCode HTTP 客户端"""
+
+    _PROVIDER_ALIASES = {
+        "copilot": "github-copilot",
+    }
     
     def __init__(self, server_url: str = "http://127.0.0.1:11200"):
         self.base_url = self._normalize_http_base_url(server_url)
@@ -119,10 +123,92 @@ class OpenCodeClient:
         if model:
             if "/" in model:
                 provider_id, model_id = model.split("/", 1)
+                provider_id = self._PROVIDER_ALIASES.get(provider_id, provider_id)
                 payload["model"] = {"providerID": provider_id, "modelID": model_id}
             else:
                 payload["model"] = {"modelID": model}
         return payload
+
+    def _extract_text_from_parts(self, parts: Any) -> str:
+        if not isinstance(parts, list):
+            return ""
+        return "".join(
+            part.get("text", "")
+            for part in parts
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+
+    async def _fetch_latest_assistant_message(
+        self,
+        client: httpx.AsyncClient,
+        session_id: str,
+        timeout: int = 30,
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        latest_resp = await client.get(
+            f"{self.base_url}/session/{session_id}/message",
+            params={"limit": 20},
+            timeout=timeout,
+        )
+        latest_resp.raise_for_status()
+        latest_data = latest_resp.json()
+        if not isinstance(latest_data, list):
+            return "", []
+
+        for msg in reversed(latest_data):
+            if not isinstance(msg, dict):
+                continue
+            info = msg.get("info")
+            if not isinstance(info, dict) or info.get("role") != "assistant":
+                continue
+            parts = msg.get("parts") if isinstance(msg.get("parts"), list) else []
+            normalized_parts = [p for p in parts if isinstance(p, dict)]
+            return self._extract_text_from_parts(normalized_parts), normalized_parts
+        return "", []
+
+    async def _execute_task_via_prompt_async(
+        self,
+        client: httpx.AsyncClient,
+        session_id: str,
+        payload: dict,
+        timeout: int,
+        workspace: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+    ) -> TaskResult:
+        prompt_resp = await client.post(
+            f"{self.base_url}/session/{session_id}/prompt_async",
+            json=payload,
+            timeout=min(timeout, 30),
+        )
+        if prompt_resp.status_code not in (200, 202, 204):
+            session_id = await self._create_session(client=client, workspace=workspace)
+            if conversation_id:
+                _conversation_current_session[str(conversation_id)] = session_id
+            prompt_resp = await client.post(
+                f"{self.base_url}/session/{session_id}/prompt_async",
+                json=payload,
+                timeout=min(timeout, 30),
+            )
+            if prompt_resp.status_code not in (200, 202, 204):
+                raise RuntimeError(f"prompt_async 失败: HTTP {prompt_resp.status_code}")
+
+        deadline = time.monotonic() + timeout
+        last_content = ""
+        last_parts: List[Dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            content, parts = await self._fetch_latest_assistant_message(
+                client=client,
+                session_id=session_id,
+                timeout=min(timeout, 20),
+            )
+            if content:
+                last_content = content
+                last_parts = parts
+                return TaskResult(success=True, content=content, parts=parts)
+            await asyncio.sleep(0.5)
+
+        if last_content:
+            return TaskResult(success=True, content=last_content, parts=last_parts)
+        raise TimeoutError("等待 OpenCode 响应超时")
 
     def _extract_event_session_id(self, properties: dict) -> Optional[str]:
         if not isinstance(properties, dict):
@@ -340,30 +426,13 @@ class OpenCodeClient:
                 workspace=workspace
             )
             payload = self._build_prompt_payload(prompt=prompt, model=model, mode=mode, system=system)
-            try:
-                message_response = await client.post(
-                    f"{self.base_url}/session/{session_id}/message",
-                    json=payload,
-                    timeout=timeout
-                )
-                message_response.raise_for_status()
-            except Exception:
-                session_id = await self._create_session(client=client, workspace=workspace)
-                if conversation_id:
-                    _conversation_current_session[str(conversation_id)] = session_id
-                message_response = await client.post(
-                    f"{self.base_url}/session/{session_id}/message",
-                    json=payload,
-                    timeout=timeout
-                )
-                message_response.raise_for_status()
-            data = message_response.json()
-            parts = data.get("parts", []) if isinstance(data, dict) else []
-            content = "".join([p.get("text", "") for p in parts if isinstance(p, dict) and p.get("type") == "text"])
-            return TaskResult(
-                success=True,
-                content=content,
-                parts=parts if isinstance(parts, list) else []
+            return await self._execute_task_via_prompt_async(
+                client=client,
+                session_id=session_id,
+                payload=payload,
+                timeout=timeout,
+                workspace=workspace,
+                conversation_id=conversation_id,
             )
         except Exception as e:
             self.connected = False

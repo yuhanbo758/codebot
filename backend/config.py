@@ -70,6 +70,8 @@ class GeneralConfig(BaseModel):
     file_storage_path: str = ""
     # @ 插入文件时的搜索目录列表（为空则只搜索项目目录/BASE_DIR）
     file_search_dirs: List[str] = []
+    # 聊天页面默认模型，供聊天页与网关复用
+    chat_default_model: str = ""
 
 
 
@@ -150,7 +152,7 @@ class SandboxConfig(BaseModel):
 
 class AppConfig(BaseModel):
     """应用配置"""
-    version: str = "2.2.0"
+    version: str = "2.8.0"
     general: GeneralConfig = GeneralConfig()
     memory: MemoryConfig = MemoryConfig()
     logs: LogConfig = LogConfig()

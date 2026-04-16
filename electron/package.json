@@ -1,11 +1,11 @@
 {
   "name": "codebot",
-  "version": "2.5.0",
+  "version": "2.8.0",
   "description": "基于 OpenCode 的个人 AI 助手",
   "author": "Codebot",
   "main": "main.js",
   "scripts": {
-    "start": "chcp 65001 && npm --prefix ../frontend run build && electron .",
+    "start": "chcp 65001 && electron .",
     "build": "electron-builder"
   },
   "dependencies": {},
@@ -22,7 +22,8 @@
     },
     "files": [
       "main.js",
-      "preload.js"
+      "preload.js",
+      "loading.html"
     ],
     "extraResources": [
       {
@@ -34,6 +35,10 @@
         "from": "../frontend/dist",
         "to": "frontend-dist",
         "filter": ["**/*"]
+      },
+      {
+        "from": "../README.md",
+        "to": "README.md"
       },
       {
         "from": "../skills",
@@ -52,6 +57,7 @@
     },
     "win": {
       "icon": "../logo.ico",
+      "signingHashAlgorithms": null,
       "target": ["nsis", "portable"]
     },
     "linux": {

@@ -103,6 +103,7 @@ echo      Frontend built: frontend\dist\
 echo.
 echo [5/5] Packaging Electron app...
 pushd "%ROOT%electron"
+set "CSC_IDENTITY_AUTO_DISCOVERY=false"
 call npm install --silent
 if errorlevel 1 (
     popd

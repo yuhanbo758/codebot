@@ -43,6 +43,10 @@
               <el-icon><Setting /></el-icon>
               <span>设置</span>
             </el-menu-item>
+            <el-menu-item index="/docs">
+              <el-icon><Document /></el-icon>
+              <span>文档</span>
+            </el-menu-item>
           </el-menu>
           
           <div class="header-actions">

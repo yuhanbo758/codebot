@@ -1,5 +1,11 @@
 {
   "version": "1.0.0",
+  "general": {
+    "link_open_mode": "system",
+    "file_storage_path": "",
+    "file_search_dirs": [],
+    "chat_default_model": ""
+  },
   "memory": {
     "auto_cleanup_enabled": true,
     "cleanup_days": 180,
@@ -11,10 +17,12 @@
     "organize_enabled": true,
     "organize_chat_enabled": true,
     "organize_time": "03:00",
-    "organize_last_run": "2026-03-07T02:59:19.674395"
+    "organize_last_run": "2026-03-07T02:59:19.674395",
+    "organize_model": null
   },
   "logs": {
     "task_log_retention_days": 30,
+    "chat_log_retention_days": 30,
     "system_log_retention_days": 7,
     "log_level": "INFO"
   },
@@ -64,19 +72,19 @@
   },
   "sandbox": {
     "execution_mode": "auto",
+    "enabled": false,
+    "workspace_dir": "",
+    "exec_timeout": 300,
+    "network_enabled": true,
     "runtime_binary": "",
     "image_path": "",
-    "workspace_dir": "",
     "memory_mb": 2048,
     "startup_timeout": 99,
-    "exec_timeout": 300,
     "ipc_dir": "",
     "auto_download": true,
     "extra_qemu_args": [],
     "snapshot_mode": true,
-    "network_enabled": true,
     "image_url": "",
-    "runtime_url": "",
-    "enabled": false
+    "runtime_url": ""
   }
 }

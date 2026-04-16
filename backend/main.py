@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from loguru import logger
@@ -29,7 +29,7 @@ from services.notification import NotificationService
 from utils.installer import check_and_install_opencode, start_opencode_server, stop_opencode_server
 
 # 导入 API 路由
-from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router
+from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router
 
 
 # 全局组件实例
@@ -188,6 +188,7 @@ async def lifespan(app: FastAPI):
     
     opencode_ws = OpenCodeClient(app_config.opencode.server_url)
     chat.opencode_ws = opencode_ws
+    gateway_router.opencode_ws = opencode_ws
     memory_manager = MemoryManager()
     memory.memory_manager = memory_manager
     lark.memory_manager = memory_manager
@@ -392,7 +393,7 @@ def _is_port_available(host: str, port: int) -> bool:
 app = FastAPI(
     title="Codebot",
     description="基于 OpenCode 的个人 AI 助手",
-    version="2.1.0",
+    version="2.8.0",
     lifespan=lifespan
 )
 
@@ -415,6 +416,7 @@ app.include_router(config_router.router, prefix="/api/config", tags=["配置"])
 app.include_router(notifications.router, prefix="/api/notifications", tags=["通知"])
 app.include_router(lark.router, prefix="/api/lark", tags=["飞书"])
 app.include_router(sandbox_router.router, prefix="/api/sandbox", tags=["沙箱"])
+app.include_router(gateway_router.router, prefix="/v1", tags=["模型网关"])
 
 
 @app.get("/api/health")
@@ -422,7 +424,7 @@ async def health_check():
     """健康检查"""
     return {
         "status": "healthy",
-        "version": "2.1.0",
+        "version": "2.8.0",
         "opencode_connected": opencode_ws.connected if opencode_ws else False,
         "runtime_source": "packaged" if getattr(sys, "frozen", False) else "source",
         "pid": os.getpid()
@@ -440,6 +442,28 @@ async def network_info():
         "local_ip": local_ip,
         "port": port,
     }
+
+
+@app.get("/api/docs/readme")
+async def readme_documentation():
+    candidate_paths = []
+    docs_source = os.environ.get("CODEBOT_DOCS_SOURCE", "").strip()
+    if docs_source:
+        candidate_paths.append(Path(docs_source))
+    candidate_paths.append(settings.BASE_DIR / "README.md")
+    candidate_paths.append(Path(__file__).resolve().parent.parent / "README.md")
+    resources_dir = os.environ.get("CODEBOT_RESOURCES_DIR", "").strip()
+    if resources_dir:
+        candidate_paths.append(Path(resources_dir) / "README.md")
+
+    readme_path = next((p for p in candidate_paths if p and p.exists() and p.is_file()), None)
+    if readme_path is None:
+        fallback = "# Codebot\n\n暂无 README 文件，建议查看设置页、聊天页、记忆页与定时任务页的界面说明。"
+        return PlainTextResponse(fallback, media_type="text/markdown; charset=utf-8")
+    return PlainTextResponse(
+        readme_path.read_text(encoding="utf-8"),
+        media_type="text/markdown; charset=utf-8",
+    )
 
 
 @app.get("/api/ready")

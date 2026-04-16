@@ -1,0 +1,10 @@
+{
+  "mcp": {
+    "codebot": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8080/api/mcp/codebot/sse",
+      "enabled": true,
+      "oauth": false
+    }
+  }
+}

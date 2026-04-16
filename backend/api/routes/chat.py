@@ -88,11 +88,9 @@ class SkillGenerateRequest(BaseModel):
     message_limit: int = 50
 
 def generate_conversation_title(content: str, user_message: str = "") -> str:
-    """生成对话标题：优先从用户消息提取核心主题，回退到AI回复首句。
-    去除冗余前缀（"用户想要"、"好的我来帮你"等），直接以功能/用途命名。"""
+    """本地回退标题生成：尽量提取任务主题，不直接照抄原始首句。"""
     max_length = 20
 
-    # ── 冗余前缀模式（中英文），匹配后去除 ────────────────────────
     _VERBOSE_PREFIXES = re.compile(
         r"^(?:"
         r"用户(?:想要?|需要|希望|要求|请求|说|问|提到|提出|想让我|让我|要我)"
@@ -105,38 +103,157 @@ def generate_conversation_title(content: str, user_message: str = "") -> str:
     )
 
     def _extract_title(raw: str) -> str:
-        """从原始文本中提取简洁标题。"""
         text = " ".join(raw.strip().split())
-        # 去除代码块
         text = re.sub(r"`{1,3}[\s\S]*?`{1,3}", "", text).strip()
-        # 取第一句
         for sep in ["\n", "。", "！", "？", "；", ";", ".", "!", "?"]:
             if sep in text:
                 text = text.split(sep, 1)[0].strip()
                 break
-        # 去除冗余前缀
         text = _VERBOSE_PREFIXES.sub("", text).strip()
-        # 去除开头的标点符号残留
+        text = re.sub(r"^[\"'“”‘’《》【】\[\](){}]+|[\"'“”‘’《》【】\[\](){}]+$", "", text).strip()
         text = re.sub(r"^[，,。.!！？?；;：:\-—]+", "", text).strip()
-        # 安全检测
+        text = re.sub(r"(?:请问|帮我|麻烦|请你|我想|我要|如何|怎么|为什么)\s*", "", text).strip()
         if any(tok in text.lower() for tok in ["system_policy", "conversation_context", "internal_context"]):
             return ""
         return text
 
-    # 策略1：优先从用户消息提取标题（用户意图最直接）
-    if user_message:
-        title = _extract_title(user_message)
-        if title and len(title) >= 2:
-            return title if len(title) <= max_length else f"{title[:max_length]}..."
-
-    # 策略2：从AI回复提取标题
+    # 优先从 AI 回复中提取标题（更能反映实际任务内容）
     if content:
         sanitized = _sanitize_assistant_output(content)
         title = _extract_title(sanitized)
         if title and len(title) >= 2:
-            return title if len(title) <= max_length else f"{title[:max_length]}..."
+            return title[:max_length]
+
+    # 回退：从用户消息提取
+    if user_message:
+        title = _extract_title(user_message)
+        if title and len(title) >= 2:
+            return title[:max_length]
 
     return "新对话"
+
+
+async def generate_conversation_title_via_ai(
+    user_message: str,
+    assistant_response: str,
+    model: Optional[str] = None
+) -> str:
+    """调用 AI 根据用户问题和AI回复内容生成简洁的对话标题。
+    
+    AI 会综合理解对话处理的实际任务来命名，而非简单截取用户消息。
+    如果 AI 调用失败，回退到本地 generate_conversation_title()。
+    
+    Args:
+        model: 当前对话使用的模型（providerID/modelID 格式），传入以确保标题生成能正常工作。
+    """
+    max_length = 20
+    try:
+        client = opencode_ws
+        if client is None or not getattr(client, "connected", False):
+            logger.info(f"[标题生成] opencode_ws 未连接，尝试临时连接...")
+            client = OpenCodeClient(app_config.opencode.server_url)
+            ok = await client.try_connect(attempts=3, delay=0.5, open_timeout=2.0)
+            if not ok:
+                logger.warning("[标题生成] 无法连接 OpenCode，回退到本地生成")
+                return generate_conversation_title(assistant_response, user_message=user_message)
+
+        # 只截取少量上下文，尽快生成标题，避免额外浪费 token
+        user_snippet = user_message[:220] if user_message else ""
+        response_snippet = _sanitize_assistant_output(assistant_response or "", user_message=user_message)[:420]
+        
+        prompt = (
+            f"请根据以下对话内容，生成一个简洁的中文对话标题（不超过{max_length}个字）。\n"
+            "要求：\n"
+            "1. 标题必须是对整个对话主题的总结，不要直接照抄用户提问第一句。\n"
+            "2. 优先概括 AI 实际完成的任务、问题诊断结果或讨论主题。\n"
+            "3. 不要输出引号、句号、冒号、序号、解释或多余文本。\n"
+            "4. 只输出最终标题文本。\n\n"
+            f"用户消息：{user_snippet}\n\n"
+            f"AI回复：{response_snippet}"
+        )
+        logger.debug(f"[标题生成] 调用 AI 生成标题，model={model}")
+        result = await client.execute_task(prompt, model=model, timeout=30)
+        if result.success and result.content:
+            title = " ".join(result.content.strip().split())
+            title = title.split("\n", 1)[0].strip()
+            title = title.strip('"\'“”‘’`')
+            # 去除可能的多余标点和前缀
+            title = re.sub(r"^(标题[：:]?\s*)", "", title).strip()
+            title = re.sub(r"^[\-•*\d\.、\s]+", "", title).strip()
+            title = re.sub(r"[。！？!?,，；;：:]+$", "", title).strip()
+            if title and 2 <= len(title) <= max_length + 5:
+                logger.info(f"[标题生成] AI 生成标题成功: {title}")
+                return title[:max_length]
+            else:
+                logger.warning(f"[标题生成] AI 返回标题不合规（长度={len(title)}）: {title!r}")
+        else:
+            logger.warning(f"[标题生成] AI 调用失败: success={result.success}, error={result.error}")
+    except Exception as e:
+        logger.warning(f"[标题生成] AI 生成对话标题异常，回退本地生成: {e}")
+
+    return generate_conversation_title(assistant_response, user_message=user_message)
+
+
+async def _update_conversation_title_if_needed(
+    conversation_id: int,
+    user_message: str,
+    assistant_response: str,
+    model: Optional[str] = None,
+) -> bool:
+    try:
+        conversations_db.connect()
+        memory_manager = MemoryManager()
+        conversation = await memory_manager.get_conversation(conversation_id)
+        if not conversation:
+            return False
+        existing_title = (conversation.get("title") or "").strip()
+        if existing_title and existing_title != "新对话":
+            return False
+        new_title = await generate_conversation_title_via_ai(user_message, assistant_response, model=model)
+        if not new_title:
+            return False
+        await memory_manager.update_conversation_title(conversation_id, new_title)
+        return True
+    except Exception as e:
+        logger.debug(f"后台更新对话标题失败: {e}")
+        return False
+
+
+def _assistant_excerpt_for_title(raw_content: str, user_message: str = "", min_chars: int = 180, max_chars: int = 420) -> str:
+    cleaned = _sanitize_assistant_output(raw_content or "", user_message=user_message).strip()
+    if len(cleaned) < min_chars:
+        return ""
+    return cleaned[:max_chars]
+
+
+async def _run_chat_post_processing(
+    user_message: str,
+    assistant_response: str,
+    conversation_id: Optional[int] = None,
+) -> None:
+    try:
+        await extract_and_save_background(
+            user_message=user_message,
+            assistant_response=assistant_response,
+            memory_manager=_get_chat_memory_manager(),
+            opencode_ws=opencode_ws,
+        )
+    except Exception as exc:
+        logger.debug(f"后台记忆提取失败: {exc}")
+
+    try:
+        await _try_create_scheduled_task(user_message)
+    except Exception as exc:
+        logger.debug(f"后台定时任务沉淀失败: {exc}")
+
+    try:
+        _materialize_reusable_skill(
+            user_message=user_message,
+            assistant_response=assistant_response,
+            conversation_id=conversation_id,
+        )
+    except Exception as exc:
+        logger.debug(f"后台技能沉淀失败: {exc}")
 
 
 def _sanitize_assistant_output(content: str, user_message: str = "") -> str:
@@ -1696,7 +1813,7 @@ def _build_skill_from_conversation(messages: List[dict], request: SkillGenerateR
     }
 
 
-def _should_materialize_skill(user_message: str, assistant_response: str) -> bool:
+def _should_materialize_skill(user_message: str, assistant_response: str, conversation_id: Optional[int] = None) -> bool:
     user_text = (user_message or "").strip()
     answer_text = _sanitize_assistant_output(assistant_response or "")
     if _skill_content_is_noise(answer_text):
@@ -1714,7 +1831,34 @@ def _should_materialize_skill(user_message: str, assistant_response: str) -> boo
         "workflow", "pipeline", "script", "troubleshoot", "deploy", "automation", "refactor", "migration"
     ]
     hit = sum(1 for w in trigger_words if w.lower() in f"{user_text}\n{answer_text}".lower())
-    return hit >= 3
+    if hit < 3:
+        return False
+    if conversation_id is None:
+        return False
+
+    try:
+        conversations_db.connect()
+        memory_manager = MemoryManager()
+        history = memory_manager.sqlite_db.cursor().execute(
+            "SELECT content FROM messages WHERE conversation_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 12",
+            (conversation_id,)
+        ).fetchall()
+    except Exception:
+        history = []
+
+    normalized_user = re.sub(r"\s+", " ", user_text.lower()).strip()
+    repeated_hits = 0
+    for row in history:
+        prev = str(row[0] or "").strip()
+        prev_norm = re.sub(r"\s+", " ", prev.lower()).strip()
+        if not prev_norm or prev_norm == normalized_user:
+            continue
+        if _skill_name_similar(prev_norm, normalized_user):
+            repeated_hits += 1
+            if repeated_hits >= 1:
+                return True
+
+    return False
 
 
 def _skill_name_similar(a: str, b: str) -> bool:
@@ -1731,9 +1875,9 @@ def _skill_name_similar(a: str, b: str) -> bool:
     return overlap >= 0.6
 
 
-def _materialize_reusable_skill(user_message: str, assistant_response: str) -> None:
+def _materialize_reusable_skill(user_message: str, assistant_response: str, conversation_id: Optional[int] = None) -> None:
     cleaned_response = _sanitize_assistant_output(assistant_response or "")
-    if not _should_materialize_skill(user_message, cleaned_response):
+    if not _should_materialize_skill(user_message, cleaned_response, conversation_id=conversation_id):
         return
     title = generate_conversation_title(user_message or "自动技能")
     desc = cleaned_response.strip().replace("\n", " ")
@@ -1789,7 +1933,9 @@ def _materialize_reusable_skill(user_message: str, assistant_response: str) -> N
                 f"> {user_message[:300]}\n\n"
                 f"参考回复内容（作为技能的主要指令）：\n"
                 f"{cleaned_response[:1500]}\n\n"
-                f"请将技能文件创建在 {settings.SKILLS_DIR} 目录下。"
+                f"【重要】技能文件必须创建在以下目录：{settings.SKILLS_DIR}\n"
+                f"绝对不要保存到 ~/.agents/skills/ 或任何其他目录。\n"
+                f"请在 {settings.SKILLS_DIR} 下创建一个子文件夹，其中包含 SKILL.md 文件。"
             )
             session_id = f"skill_create_{hashlib.sha1(user_message.encode()).hexdigest()[:8]}"
             asyncio.get_event_loop().create_task(
@@ -1831,8 +1977,56 @@ async def _async_create_skill_via_opencode(session_id: str, prompt: str) -> None
                 message=prompt,
             )
             logger.info(f"[skill] skill-creator 异步任务完成: {session_id}")
+            # 后置检查：如果 skill-creator 错误地将文件保存到 ~/.agents/skills/，
+            # 将其移动到 codebot 的 skills/ 目录
+            await _rescue_misplaced_skills()
     except Exception as exc:
         logger.warning(f"[skill] skill-creator 异步任务失败: {exc}")
+
+
+async def _rescue_misplaced_skills() -> None:
+    """检查 ~/.agents/skills/ 中是否有最近创建的非 codebot- 前缀的技能目录，
+    如果是由 codebot 的 skill-creator 调用产生的，将其移动到 codebot 的 skills/ 目录。"""
+    import shutil
+    import time
+    oc_skills = Path.home() / ".agents" / "skills"
+    if not oc_skills.exists():
+        return
+    codebot_skills = settings.SKILLS_DIR
+    codebot_skills.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for entry in oc_skills.iterdir():
+        if not entry.is_dir():
+            continue
+        # 跳过 codebot- 前缀的目录（这些是同步过去的）
+        if entry.name.startswith("codebot-"):
+            continue
+        skill_md = entry / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        # 只检查最近 60 秒内创建的目录（大概率是刚被 skill-creator 创建的）
+        try:
+            mtime = skill_md.stat().st_mtime
+            if now - mtime > 60:
+                continue
+        except Exception:
+            continue
+        # 检查名称是否包含"自动技能"标记，说明是 codebot 触发的
+        try:
+            content = skill_md.read_text(encoding="utf-8")
+            if "自动技能" not in content:
+                continue
+        except Exception:
+            continue
+        # 移动到 codebot 的 skills/ 目录
+        dest = codebot_skills / entry.name
+        if dest.exists():
+            continue  # 已存在则跳过
+        try:
+            shutil.move(str(entry), str(dest))
+            logger.info(f"[skill] 已将误放的技能从 {entry} 移动到 {dest}")
+        except Exception as e:
+            logger.warning(f"[skill] 移动误放技能失败: {e}")
 
 
 def _write_auto_skill_md(skill_md_path, name: str, description: str,
@@ -1870,18 +2064,21 @@ def _write_skill(skill_id: str, data: dict):
 
 
 @router.post("/conversations", response_model=MessageResponse)
-async def create_conversation(title: str = Body("新对话", embed=True)):
+async def create_conversation(
+    title: str = Body("新对话"),
+    project_dir: Optional[str] = Body(None)
+):
     """创建对话"""
     try:
         # 初始化数据库连接
         conversations_db.connect()
         
         memory_manager = MemoryManager()
-        conversation_id = await memory_manager.create_conversation(title)
+        conversation_id = await memory_manager.create_conversation(title, project_dir=project_dir)
         
         return MessageResponse(
             success=True,
-            data={"id": conversation_id, "title": title},
+            data={"id": conversation_id, "title": title, "project_dir": project_dir},
             message="对话创建成功"
         )
     except Exception as e:
@@ -1932,6 +2129,26 @@ async def get_conversation(conversation_id: int):
             "success": True,
             "data": conversation
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/conversations/{conversation_id}/project_dir")
+async def update_conversation_project_dir(
+    conversation_id: int,
+    project_dir: Optional[str] = Body(None, embed=True)
+):
+    """更新对话关联的项目目录"""
+    try:
+        conversations_db.connect()
+        memory_manager = MemoryManager()
+        conversation = await memory_manager.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="对话不存在")
+        await memory_manager.update_conversation_project_dir(conversation_id, project_dir)
+        return {"success": True, "data": {"project_dir": project_dir}, "message": "项目目录已更新"}
     except HTTPException:
         raise
     except Exception as e:
@@ -2569,8 +2786,13 @@ async def send_to_opencode(request: SendMessageRequest):
             if conversation:
                 existing_title = conversation.get("title") or ""
                 if existing_title == "新对话" or existing_title.strip() == "":
-                    new_title = generate_conversation_title(content, user_message=request.message)
-                    await memory_manager.update_conversation_title(request.conversation_id, new_title)
+                    async def _update_title_bg(conv_id, msg, resp, mdl):
+                        try:
+                            new_title = await generate_conversation_title_via_ai(msg, resp, model=mdl)
+                            await memory_manager.update_conversation_title(conv_id, new_title)
+                        except Exception as e:
+                            logger.debug(f"后台更新对话标题失败: {e}")
+                    asyncio.create_task(_update_title_bg(request.conversation_id, request.message, content, request.model))
 
             # 后台自动提取用户习惯/偏好（不阻塞响应）
             asyncio.create_task(
@@ -2722,8 +2944,13 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                 if conversation:
                     existing_title = conversation.get("title") or ""
                     if existing_title == "新对话" or existing_title.strip() == "":
-                        new_title = generate_conversation_title(content, user_message=request.message)
-                        await memory_manager.update_conversation_title(request.conversation_id, new_title)
+                        async def _update_title_bg_stream(conv_id, msg, resp, mdl):
+                            try:
+                                new_title = await generate_conversation_title_via_ai(msg, resp, model=mdl)
+                                await memory_manager.update_conversation_title(conv_id, new_title)
+                            except Exception as e:
+                                logger.debug(f"后台更新对话标题失败(stream): {e}")
+                        asyncio.create_task(_update_title_bg_stream(request.conversation_id, request.message, content, request.model))
 
                 asyncio.create_task(
                     extract_and_save_background(
@@ -2827,16 +3054,11 @@ async def _drain_queue(conv_id: str, conversation_id: int):
                     content=content
                 )
                 asyncio.create_task(
-                    extract_and_save_background(
+                    _run_chat_post_processing(
                         user_message=task["message"],
                         assistant_response=content,
-                        memory_manager=_get_chat_memory_manager(),
-                        opencode_ws=opencode_ws,
+                        conversation_id=conversation_id,
                     )
-                )
-                _materialize_reusable_skill(
-                    user_message=task["message"],
-                    assistant_response=content
                 )
         except Exception as e:
             logger.error(f"处理排队任务失败: {e}")

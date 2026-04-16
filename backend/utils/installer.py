@@ -11,6 +11,7 @@ import time
 import asyncio
 from typing import Optional, List
 from pathlib import Path
+from urllib.parse import urlparse
 from loguru import logger
 
 import httpx
@@ -98,6 +99,61 @@ async def _is_opencode_http_ready(base_url: str) -> bool:
         except Exception:
             continue
     return False
+
+
+def _collect_opencode_base_urls() -> List[str]:
+    """收集可能存在 OpenCode HTTP 服务的本地地址。"""
+    urls: List[str] = []
+    seen = set()
+
+    def _append(url: str):
+        value = (url or "").strip().rstrip("/")
+        if not value:
+            return
+        key = value.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        urls.append(value)
+
+    try:
+        from config import app_config
+
+        configured_url = app_config.opencode.server_url
+        if configured_url:
+            parsed = urlparse(configured_url)
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port
+            scheme = parsed.scheme or "http"
+            if port:
+                _append(f"{scheme}://{host}:{port}")
+    except Exception:
+        pass
+
+    for raw in [
+        os.environ.get("CODEBOT_OPENCODE_PREFERRED_PORT", ""),
+        os.environ.get("CODEBOT_OPENCODE_FALLBACK_PORT", ""),
+        "1120",
+        "11200",
+        "4096",
+        "50690",
+    ]:
+        try:
+            port = int(str(raw).strip())
+        except Exception:
+            continue
+        if 1 <= port <= 65535:
+            _append(f"http://127.0.0.1:{port}")
+
+    return urls
+
+
+async def _find_running_opencode_service() -> Optional[str]:
+    """查找本机已运行的 OpenCode 服务。"""
+    for base_url in _collect_opencode_base_urls():
+        if await _is_opencode_http_ready(base_url):
+            return base_url
+    return None
 
 
 async def check_opencode_installed() -> bool:
@@ -192,6 +248,11 @@ async def install_opencode() -> bool:
 
 async def check_and_install_opencode() -> bool:
     """检查并安装 OpenCode"""
+    running_service = await _find_running_opencode_service()
+    if running_service:
+        logger.info(f"检测到运行中的 OpenCode 服务：{running_service}，跳过安装检查")
+        return True
+
     # 检查是否已安装
     if await check_opencode_installed():
         return True
@@ -205,16 +266,17 @@ async def start_opencode_server(port: int = 11200) -> int:
     """
     启动 codebot 专用的 OpenCode Server，返回实际监听的端口号（失败返回 0）。
 
-    重要：此函数仅启动 codebot 捆绑/管理的 opencode 实例。
+    策略：
     - 若端口已是 codebot 自己管理的健康 opencode 服务（_opencode_server_process 存活），直接复用。
-    - 若端口被外部进程占用（如 OpenCode 桌面应用），则跳过，由上层选择备用端口，
-      避免 Codebot 与外部 opencode 实例共享服务导致 Bad Request 错误。
-    - 若端口被占用但健康检查失败（非 opencode 服务），同样跳过。
+    - 若端口被外部进程占用（如 OpenCode 桌面应用）且通过健康检查，直接复用。
+      codebot 创建独立的 session，不会干扰桌面端的会话。
+    - 若端口被占用但健康检查失败（非 opencode 服务），跳过。
+    - 否则尝试启动新实例。
     """
     try:
         global _opencode_server_process
 
-        # 若指定端口已被占用，先检查是否是 codebot 自己管理的进程
+        # 若指定端口已被占用，先检查是否是可用的 OpenCode 服务
         if _is_port_open("127.0.0.1", port):
             base_url_check = f"http://127.0.0.1:{port}"
             if await _is_opencode_http_ready(base_url_check):
@@ -224,13 +286,12 @@ async def start_opencode_server(port: int = 11200) -> int:
                     return port
                 else:
                     # 端口被外部进程占用（如 OpenCode 桌面应用）
-                    # 不能复用：外部实例有独立的 session 状态和配置，
-                    # 共享会导致 API 请求冲突（Bad Request）
-                    logger.warning(
-                        f"端口 {port} 被外部 OpenCode 进程占用（可能是 OpenCode 桌面应用），"
-                        f"跳过此端口，将使用备用端口启动 codebot 专用实例"
+                    # 直接复用：codebot 使用独立的 session，与桌面端互不干扰
+                    logger.info(
+                        f"端口 {port} 检测到外部健康 OpenCode 服务（可能是 OpenCode 桌面应用），"
+                        f"直接复用，codebot 将创建独立的会话"
                     )
-                    return 0
+                    return port
             else:
                 logger.warning(f"端口 {port} 已被占用但非 OpenCode 服务，跳过")
                 return 0
@@ -305,12 +366,15 @@ async def start_opencode_server(port: int = 11200) -> int:
 
 
 def stop_opencode_server():
+    """停止 codebot 自己启动的 OpenCode 实例。不会影响外部 OpenCode 进程（如桌面应用）。"""
     global _opencode_server_process
     proc = _opencode_server_process
     _opencode_server_process = None
     if not proc:
+        logger.debug("无 codebot 管理的 OpenCode 进程需要停止（可能是复用了外部实例）")
         return
     try:
+        logger.info("正在停止 codebot 管理的 OpenCode 实例...")
         proc.terminate()
     except Exception:
         pass
