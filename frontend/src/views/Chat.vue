@@ -997,8 +997,8 @@ const selectCommand = (cmd) => {
       inputMessage.value += '显示与当前话题相关的记忆'
     }
   } else if (cmd.type === 'skill' || cmd.type === 'category') {
-    // 把技能名称插入消息中作为提示
-    inputMessage.value += `使用 ${cmd.skill_name || cmd.label} 技能`
+    const label = cmd.skill_name || cmd.label
+    inputMessage.value += `使用技能[${cmd.skill_id}] ${label} `
   }
   nextTick(() => inputRef.value?.focus())
 }

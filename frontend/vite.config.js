@@ -2,6 +2,8 @@ import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { resolve } from 'path'
 
+const backendTarget = process.env.VITE_CODEBOT_BACKEND_URL || process.env.CODEBOT_BACKEND_URL || 'http://localhost:18080'
+
 export default defineConfig({
   plugins: [vue()],
   resolve: {
@@ -13,11 +15,11 @@ export default defineConfig({
     port: 3000,
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        target: backendTarget,
         changeOrigin: true
       },
       '/logo.ico': {
-        target: 'http://localhost:8080',
+        target: backendTarget,
         changeOrigin: true
       }
     }

@@ -43,25 +43,31 @@
               <el-icon><Setting /></el-icon>
               <span>设置</span>
             </el-menu-item>
-            <el-menu-item index="/docs">
-              <el-icon><Document /></el-icon>
-              <span>文档</span>
-            </el-menu-item>
           </el-menu>
           
           <div class="header-actions">
+            <el-button size="small" @click="openGrowthDialog">
+              成长候选
+            </el-button>
             <!-- 通知铃铛 -->
             <el-badge :value="unreadCount" :hidden="unreadCount === 0">
               <el-button :icon="Bell" circle @click="showNotifications" />
             </el-badge>
             
             <!-- 用户菜单 -->
-            <el-dropdown>
-              <el-avatar :size="32" icon="User" />
+            <el-dropdown @command="handleAccountCommand">
+              <div class="account-trigger">
+                <el-avatar :size="32" icon="User" />
+                <span v-if="account.authenticated" class="account-name">{{ displayUserName }}</span>
+                <el-tag v-if="account.canDownloadUpdates" size="small" type="success">codebot</el-tag>
+              </div>
               <template #dropdown>
                 <el-dropdown-menu>
-                  <el-dropdown-item>关于</el-dropdown-item>
-                  <el-dropdown-item divided>退出</el-dropdown-item>
+                  <el-dropdown-item v-if="!account.authenticated" command="login">登录</el-dropdown-item>
+                  <el-dropdown-item v-else command="refresh">刷新会员</el-dropdown-item>
+                  <el-dropdown-item command="check-update">检查更新</el-dropdown-item>
+                  <el-dropdown-item command="about">关于</el-dropdown-item>
+                  <el-dropdown-item v-if="account.authenticated" command="logout" divided>退出登录</el-dropdown-item>
                 </el-dropdown-menu>
               </template>
             </el-dropdown>
@@ -118,19 +124,85 @@
         </div>
       </div>
     </el-drawer>
+
+    <el-dialog v-model="updateDialogVisible" title="Codebot 更新" width="460px">
+      <div class="update-panel">
+        <div class="update-row">
+          <span>更新源</span>
+          <el-tag :type="updateState.source === 'object-storage' ? 'success' : 'info'">
+            {{ updateState.source === 'object-storage' ? '会员对象存储' : 'GitHub Releases' }}
+          </el-tag>
+        </div>
+        <div class="update-row">
+          <span>状态</span>
+          <span>{{ updateState.message || '尚未检查' }}</span>
+        </div>
+        <div v-if="updateState.progress > 0" class="update-progress">
+          <el-progress :percentage="Math.round(updateState.progress)" />
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="checkUpdate" :loading="updateLoading">检查更新</el-button>
+        <el-button type="primary" @click="downloadUpdate" :disabled="!updateState.available" :loading="downloadLoading">下载</el-button>
+        <el-button type="success" @click="installUpdate" :disabled="!updateState.downloaded">安装重启</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="growthDialogVisible" title="成长候选" width="720px">
+      <el-table v-loading="growthLoading" :data="growthCandidates" height="360px">
+        <el-table-column prop="kind" label="类型" width="90" />
+        <el-table-column prop="title" label="标题" width="180" />
+        <el-table-column prop="content" label="内容" min-width="260" show-overflow-tooltip />
+        <el-table-column label="操作" width="150">
+          <template #default="{ row }">
+            <el-button size="small" type="primary" link @click="acceptGrowth(row)">接受</el-button>
+            <el-button size="small" type="danger" link @click="rejectGrowth(row)">拒绝</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <template #footer>
+        <el-button @click="loadGrowthCandidates" :loading="growthLoading">刷新</el-button>
+        <el-button @click="growthDialogVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { Bell, Monitor, ChatDotRound, Folder, Clock, Grid, Document, Setting, Connection } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import { useNotificationStore } from './stores/notification'
 import { storeToRefs } from 'pinia'
+import axios from 'axios'
 
 const notificationDrawer = ref(false)
 const notificationStore = useNotificationStore()
 const { notifications, unreadCount, config } = storeToRefs(notificationStore)
 const pollTimer = ref(null)
+const account = ref({ authenticated: false, canDownloadUpdates: false, user: null })
+const accountLoading = ref(false)
+const updateDialogVisible = ref(false)
+const updateLoading = ref(false)
+const downloadLoading = ref(false)
+const updateState = ref({
+  source: 'github',
+  message: '',
+  available: false,
+  downloaded: false,
+  progress: 0
+})
+const growthDialogVisible = ref(false)
+const growthLoading = ref(false)
+const growthCandidates = ref([])
+let removeUpdateListener = null
+let removeAccountChangedListener = null
+let removeSkillDownloadListener = null
+
+const displayUserName = computed(() => {
+  const user = account.value.user || {}
+  return user.nickname || user.name || user.username || user.email || '已登录'
+})
 
 const showNotifications = () => {
   notificationDrawer.value = true
@@ -156,12 +228,193 @@ const clearNotifications = async () => {
   loadNotifications()
 }
 
+const electronApi = () => window.electronAPI || null
+
+const loadAccount = async () => {
+  const api = electronApi()
+  if (!api?.accountMe) return
+  try {
+    const result = await api.accountMe()
+    account.value = result || { authenticated: false, canDownloadUpdates: false, user: null }
+  } catch (err) {
+    account.value = { authenticated: false, canDownloadUpdates: false, user: null }
+  }
+}
+
+const login = async () => {
+  const api = electronApi()
+  if (!api?.accountLogin) {
+    ElMessage.warning('当前运行环境不支持 Electron 登录')
+    return
+  }
+  accountLoading.value = true
+  try {
+    await api.accountLogin()
+    ElMessage.success('已打开程序小店登录页，完成登录后应用会自动同步状态')
+  } catch (err) {
+    ElMessage.error(err?.message || '登录失败')
+  } finally {
+    accountLoading.value = false
+  }
+}
+
+const logout = async () => {
+  const api = electronApi()
+  if (!api?.accountLogout) return
+  await api.accountLogout()
+  account.value = { authenticated: false, canDownloadUpdates: false, user: null }
+  ElMessage.success('已退出登录')
+}
+
+const handleAccountCommand = async (command) => {
+  if (command === 'login') await login()
+  else if (command === 'logout') await logout()
+  else if (command === 'refresh') {
+    await loadAccount()
+    ElMessage.success('会员状态已刷新')
+  } else if (command === 'check-update') {
+    updateDialogVisible.value = true
+    await checkUpdate()
+  } else if (command === 'about') {
+    ElMessage.info('Codebot')
+  }
+}
+
+const handleUpdateStatus = (payload) => {
+  if (!payload) return
+  updateState.value.source = payload.source || updateState.value.source
+  if (payload.type === 'checking') {
+    updateState.value.available = false
+    updateState.value.downloaded = false
+    updateState.value.progress = 0
+    updateState.value.message = '正在检查更新...'
+  }
+  if (payload.type === 'available') {
+    updateState.value.available = true
+    updateState.value.downloaded = false
+    updateState.value.progress = 0
+    updateState.value.message = `发现新版本 ${payload.info?.version || ''}`.trim()
+  }
+  if (payload.type === 'not-available') {
+    updateState.value.available = false
+    updateState.value.downloaded = false
+    updateState.value.progress = 0
+    updateState.value.message = '当前已是最新版本'
+  }
+  if (payload.type === 'download-progress') {
+    updateState.value.progress = Number(payload.progress?.percent || 0)
+    updateState.value.message = '正在下载更新...'
+  }
+  if (payload.type === 'downloaded') {
+    updateState.value.downloaded = true
+    updateState.value.progress = 100
+    updateState.value.message = payload.message || '更新已下载，重启后安装'
+  }
+  if (payload.type === 'error') {
+    updateState.value.message = payload.message || '更新失败'
+    ElMessage.error(updateState.value.message)
+  }
+}
+
+const checkUpdate = async () => {
+  const api = electronApi()
+  if (!api?.checkUpdate) {
+    ElMessage.warning('当前运行环境不支持自动更新')
+    return
+  }
+  updateLoading.value = true
+  updateState.value.message = '正在检查更新...'
+  try {
+    const result = await api.checkUpdate()
+    updateState.value.source = result?.source || 'github'
+  } catch (err) {
+    updateState.value.message = err?.message || '检查更新失败'
+    ElMessage.error(updateState.value.message)
+  } finally {
+    updateLoading.value = false
+  }
+}
+
+const downloadUpdate = async () => {
+  const api = electronApi()
+  if (!api?.downloadUpdate) return
+  downloadLoading.value = true
+  try {
+    await api.downloadUpdate()
+  } catch (err) {
+    ElMessage.error(err?.message || '下载更新失败')
+  } finally {
+    downloadLoading.value = false
+  }
+}
+
+const installUpdate = async () => {
+  const api = electronApi()
+  if (api?.installUpdate) await api.installUpdate()
+}
+
+const loadGrowthCandidates = async () => {
+  growthLoading.value = true
+  try {
+    const res = await axios.get('/api/growth/candidates', { params: { status: 'pending', limit: 50 } })
+    growthCandidates.value = res.data?.data?.items || []
+  } catch (err) {
+    ElMessage.error('加载成长候选失败')
+  } finally {
+    growthLoading.value = false
+  }
+}
+
+const openGrowthDialog = async () => {
+  growthDialogVisible.value = true
+  await loadGrowthCandidates()
+}
+
+const acceptGrowth = async (row) => {
+  try {
+    await axios.post(`/api/growth/candidates/${row.id}/accept`)
+    ElMessage.success('已接受')
+    await loadGrowthCandidates()
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.detail || '接受失败')
+  }
+}
+
+const rejectGrowth = async (row) => {
+  try {
+    await axios.post(`/api/growth/candidates/${row.id}/reject`)
+    ElMessage.success('已拒绝')
+    await loadGrowthCandidates()
+  } catch (err) {
+    ElMessage.error('拒绝失败')
+  }
+}
+
 const formatDate = (dateStr) => {
   const date = new Date(dateStr)
   return date.toLocaleString('zh-CN')
 }
 
 onMounted(() => {
+  loadAccount()
+  if (electronApi()?.onUpdateStatus) {
+    removeUpdateListener = electronApi().onUpdateStatus(handleUpdateStatus)
+  }
+  if (electronApi()?.onAccountChanged) {
+    removeAccountChangedListener = electronApi().onAccountChanged(async () => {
+      await loadAccount()
+    })
+  }
+  if (electronApi()?.onSkillDownload) {
+    removeSkillDownloadListener = electronApi().onSkillDownload((payload) => {
+      if (payload?.type === 'completed') {
+        const name = payload?.installed?.slug || payload?.fileName || '技能'
+        ElMessage.success(`${name} 已下载到 Codebot 技能目录并作为自动生成技能安装`)
+      } else if (payload?.type === 'error') {
+        ElMessage.error(payload?.message || '程序小店技能下载失败')
+      }
+    })
+  }
   notificationStore.fetchUnreadCount()
   notificationStore.fetchConfig().then(() => {
     const interval = Math.max(5, Math.min(120, Number(config.value?.poll_interval || 30)))
@@ -172,6 +425,13 @@ onMounted(() => {
       notificationStore.fetchUnreadCount()
     }, interval * 1000)
   })
+})
+
+onBeforeUnmount(() => {
+  if (pollTimer.value) clearInterval(pollTimer.value)
+  if (typeof removeUpdateListener === 'function') removeUpdateListener()
+  if (typeof removeAccountChangedListener === 'function') removeAccountChangedListener()
+  if (typeof removeSkillDownloadListener === 'function') removeSkillDownloadListener()
 })
 </script>
 
@@ -212,6 +472,39 @@ onMounted(() => {
   display: flex;
   align-items: center;
   gap: 16px;
+}
+
+.account-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.account-name {
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #303133;
+  font-size: 13px;
+}
+
+.update-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.update-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.update-progress {
+  padding-top: 4px;
 }
 
 .notification-drawer-body {

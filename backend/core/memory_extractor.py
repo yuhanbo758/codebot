@@ -31,6 +31,9 @@ _EXTRACTION_RULES: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"我(不喜欢|讨厌|不想|不用|不爱|不习惯)\s*(.+?)(?:[，。,.]|$)"),                     "preference"),
     (re.compile(r"我(更|还是)?(喜欢|倾向|偏向|首选)\s*(.+?)(?:[，。,.]|$)"),                         "preference"),
     (re.compile(r"我(比较|很|非常)?(偏好|倾向)\s*(.+?)(?:[，。,.]|$)"),                              "preference"),
+    (re.compile(r"(?:请|帮我)?记住[：:]?\s*(.+?)(?:[，。,.]|$)"),                                      "note"),
+    (re.compile(r"(?:以后|下次|今后|往后)\s*(?:请)?\s*(?:都|要|不要|别|尽量|优先)?\s*(.+?)(?:[，。,.]|$)"), "preference"),
+    (re.compile(r"我希望你\s*(.+?)(?:[，。,.]|$)"),                                                    "preference"),
 
     # ── habit ──
     (re.compile(r"我(通常|一般|平时|习惯|经常|常常|总是|每天|每次)\s*(.+?)(?:[，。,.]|$)"),           "habit"),

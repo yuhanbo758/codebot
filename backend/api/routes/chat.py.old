@@ -13,7 +13,6 @@ import base64
 import tempfile
 import os
 import hashlib
-from pathlib import Path
 from urllib.parse import urlparse
 
 import asyncio
@@ -1419,8 +1418,8 @@ def _get_chat_memory_manager() -> MemoryManager:
 
 
 async def _save_memory_content(content: str, category: str, raw_message: str) -> bool:
-    selected_skill, cleaned_message, opencode_skill_fallback = _extract_requested_skill(raw_message)
-    message_for_context = cleaned_message or raw_message
+    selected_skill, cleaned_message, opencode_skill_fallback = _extract_requested_skill(message)
+    message_for_context = cleaned_message or message
     manager = _get_chat_memory_manager()
     metadata = {"source": "chat", "raw": raw_message}
     try:
@@ -1709,15 +1708,6 @@ async def _build_opencode_prompt_parts(message: str, mode: Optional[str] = None,
     system_prompt 通过 OpenCode API 的独立 system 字段传递，不混入用户消息文本，
     从根本上解决 AI 把系统指令原文回显到回复中的问题。
     """
-    raw_message = message or ""
-    try:
-        selected_skill, cleaned_message, opencode_skill_fallback = _extract_requested_skill(raw_message)
-    except Exception as exc:
-        logger.debug(f"[skill] 解析请求技能失败: {exc}")
-        selected_skill, cleaned_message, opencode_skill_fallback = None, raw_message, False
-    # 用于记忆/事实检索的查询文本（去除技能标记）
-    message_for_context = cleaned_message or raw_message
-
     manager = _get_chat_memory_manager()
     facts_context: List[str] = []
     memories_context: List[str] = []
@@ -1842,9 +1832,9 @@ async def _build_opencode_prompt_parts(message: str, mode: Optional[str] = None,
 
     system_prompt = "\n\n".join(system_lines)
     if selected_skill and opencode_skill_fallback:
-        cleaned_message = f"/skill {selected_skill.get('slug')}\n\n{cleaned_message or raw_message}"
+        cleaned_message = f"/skill {selected_skill.get('slug')}\n\n{cleaned_message or message}"
     # user_message 只含纯净的用户输入，不混入任何系统指令
-    return system_prompt, cleaned_message or raw_message
+    return system_prompt, cleaned_message or message
 
 
 async def _build_opencode_prompt_with_memory(message: str, mode: Optional[str] = None) -> str:

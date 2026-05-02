@@ -1,5 +1,14 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+function toPlainValue(value) {
+  if (value == null) return value;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_) {
+    return value;
+  }
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
   // 应用控制
   quit: () => ipcRenderer.send('app-quit'),
@@ -18,11 +27,39 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setLinkOpenMode: (mode) => ipcRenderer.invoke('set-link-open-mode', mode),
   
   // 选择文件夹（用于项目目录选择等）
-  selectFolder: (options) => ipcRenderer.invoke('dialog:selectFolder', options),
+  selectFolder: (options) => ipcRenderer.invoke('dialog:selectFolder', toPlainValue(options)),
 
   // 系统信息
   getPlatform: () => require('process').platform,
   getVersion: () => ipcRenderer.invoke('get-version'),
-  copyText: (text) => ipcRenderer.invoke('clipboard-copy', text)
-});
+  copyText: (text) => ipcRenderer.invoke('clipboard-copy', text),
 
+  // Account / membership
+  accountLogin: (credentials) => ipcRenderer.invoke('account:login', toPlainValue(credentials)),
+  accountLogout: () => ipcRenderer.invoke('account:logout'),
+  accountMe: () => ipcRenderer.invoke('account:me'),
+  accountAccess: () => ipcRenderer.invoke('account:access'),
+  openMemberCenter: () => ipcRenderer.invoke('shop:open-member-center'),
+  openCodebotStore: () => ipcRenderer.invoke('shop:open-codebot-store'),
+  openSkillsFolder: () => ipcRenderer.invoke('skills:open-folder'),
+  onAccountChanged: (callback) => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('account:changed', listener)
+    return () => ipcRenderer.removeListener('account:changed', listener)
+  },
+  onSkillDownload: (callback) => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('skills:download', listener)
+    return () => ipcRenderer.removeListener('skills:download', listener)
+  },
+
+  // Updates
+  checkUpdate: () => ipcRenderer.invoke('update:check'),
+  downloadUpdate: () => ipcRenderer.invoke('update:download'),
+  installUpdate: () => ipcRenderer.invoke('update:install'),
+  onUpdateStatus: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('update:status', listener);
+    return () => ipcRenderer.removeListener('update:status', listener);
+  }
+});

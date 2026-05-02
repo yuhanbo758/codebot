@@ -27,6 +27,10 @@
           <el-button @click="toggleBatchMode">
             {{ batchMode ? '退出批量' : '批量处理' }}
           </el-button>
+          <el-button @click="openSkillsFolder">
+            <el-icon><FolderOpened /></el-icon>
+            skill文件
+          </el-button>
           <el-button type="success" @click="showGenerateDialog = true">
             <el-icon><MagicStick /></el-icon>
             生成技能
@@ -35,9 +39,13 @@
             <el-icon><Download /></el-icon>
             安装技能
           </el-button>
+          <el-button type="warning" @click="openCodebotStore">
+            <el-icon><Link /></el-icon>
+            程序小店
+          </el-button>
         </div>
       </div>
-      <div class="skills-subtitle">管理 Codebot 的技能。内置技能和自动生成技能仅供 Codebot 内部使用；OpenCode 技能由 OpenCode CLI 自身管理（位于 ~/.agents/skills/）。可点击操作列中的「同步」按钮，将内置或自动生成技能同步到 OpenCode CLI 的 skills 目录，以供 OpenCode CLI 直接调用。</div>
+      <div class="skills-subtitle">管理 Codebot 的技能。调用优先级为自动生成、内置、外部兼容目录、OpenCode。Codebot 技能仅供 Codebot 使用，不再默认同步到 OpenCode CLI。</div>
     </div>
 
     <!-- 可滚动表格区域 -->
@@ -56,7 +64,7 @@
         <el-table-column label="来源" width="100">
           <template #default="{ row }">
             <el-tag size="small" :type="sourceTagType(row.source)">
-              {{ sourceLabel(row.id) }}
+              {{ row.sourceLabel || row.source_label || sourceLabel(row) }}
             </el-tag>
           </template>
         </el-table-column>
@@ -69,20 +77,19 @@
         </el-table-column>
         <el-table-column label="操作" width="260">
           <template #default="{ row }">
-            <!-- builtin: 支持编辑 SKILL.md，不支持卸载，支持同步到 OpenCode -->
+            <!-- builtin: 支持编辑 SKILL.md，不支持卸载 -->
             <template v-if="row.id?.startsWith('builtin:')">
               <el-button size="small" type="primary" plain @click="openEditDialog(row)">编辑</el-button>
-              <el-button size="small" type="warning" plain @click="syncSingleSkill(row)" :loading="row.syncing">同步</el-button>
               <el-text type="info" size="small" style="margin-left:8px">内置</el-text>
             </template>
-            <!-- auto: 自动生成，支持编辑、删除和同步到 OpenCode -->
+            <!-- auto: 自动生成，支持编辑、删除 -->
             <template v-else-if="row.id?.startsWith('auto:')">
               <el-button size="small" type="primary" plain @click="openEditDialog(row)">编辑</el-button>
-              <el-button size="small" type="warning" plain @click="syncSingleSkill(row)" :loading="row.syncing">同步</el-button>
               <el-button size="small" type="danger" plain @click="deleteSkill(row)" :loading="row.deleting">删除</el-button>
             </template>
             <!-- custom: 外部目录只读 -->
-            <el-text v-else-if="row.id?.startsWith('custom:')" type="info" size="small">外部只读</el-text>
+            <el-text v-else-if="row.id?.startsWith('custom:') || row.id?.startsWith('external:')" type="info" size="small">外部只读</el-text>
+            <el-text v-else-if="row.id?.startsWith('opencode:')" type="info" size="small">OpenCode 管理</el-text>
             <!-- opencode: / 普通 JSON 技能 -->
             <template v-else>
               <el-button
@@ -213,7 +220,7 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Download, Search, MagicStick, Link } from '@element-plus/icons-vue'
+import { Download, Search, MagicStick, Link, FolderOpened } from '@element-plus/icons-vue'
 import axios from 'axios'
 
 const skills = ref([])
@@ -244,10 +251,10 @@ const editForm = ref({ id: '', content: '' })
  *  - 普通 JSON（source=chat）     → 也走全文编辑（content 为空时可填写）
  */
 const isEditable = (row) => {
-  if (row.id?.startsWith('custom:')) return false   // 外部目录只读
+  if (row.id?.startsWith('custom:') || row.id?.startsWith('external:')) return false   // 外部目录只读
+  if (row.id?.startsWith('opencode:')) return false // OpenCode 技能由 OpenCode CLI 管理
   if (row.id?.startsWith('builtin:')) return true
   if (row.id?.startsWith('auto:')) return true
-  if (row.id?.startsWith('opencode:')) return true
   return row.source === 'chat'
 }
 
@@ -290,6 +297,33 @@ const installForm = ref({
   source: ''
 })
 
+const openCodebotStore = async () => {
+  if (window.electronAPI?.openCodebotStore) {
+    try {
+      await window.electronAPI.openCodebotStore()
+      ElMessage.success('已打开程序小店，下载的技能将自动安装到 Codebot 技能目录')
+      return
+    } catch (error) {
+      ElMessage.error(error?.message || '打开程序小店失败')
+      return
+    }
+  }
+  window.open('https://shop.sanrenjz.com/codebot', '_blank', 'noopener')
+}
+
+const openSkillsFolder = async () => {
+  if (window.electronAPI?.openSkillsFolder) {
+    try {
+      await window.electronAPI.openSkillsFolder()
+      return
+    } catch (error) {
+      ElMessage.error(error?.message || '打开 skill 文件夹失败')
+      return
+    }
+  }
+  ElMessage.warning('当前运行环境不支持打开 skill 文件夹')
+}
+
 const filteredSkills = computed(() => {
   const q = searchQuery.value.trim().toLowerCase()
   if (!q) return skills.value
@@ -299,20 +333,25 @@ const filteredSkills = computed(() => {
   )
 })
 
-const sourceLabel = (id) => {
+const sourceLabel = (row) => {
+  const id = row?.id || ''
+  if (row?.source === 'auto_generated') return '自动生成'
+  if (row?.source === 'builtin') return '内置'
+  if (row?.source === 'external') return '外部兼容'
+  if (row?.source === 'opencode') return 'OpenCode'
   if (!id) return '自定义'
   if (id.startsWith('builtin:')) return '内置'
   if (id.startsWith('auto:')) return '自动生成'
   if (id.startsWith('opencode:')) return 'OpenCode'
-  if (id.startsWith('custom:')) return '外部目录'
+  if (id.startsWith('custom:') || id.startsWith('external:')) return '外部兼容'
   return '自定义'
 }
 
 const sourceTagType = (source) => {
   if (source === 'builtin') return 'warning'
-  if (source === 'auto') return 'success'
+  if (source === 'auto' || source === 'auto_generated') return 'success'
   if (source === 'opencode') return 'info'
-  if (source === 'custom') return ''
+  if (source === 'custom' || source === 'external') return ''
   return 'primary'
 }
 
@@ -467,6 +506,13 @@ const syncSingleSkill = async (skill) => {
 
 onMounted(() => {
   loadSkills()
+  if (window.electronAPI?.onSkillDownload) {
+    window.electronAPI.onSkillDownload((payload) => {
+      if (payload?.type === 'completed') {
+        loadSkills()
+      }
+    })
+  }
 })
 </script>
 

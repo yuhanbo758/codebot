@@ -41,25 +41,25 @@ hiddenimports += collect_submodules('uvicorn')
 tmp_ret = collect_all('lark_oapi')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
-# hnswlib — C++ 扩展，PyInstaller 无法自动发现，必须手动指定
-# 直接硬编码路径，目标 '.' 表示放入 _internal/ 根目录
-_hnswlib_src = r'D:\wenjian\python\.conda\Lib\site-packages\hnswlib.cp312-win_amd64.pyd'
-binaries.append((_hnswlib_src, '.'))
+# hnswlib / winrt native extensions. Detect them from the active CI/dev
+# environment instead of hard-coding one local Conda path.
+try:
+    import hnswlib as _hnswlib
+    _hnswlib_src = getattr(_hnswlib, '__file__', '')
+    if _hnswlib_src and os.path.exists(_hnswlib_src):
+        binaries.append((_hnswlib_src, '.'))
+except Exception as e:
+    print(f"Warning: hnswlib binary detection failed: {e}")
 
-# winrt — windows_toasts 依赖的 C++ 扩展 .pyd 文件
-_winrt_dir = r'D:\wenjian\python\.conda\Lib\site-packages\winrt'
-_winrt_pyds = [
-    '_winrt.cp312-win_amd64.pyd',
-    '_winrt_windows_data_xml_dom.cp312-win_amd64.pyd',
-    '_winrt_windows_foundation.cp312-win_amd64.pyd',
-    '_winrt_windows_foundation_collections.cp312-win_amd64.pyd',
-    '_winrt_windows_ui_notifications.cp312-win_amd64.pyd',
-]
-for _pyd in _winrt_pyds:
-    binaries.append((os.path.join(_winrt_dir, _pyd), 'winrt'))
-
-# winrt msvcp140.dll (needed by the .pyd files)
-binaries.append((os.path.join(_winrt_dir, 'msvcp140.dll'), 'winrt'))
+try:
+    import winrt as _winrt
+    _winrt_dir = os.path.dirname(getattr(_winrt, '__file__', ''))
+    if _winrt_dir and os.path.isdir(_winrt_dir):
+        for _name in os.listdir(_winrt_dir):
+            if _name.lower().endswith(('.pyd', '.dll')):
+                binaries.append((os.path.join(_winrt_dir, _name), 'winrt'))
+except Exception as e:
+    print(f"Warning: winrt binary detection failed: {e}")
 
 # collect_all for document/data packages
 for _pkg in ('docx', 'pptx', 'pypdf', 'pdfplumber', 'reportlab', 'plyer', 'windows_toasts', 'winrt'):

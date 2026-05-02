@@ -74,7 +74,7 @@ const routes = [
   {
     path: '/docs',
     name: 'Docs',
-    component: () => import('@/views/Docs.vue')
+    redirect: '/settings?tab=docs'
   }
 ]
 

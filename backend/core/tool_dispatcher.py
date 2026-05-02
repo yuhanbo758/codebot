@@ -81,6 +81,14 @@ def _append_skill_dir(skills: List[dict], base_dir: Path, source: str, prefix: s
 
 def _load_all_skills() -> List[dict]:
     """Load JSON metadata skills plus all `SKILL.md` based skills."""
+    try:
+        from core.skill_registry import get_skill_registry
+
+        return get_skill_registry().list_skills(include_content=True)
+    except Exception as exc:
+        logger.warning(f"[skills] registry load failed: {exc}")
+        return []
+
     skills: List[dict] = []
 
     skills_dir = _get_skills_dir()

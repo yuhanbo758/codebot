@@ -434,6 +434,7 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
             chat_router._materialize_reusable_skill(
                 user_message=user_text,
                 assistant_response=assistant_text,
+                conversation_id=conv_id,
             )
         except Exception:
             pass
@@ -454,6 +455,7 @@ async def run_organize_loop(get_memory_manager_fn, get_opencode_ws_fn, get_confi
     """
     logger.info("[memory_organizer] 自动整理循环已启动")
     last_triggered_date: Optional[str] = None   # "YYYY-MM-DD"
+    startup_checked = False
 
     while True:
         try:
@@ -467,37 +469,46 @@ async def run_organize_loop(get_memory_manager_fn, get_opencode_ws_fn, get_confi
 
             now = datetime.now()
             today_str = now.strftime("%Y-%m-%d")
+            should_run = False
+            trigger_reason = ""
+
+            if not startup_checked:
+                startup_checked = True
+                should_run = True
+                trigger_reason = "startup"
+
+            if mem_cfg.organize_last_run:
+                try:
+                    last_dt = datetime.fromisoformat(mem_cfg.organize_last_run)
+                    if now - last_dt >= timedelta(hours=6):
+                        should_run = True
+                        trigger_reason = "interval"
+                except Exception:
+                    pass
+            elif startup_checked:
+                should_run = True
+                trigger_reason = "first_run"
 
             # 解析配置的整理时间
             try:
                 hour, minute = map(int, mem_cfg.organize_time.split(":"))
             except Exception:
-                continue
+                hour, minute = 3, 0
 
             # 是否在该时间窗口内（允许 ±1 分钟误差）
             target_minute = hour * 60 + minute
             now_minute = now.hour * 60 + now.minute
             in_window = abs(now_minute - target_minute) <= 1
 
-            if not in_window:
-                continue
+            if in_window and last_triggered_date != today_str:
+                should_run = True
+                trigger_reason = "daily_window"
 
-            # 今天是否已经触发过
-            if last_triggered_date == today_str:
+            if not should_run:
                 continue
-
-            # 检查 organize_last_run 是否今天已运行（防重启后重复触发）
-            if mem_cfg.organize_last_run:
-                try:
-                    last_dt = datetime.fromisoformat(mem_cfg.organize_last_run)
-                    if last_dt.strftime("%Y-%m-%d") == today_str:
-                        last_triggered_date = today_str
-                        continue
-                except Exception:
-                    pass
 
             last_triggered_date = today_str
-            logger.info(f"[memory_organizer] 到达整理时间 {mem_cfg.organize_time}，启动自动整理...")
+            logger.info(f"[memory_organizer] 触发自动整理：{trigger_reason or mem_cfg.organize_time}")
 
             mm = get_memory_manager_fn()
             ws = get_opencode_ws_fn()

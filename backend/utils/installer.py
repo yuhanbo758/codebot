@@ -133,10 +133,10 @@ def _collect_opencode_base_urls() -> List[str]:
     for raw in [
         os.environ.get("CODEBOT_OPENCODE_PREFERRED_PORT", ""),
         os.environ.get("CODEBOT_OPENCODE_FALLBACK_PORT", ""),
-        "1120",
         "11200",
         "4096",
         "50690",
+        "1120",
     ]:
         try:
             port = int(str(raw).strip())
@@ -321,6 +321,18 @@ async def start_opencode_server(port: int = 11200) -> int:
         # - XDG_CONFIG_HOME 覆盖配置主目录，opencode 将在其下建立 opencode/opencode.json
         # - 保留原有环境，以免 PATH 等必要变量丢失
         proc_env = dict(os.environ)
+        # Desktop OpenCode injects these variables into child processes. If they
+        # leak into Codebot's managed server, OpenCode enables Basic Auth and
+        # Codebot's local HTTP client receives 401 on every request.
+        for key in [
+            "OPENCODE_SERVER_USERNAME",
+            "OPENCODE_SERVER_PASSWORD",
+            "OPENCODE_CLIENT",
+            "OPENCODE_PID",
+            "OPENCODE_PROCESS_ROLE",
+            "OPENCODE_RUN_ID",
+        ]:
+            proc_env.pop(key, None)
         # opencode 遵循 XDG Base Directory 规范，配置读写路径为 $XDG_CONFIG_HOME/opencode/
         # 将其重定向到 codebot 数据目录下，与系统级 ~/.config/opencode/ 完全隔离
         xdg_config_parent = str(Path(opencode_config_dir).parent)

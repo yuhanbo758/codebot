@@ -68,6 +68,10 @@ backend/build_tmp2/
 security-scan-*.json
 security-report*.json
 
+# 本地 AI / 私有协作文档
+AGENTS.md
+.trae/
+
 # IDE
 .vscode/
 .idea/
@@ -84,6 +88,7 @@ Thumbs.db
 tmp/
 temp/
 *.tmp
+tmp-release-assets/
 
 # 测试
 .pytest_cache/

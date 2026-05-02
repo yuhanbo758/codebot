@@ -2,6 +2,8 @@
 
 基于 OpenCode 的第三方能力工作台 - 所有聊天统一由 OpenCode 处理，Codebot 负责提供 MCP / Skills / 记忆 / 定时任务能力并展示结果
 
+当前发布版本：`3.2.0`
+
 ## ✨ 特性
 
 - 🤖 **OpenCode 主控**: 所有聊天消息统一交给 OpenCode 处理，支持多模型切换与原生工具流式事件展示
@@ -61,7 +63,7 @@ opencode serve
 opencode serve --port 11200 --hostname 127.0.0.1
 ```
 
-应用程序配置文件（设置 → 通用设置 → 配置文件 → `config.json`）里的 `server_url` 需要与 `opencode serve` 保持一致（端口/地址一致）。如果连不上，请优先检查该配置项。桌面端启动后端时会自动尝试拉起 OpenCode 服务，默认优先级为 `127.0.0.1:11200` → 配置文件中的 `server_url` 端口 → `127.0.0.1:11201`。如需覆盖默认值，可设置环境变量 `CODEBOT_OPENCODE_PREFERRED_PORT` 与 `CODEBOT_OPENCODE_FALLBACK_PORT`。
+应用程序配置文件（设置 → 通用设置 → 配置文件 → `config.json`）里的 `server_url` 需要与 `opencode serve` 保持一致（端口/地址一致）。如果连不上，请优先检查该配置项。桌面端启动后端时会自动尝试拉起 OpenCode 服务，并统一优先使用 `127.0.0.1:11200`。如需覆盖默认值，可设置环境变量 `CODEBOT_OPENCODE_PREFERRED_PORT` 与 `CODEBOT_OPENCODE_FALLBACK_PORT`。
 启动后，Codebot 会自动把以下内容同步到 OpenCode：
 
 - Codebot 自身的第三方 MCP 入口：`/api/mcp/codebot/sse`
@@ -129,7 +131,7 @@ npm start
 ```
 
 开发模式下（从源码运行），Electron 默认使用 `venv\\Scripts\\python.exe`（若存在）启动 `backend\\main.py`，以确保后端代码变更立即生效；如需强制使用 `backend\\dist\\codebot-backend.exe`，可设置环境变量 `CODEBOT_BACKEND_MODE=exe`。
-Electron 会优先使用应用内置的 `opencode` 可执行文件（`electron/vendor/opencode` 或打包后的 `resources/opencode`）自动拉起 `opencode serve`；若内置文件不可用或不可执行，会自动回退到系统 PATH 中的 `opencode`。桌面端会强制开启 OpenCode 自动拉起，并优先尝试 11200（随后回退到配置端口与 11201）。如果系统里已经有 OpenCode 桌面端或 `opencode serve` 在运行，Codebot 会直接复用现有健康服务并跳过额外安装检查，避免启动阶段被 OpenCode 检测卡住。
+Electron 会优先使用应用内置的 `opencode` 可执行文件（`electron/vendor/opencode` 或打包后的 `resources/opencode`）自动拉起 `opencode serve`；若内置文件不可用或不可执行，会自动回退到系统 PATH 中的 `opencode`。桌面端会强制开启 OpenCode 自动拉起，并统一优先尝试 `127.0.0.1:11200`；如果系统里已经有 OpenCode 桌面端或 `opencode serve` 在运行，Codebot 会直接复用现有健康服务并跳过额外安装检查，避免启动阶段被 OpenCode 检测卡住。
 
 ### Windows 沙箱现状
 
@@ -560,7 +562,9 @@ npm run build
 - 桌面端打包默认读取 `backend/dist_build/codebot-backend` 作为后端资源目录。
 - Windows 下建议使用根目录 `build.bat` 执行完整打包流程（后端 PyInstaller + 前端构建 + Electron 安装包）。
 - Windows 打包产物默认输出到 `electron/dist/electron_new/`。
-- Windows 产物会同时生成安装版（`Codebot Setup 1.0.0.exe`）和免安装版（`Codebot 1.0.0.exe`，portable）。
+- Windows 产物会同时生成安装版（`Codebot-Setup-1.0.0.exe`）和免安装版（`Codebot-1.0.0.exe`，portable）。
+- GitHub Releases 公共更新会在桌面端先解析 Release API 中的真实安装包资产名，再执行下载；即使资产名里的空格、点号或连字符存在差异，也不会再因为 404 导致下载失败。
+- 项目已在 `.trae/rules/release-update-compat.md` 固化 GitHub Release 更新兼容规则，后续智能体处理发版、补传资产或自动更新问题时应优先遵循该规则。
 - `build.bat` 会自动清理 `electron/dist/electron_new/win-unpacked`，避免旧桌面资源残留导致打包混淆。
 - `build.bat` 使用 `python -m pip` 安装依赖并关闭 pip 版本检查，兼容 Conda/venv 场景。
 - `build.bat` 使用 `python -m PyInstaller` 执行后端封装，避免 `pyinstaller.exe` 路径缺失导致构建失败。
@@ -623,9 +627,9 @@ npm run build
 - `GET /api/skills/{skill_id}/content` - 读取 SKILL.md 内容
 - `PUT /api/skills/{skill_id}/content` - 更新 SKILL.md 内容
 - `POST /api/skills/generate` - 从对话生成技能
-- `POST /api/skills/sync-to-opencode` - 批量同步技能到 OpenCode
-- `POST /api/skills/{skill_id}/sync-to-opencode` - 同步单个技能到 OpenCode
-- `GET /api/skills/opencode-sync-status` - 获取技能同步状态
+- `POST /api/skills/sync-to-opencode` - 高级导出接口，默认禁用；需设置 `CODEBOT_ALLOW_OPENCODE_SKILL_EXPORT=1`
+- `POST /api/skills/{skill_id}/sync-to-opencode` - 高级导出单个 Codebot 技能，默认禁用
+- `GET /api/skills/opencode-sync-status` - 获取历史导出状态和遗留 `codebot-*` 技能信息
 
 ### MCP API
 

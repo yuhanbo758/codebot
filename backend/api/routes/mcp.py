@@ -774,8 +774,20 @@ def _codebot_bind_host() -> str:
     return host
 
 
+def _codebot_runtime_port() -> int:
+    raw = os.environ.get("CODEBOT_BACKEND_PORT", "").strip()
+    if raw:
+        try:
+            port = int(raw)
+            if 1 <= port <= 65535:
+                return port
+        except Exception:
+            pass
+    return int(app_config.network.port)
+
+
 def get_codebot_remote_sse_url() -> str:
-    return f"http://{_codebot_bind_host()}:{app_config.network.port}/api/mcp/codebot/sse"
+    return f"http://{_codebot_bind_host()}:{_codebot_runtime_port()}/api/mcp/codebot/sse"
 
 
 def _build_codebot_remote_mcp_entry() -> dict:
@@ -1652,7 +1664,7 @@ async def get_codebot_third_party_status():
             "desktop_role": "OpenCode Desktop Companion",
             "server_name": CODEBOT_REMOTE_SERVER_NAME,
             "sse_url": get_codebot_remote_sse_url(),
-            "message_url_template": f"http://{_codebot_bind_host()}:{app_config.network.port}/api/mcp/codebot/messages?sessionId={{session_id}}",
+            "message_url_template": f"http://{_codebot_bind_host()}:{_codebot_runtime_port()}/api/mcp/codebot/messages?sessionId={{session_id}}",
             "bridge_status": get_codebot_remote_mcp_status(),
             "opencode_server_url": app_config.opencode.server_url,
             "opencode_connected": opencode_status["connected"],

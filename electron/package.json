@@ -1,6 +1,6 @@
 {
   "name": "codebot",
-  "version": "2.8.0",
+  "version": "3.2.0",
   "description": "基于 OpenCode 的个人 AI 助手",
   "author": "Codebot",
   "main": "main.js",
@@ -8,7 +8,9 @@
     "start": "chcp 65001 && electron .",
     "build": "electron-builder"
   },
-  "dependencies": {},
+  "dependencies": {
+    "electron-updater": "^6.8.3"
+  },
   "devDependencies": {
     "electron": "^28.0.0",
     "electron-builder": "^24.9.0"
@@ -60,8 +62,21 @@
       "signingHashAlgorithms": null,
       "target": ["nsis", "portable"]
     },
+    "nsis": {
+      "artifactName": "Codebot-Setup-${version}.${ext}"
+    },
+    "portable": {
+      "artifactName": "Codebot-${version}.${ext}"
+    },
     "linux": {
       "target": ["AppImage", "deb"]
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "yuhanbo758",
+        "repo": "codebot"
+      }
+    ]
   }
 }

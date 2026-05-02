@@ -29,7 +29,7 @@ from services.notification import NotificationService
 from utils.installer import check_and_install_opencode, start_opencode_server, stop_opencode_server
 
 # 导入 API 路由
-from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router
+from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router, growth as growth_router
 
 
 # 全局组件实例
@@ -57,6 +57,33 @@ def _configure_console_encoding():
 
 
 _configure_console_encoding()
+
+
+def _runtime_backend_port() -> int:
+    raw = os.environ.get("CODEBOT_BACKEND_PORT", "").strip()
+    if raw:
+        try:
+            port = int(raw)
+            if 1 <= port <= 65535:
+                return port
+        except Exception:
+            logger.warning(f"忽略无效 CODEBOT_BACKEND_PORT: {raw}")
+    return int(app_config.network.port)
+
+
+def _runtime_opencode_server_url() -> str:
+    explicit_url = os.environ.get("CODEBOT_OPENCODE_SERVER_URL", "").strip()
+    if explicit_url:
+        return explicit_url.rstrip("/")
+    raw_port = os.environ.get("CODEBOT_OPENCODE_PREFERRED_PORT", "").strip()
+    if raw_port:
+        try:
+            port = int(raw_port)
+            if 1 <= port <= 65535:
+                return f"http://127.0.0.1:{port}"
+        except Exception:
+            logger.warning(f"忽略无效 CODEBOT_OPENCODE_PREFERRED_PORT: {raw_port}")
+    return app_config.opencode.server_url
 
 
 def _seed_builtin_skills(skills_dir: Path):
@@ -186,7 +213,8 @@ async def lifespan(app: FastAPI):
     logger.info("初始化核心组件...")
     global opencode_ws, memory_manager, notification_service, lark_ws_bot, sandbox_manager
     
-    opencode_ws = OpenCodeClient(app_config.opencode.server_url)
+    runtime_opencode_url = _runtime_opencode_server_url()
+    opencode_ws = OpenCodeClient(runtime_opencode_url)
     chat.opencode_ws = opencode_ws
     gateway_router.opencode_ws = opencode_ws
     memory_manager = MemoryManager()
@@ -221,7 +249,7 @@ async def lifespan(app: FastAPI):
     force_auto_start = os.environ.get("CODEBOT_FORCE_OPENCODE_AUTOSTART", "").strip().lower() in {"1", "true", "yes", "on"}
     should_auto_start = bool(force_auto_start or app_config.opencode.auto_start or os.environ.get("CODEBOT_DATA_DIR"))
     if should_auto_start:
-        parsed = urlparse(app_config.opencode.server_url)
+        parsed = urlparse(runtime_opencode_url)
         configured_port = parsed.port or 11200
         preferred_port_raw = os.environ.get("CODEBOT_OPENCODE_PREFERRED_PORT", "").strip()
         fallback_port_raw = os.environ.get("CODEBOT_OPENCODE_FALLBACK_PORT", "").strip()
@@ -230,11 +258,12 @@ async def lifespan(app: FastAPI):
         except Exception:
             preferred_port = 11200
         try:
-            fallback_port = int(fallback_port_raw) if fallback_port_raw else 11201
+            fallback_port = int(fallback_port_raw) if fallback_port_raw else 11200
         except Exception:
-            fallback_port = 11201
+            fallback_port = 11200
+        candidate_sources = [preferred_port, fallback_port] if (preferred_port_raw or fallback_port_raw) else [preferred_port, configured_port, fallback_port]
         candidate_ports = []
-        for p in [preferred_port, configured_port, fallback_port]:
+        for p in candidate_sources:
             if not isinstance(p, int) or p < 1 or p > 65535:
                 continue
             if p not in candidate_ports:
@@ -314,8 +343,9 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 50)
     logger.info("✨ Codebot 启动成功！")
     logger.info("=" * 50)
-    logger.info(f"📍 本地访问：http://127.0.0.1:{app_config.network.port}")
-    logger.info(f"🌐 局域网访问：http://{local_ip}:{app_config.network.port}")
+    backend_port = _runtime_backend_port()
+    logger.info(f"📍 本地访问：http://127.0.0.1:{backend_port}")
+    logger.info(f"🌐 局域网访问：http://{local_ip}:{backend_port}")
     logger.info(f"📱 移动端：使用手机浏览器访问局域网地址")
     logger.info("=" * 50)
     
@@ -393,7 +423,7 @@ def _is_port_available(host: str, port: int) -> bool:
 app = FastAPI(
     title="Codebot",
     description="基于 OpenCode 的个人 AI 助手",
-    version="2.8.0",
+    version=app_config.version,
     lifespan=lifespan
 )
 
@@ -416,6 +446,7 @@ app.include_router(config_router.router, prefix="/api/config", tags=["配置"])
 app.include_router(notifications.router, prefix="/api/notifications", tags=["通知"])
 app.include_router(lark.router, prefix="/api/lark", tags=["飞书"])
 app.include_router(sandbox_router.router, prefix="/api/sandbox", tags=["沙箱"])
+app.include_router(growth_router.router, prefix="/api/growth", tags=["成长沉淀"])
 app.include_router(gateway_router.router, prefix="/v1", tags=["模型网关"])
 
 
@@ -424,7 +455,7 @@ async def health_check():
     """健康检查"""
     return {
         "status": "healthy",
-        "version": "2.8.0",
+        "version": app_config.version,
         "opencode_connected": opencode_ws.connected if opencode_ws else False,
         "runtime_source": "packaged" if getattr(sys, "frozen", False) else "source",
         "pid": os.getpid()
@@ -435,7 +466,7 @@ async def health_check():
 async def network_info():
     """返回本机访问地址信息"""
     local_ip = get_local_ip()
-    port = int(app_config.network.port)
+    port = _runtime_backend_port()
     return {
         "local_url": f"http://127.0.0.1:{port}",
         "lan_url": f"http://{local_ip}:{port}",
@@ -521,7 +552,7 @@ if __name__ == "__main__":
     import uvicorn
 
     host = app_config.network.host
-    port = int(app_config.network.port)
+    port = _runtime_backend_port()
     if not _is_port_available(host, port):
         logger.error(
             f"端口被占用，无法启动：{host}:{port}\n"

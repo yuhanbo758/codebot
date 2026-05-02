@@ -1,16 +1,376 @@
-const { app, BrowserWindow, Menu, dialog, ipcMain, clipboard, shell, session } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, clipboard, shell, session, safeStorage } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
 const os = require('os');
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
+let autoUpdater = null;
+try {
+  autoUpdater = require('electron-updater').autoUpdater;
+} catch (error) {
+  console.warn(`[update] electron-updater not available: ${error.message || error}`);
+}
 
-const BACKEND_URL = 'http://127.0.0.1:8080';
+const isDevRuntime = !app.isPackaged;
+const backendPort = process.env.CODEBOT_BACKEND_PORT || (isDevRuntime ? '18080' : '8080');
+const opencodePort = process.env.CODEBOT_OPENCODE_PREFERRED_PORT || (isDevRuntime ? '11203' : '11200');
+const BACKEND_URL = `http://127.0.0.1:${backendPort}`;
 const FRONTEND_DEV_URL = 'http://127.0.0.1:3000';
+const SHOP_BASE_URL = process.env.CODEBOT_SHOP_BASE_URL || 'https://shop.sanrenjz.com';
+const SHOP_MEMBER_CENTER_URL = `${SHOP_BASE_URL}/member-center`;
+const SHOP_CODEBOT_STORE_URL = `${SHOP_BASE_URL}/codebot`;
+const SHOP_DOWNLOAD_HOSTNAME = 'xz.sanrenjz.com';
+const CODEBOT_UPDATE_GENERIC_URL = process.env.CODEBOT_UPDATE_GENERIC_URL || 'https://xz.sanrenjz.com/Download/codebot/';
+const CODEBOT_GITHUB_OWNER = 'yuhanbo758';
+const CODEBOT_GITHUB_REPO = 'codebot';
+const CODEBOT_GITHUB_RELEASES_API = `https://api.github.com/repos/${CODEBOT_GITHUB_OWNER}/${CODEBOT_GITHUB_REPO}/releases`;
+const ACCOUNT_TOKEN_FILE = 'account-token.bin';
+const BUILTIN_BROWSER_PARTITION = 'persist:builtin-browser';
+const SHOP_HOSTNAME = new URL(SHOP_BASE_URL).hostname;
+let cachedAccount = null;
+let lastUpdateSource = 'github';
+let builtinSessionEventsBound = false;
+let pendingManualUpdate = null;
+let lastCheckedUpdateInfo = null;
+
+function toSerializable(value) {
+  if (value == null) return value;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_) {
+    if (value instanceof Error) {
+      return {
+        message: value.message || String(value),
+        stack: value.stack || '',
+      };
+    }
+    return { message: String(value) };
+  }
+}
+
+function getBuiltinSession() {
+  return session.fromPartition(BUILTIN_BROWSER_PARTITION);
+}
+
+function sendRendererEvent(channel, payload = {}) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, toSerializable(payload));
+  }
+}
+
+function sendAccountChanged(payload = {}) {
+  sendRendererEvent('account:changed', payload);
+}
+
+function sendSkillDownloadEvent(payload = {}) {
+  sendRendererEvent('skills:download', payload);
+}
+
+function isShopDomain(domain) {
+  const normalized = String(domain || '').replace(/^\./, '').toLowerCase();
+  return normalized === SHOP_HOSTNAME || normalized.endsWith(`.${SHOP_HOSTNAME}`);
+}
+
+function isShopUrl(rawUrl) {
+  try {
+    return isShopDomain(new URL(rawUrl).hostname);
+  } catch (_) {
+    return false;
+  }
+}
+
+function isSkillDownloadUrl(rawUrl) {
+  try {
+    const hostname = new URL(rawUrl).hostname.toLowerCase();
+    return isShopDomain(hostname) || hostname === SHOP_DOWNLOAD_HOSTNAME;
+  } catch (_) {
+    return false;
+  }
+}
+
+function isSupportedSkillDownload(fileName) {
+  return /\.(zip|md|markdown|txt)$/i.test(String(fileName || ''));
+}
+
+function codebotSkillsDir() {
+  return path.join(app.getPath('userData'), 'skills');
+}
+
+function ensureDir(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
+  return dirPath;
+}
+
+function sanitizeFileName(fileName) {
+  return String(fileName || 'download')
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim() || 'download';
+}
+
+function slugifyName(value, fallback = 'skill') {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return normalized || fallback;
+}
+
+function uniquePath(filePath) {
+  if (!fs.existsSync(filePath)) return filePath;
+  const parsed = path.parse(filePath);
+  let counter = 1;
+  while (true) {
+    const candidate = path.join(parsed.dir, `${parsed.name}_${counter}${parsed.ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+    counter += 1;
+  }
+}
+
+function uniqueAutoSkillDir(baseName) {
+  const skillsDir = ensureDir(codebotSkillsDir());
+  const slugBase = `auto_${slugifyName(baseName, 'downloaded_skill')}`;
+  let candidate = path.join(skillsDir, slugBase);
+  let counter = 1;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(skillsDir, `${slugBase}_${counter}`);
+    counter += 1;
+  }
+  return candidate;
+}
+
+function parseDownloadedSkillContent(content, fallbackName, slug) {
+  const trimmed = String(content || '').trim();
+  if (trimmed.startsWith('---')) {
+    return trimmed.endsWith('\n') ? trimmed : `${trimmed}\n`;
+  }
+  const name = fallbackName || slug || '自动生成技能';
+  return `---\nname: "${name.replace(/"/g, '\\"')}"\nslug: "${slug}"\ndescription: "从程序小店下载并自动安装"\nversion: "1.0.0"\nsource: auto_generated\ncompatibility:\n  - codebot\ncreated_at: "${new Date().toISOString()}"\n---\n\n# ${name}\n\n${trimmed || '从程序小店下载的技能内容。'}\n`;
+}
+
+function findFilesRecursive(rootDir, matcher) {
+  const matches = [];
+  const queue = [rootDir];
+  while (queue.length) {
+    const current = queue.shift();
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === '__pycache__') continue;
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        queue.push(entryPath);
+      } else if (matcher(entryPath, entry.name)) {
+        matches.push(entryPath);
+      }
+    }
+  }
+  return matches;
+}
+
+function removePath(targetPath) {
+  try {
+    fs.rmSync(targetPath, { recursive: true, force: true });
+  } catch (_) {}
+}
+
+function copyDirectoryContents(sourceDir, targetDir) {
+  fs.cpSync(sourceDir, targetDir, { recursive: true, force: true });
+}
+
+function extractArchive(archivePath, destinationDir) {
+  ensureDir(destinationDir);
+  return new Promise((resolve, reject) => {
+    const isWindows = process.platform === 'win32';
+    const command = isWindows ? 'powershell.exe' : 'tar';
+    const args = isWindows
+      ? ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', `Expand-Archive -LiteralPath '${archivePath.replace(/'/g, "''")}' -DestinationPath '${destinationDir.replace(/'/g, "''")}' -Force`]
+      : ['-xf', archivePath, '-C', destinationDir];
+    const child = spawn(command, args, { windowsHide: true });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('error', reject);
+    child.on('exit', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(stderr.trim() || '解压技能包失败'));
+      }
+    });
+  });
+}
+
+async function installDownloadedSkill(downloadPath) {
+  const fileName = path.basename(downloadPath);
+  const ext = path.extname(fileName).toLowerCase();
+  const parsed = path.parse(fileName);
+  const targetDir = uniqueAutoSkillDir(parsed.name || 'downloaded_skill');
+  ensureDir(targetDir);
+
+  if (ext === '.md' || ext === '.markdown' || ext === '.txt') {
+    const content = fs.readFileSync(downloadPath, 'utf8');
+    fs.writeFileSync(path.join(targetDir, 'SKILL.md'), parseDownloadedSkillContent(content, parsed.name, path.basename(targetDir)), 'utf8');
+    removePath(downloadPath);
+    return { slug: path.basename(targetDir), path: targetDir };
+  }
+
+  if (ext === '.zip') {
+    const extractDir = uniquePath(path.join(ensureDir(path.join(codebotSkillsDir(), '.downloads')), `${parsed.name}_unzipped`));
+    try {
+      await extractArchive(downloadPath, extractDir);
+      const skillMdFiles = findFilesRecursive(extractDir, (entryPath, entryName) => entryName.toLowerCase() === 'skill.md');
+      if (skillMdFiles.length > 0) {
+        copyDirectoryContents(path.dirname(skillMdFiles[0]), targetDir);
+      } else {
+        const markdownFiles = findFilesRecursive(extractDir, (_entryPath, entryName) => /\.(md|markdown|txt)$/i.test(entryName));
+        if (markdownFiles.length === 0) {
+          throw new Error('下载内容中没有找到可安装的 SKILL.md');
+        }
+        const content = fs.readFileSync(markdownFiles[0], 'utf8');
+        fs.writeFileSync(path.join(targetDir, 'SKILL.md'), parseDownloadedSkillContent(content, parsed.name, path.basename(targetDir)), 'utf8');
+      }
+    } finally {
+      removePath(extractDir);
+      removePath(downloadPath);
+    }
+    return { slug: path.basename(targetDir), path: targetDir };
+  }
+
+  removePath(targetDir);
+  throw new Error(`暂不支持自动安装 ${ext || '该类型'} 文件，请下载 SKILL.md 或 zip 技能包`);
+}
+
+async function readTokenFromWebContents(webContents) {
+  if (!webContents || webContents.isDestroyed()) return '';
+  try {
+    const url = webContents.getURL();
+    if (!isShopUrl(url)) return '';
+    const token = await webContents.executeJavaScript(`(() => {
+      try {
+        return String(window.localStorage.getItem('token') || '');
+      } catch (_) {
+        return '';
+      }
+    })()`, true);
+    return String(token || '').trim();
+  } catch (_) {
+    return '';
+  }
+}
+
+async function syncAccountFromWebContents(webContents) {
+  const token = await readTokenFromWebContents(webContents);
+  if (token) {
+    saveAccountToken(token);
+  } else {
+    clearAccountToken();
+  }
+  cachedAccount = await loadAccountSnapshot();
+  sendAccountChanged(cachedAccount || { authenticated: false, canDownloadUpdates: false, user: null });
+  return cachedAccount;
+}
+
+async function clearShopSession() {
+  const builtinSession = getBuiltinSession();
+  try {
+    await builtinSession.clearStorageData({ origin: SHOP_BASE_URL, storages: ['localstorage'] });
+  } catch (_) {}
+  const cookies = await builtinSession.cookies.get({ url: SHOP_BASE_URL });
+  for (const cookie of cookies) {
+    const domain = String(cookie.domain || '').replace(/^\./, '');
+    const protocol = cookie.secure ? 'https://' : 'http://';
+    const cookieUrl = `${protocol}${domain}${cookie.path || '/'}`;
+    try {
+      await builtinSession.cookies.remove(cookieUrl, cookie.name);
+    } catch (_) {}
+  }
+}
+
+async function shopSessionRequest(apiPath, options = {}) {
+  const builtinSession = getBuiltinSession();
+  if (typeof builtinSession.fetch !== 'function') {
+    throw new Error('当前 Electron 版本不支持共享浏览器会话请求');
+  }
+  const token = String(options.token || readAccountToken() || '').trim();
+  if (!token) {
+    throw new Error('未登录');
+  }
+  const url = `${SHOP_BASE_URL}${apiPath}`;
+  const headers = {
+    Accept: 'application/json, text/plain, */*',
+    ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+    Authorization: `Bearer ${token}`,
+    ...(options.headers || {}),
+  };
+  const response = await builtinSession.fetch(url, {
+    method: options.method || 'GET',
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+    credentials: 'include',
+  });
+  const text = await response.text();
+  let payload = {};
+  try { payload = text ? JSON.parse(text) : {}; } catch (_) { payload = { raw: text }; }
+  if (!response.ok) {
+    throw new Error(payload?.message || payload?.error || payload?.detail || `请求失败: ${response.status}`);
+  }
+  return payload;
+}
+
+async function loadAccountSnapshotFromSession() {
+  try {
+    const token = readAccountToken();
+    if (!token) {
+      return { authenticated: false, canDownloadUpdates: false };
+    }
+    const [me, access] = await Promise.all([
+      shopSessionRequest('/api/users/electron/me?typeCategory=codebot', { token }),
+      shopSessionRequest('/api/users/electron/access?typeCategory=codebot', { token }),
+    ]);
+    return {
+      authenticated: true,
+      user: toSerializable(me?.user || me?.data?.user || me?.data || me),
+      canDownloadUpdates: isCodebotMember(access),
+    };
+  } catch (error) {
+    return { authenticated: false, canDownloadUpdates: false, error: error.message || String(error) };
+  }
+}
+
+function bindBuiltinSessionEvents() {
+  if (builtinSessionEventsBound) return;
+  builtinSessionEventsBound = true;
+  const builtinSession = getBuiltinSession();
+
+  builtinSession.on('will-download', (event, item, webContents) => {
+    const sourceUrl = item.getURL() || webContents?.getURL() || '';
+    const fileName = sanitizeFileName(item.getFilename());
+    if (!isSkillDownloadUrl(sourceUrl) && !isSupportedSkillDownload(fileName)) return;
+    const downloadsDir = ensureDir(path.join(codebotSkillsDir(), '.downloads'));
+    const savePath = uniquePath(path.join(downloadsDir, fileName));
+    item.setSavePath(savePath);
+    sendSkillDownloadEvent({ type: 'started', fileName: path.basename(savePath) });
+    item.on('done', async (_downloadEvent, state) => {
+      if (state !== 'completed') {
+        sendSkillDownloadEvent({ type: 'error', fileName: path.basename(savePath), message: `下载未完成：${state}` });
+        return;
+      }
+      try {
+        const installed = await installDownloadedSkill(savePath);
+        sendSkillDownloadEvent({ type: 'completed', fileName: path.basename(savePath), installed });
+      } catch (error) {
+        sendSkillDownloadEvent({ type: 'error', fileName: path.basename(savePath), message: error.message || String(error) });
+      }
+    });
+  });
+}
 
 function isInternalAppUrl(url) {
   return url.startsWith(BACKEND_URL)
-    || url.startsWith('http://localhost:8080')
+    || url.startsWith(`http://localhost:${backendPort}`)
     || url.startsWith(FRONTEND_DEV_URL)
     || url.startsWith('http://localhost:3000');
 }
@@ -79,10 +439,95 @@ ipcMain.handle('dialog:selectFolder', async (_event, options) => {
   return result.filePaths[0];
 });
 
+ipcMain.handle('get-version', () => app.getVersion());
+
+ipcMain.handle('account:login', async (_event, credentials) => {
+  openBuiltinBrowserWindow(SHOP_MEMBER_CENTER_URL);
+  return { success: true, loginMode: 'browser', url: SHOP_MEMBER_CENTER_URL };
+});
+
+ipcMain.handle('account:logout', async () => {
+  await clearShopSession();
+  clearAccountToken();
+  cachedAccount = null;
+  sendAccountChanged({ authenticated: false, reason: 'logout' });
+  return { authenticated: false };
+});
+
+ipcMain.handle('account:me', async () => {
+  cachedAccount = await loadAccountSnapshot();
+  return toSerializable(cachedAccount);
+});
+
+ipcMain.handle('account:access', async () => {
+  return toSerializable(await fetchCodebotAccess());
+});
+
+ipcMain.handle('shop:open-member-center', async () => {
+  openBuiltinBrowserWindow(SHOP_MEMBER_CENTER_URL);
+  return { success: true };
+});
+
+ipcMain.handle('shop:open-codebot-store', async () => {
+  openBuiltinBrowserWindow(SHOP_CODEBOT_STORE_URL);
+  return { success: true };
+});
+
+ipcMain.handle('skills:open-folder', async () => {
+  const folder = ensureDir(codebotSkillsDir());
+  const error = await shell.openPath(folder);
+  if (error) throw new Error(error);
+  return { success: true, path: folder };
+});
+
+ipcMain.handle('update:check', async () => {
+  return checkForCodebotUpdates();
+});
+
+ipcMain.handle('update:download', async () => {
+  if (!autoUpdater) throw new Error('自动更新模块不可用');
+  if (lastUpdateSource === 'github') {
+    const version = String(lastCheckedUpdateInfo?.version || '').trim();
+    if (!version) {
+      throw new Error('尚未获得可下载的新版本，请先检查更新');
+    }
+    return downloadGithubReleaseInstaller(version);
+  }
+  pendingManualUpdate = null;
+  await autoUpdater.downloadUpdate();
+  return { success: true, mode: 'electron-updater' };
+});
+
+ipcMain.handle('update:install', async () => {
+  if (pendingManualUpdate?.installerPath) {
+    const installerPath = pendingManualUpdate.installerPath;
+    if (!fs.existsSync(installerPath)) {
+      pendingManualUpdate = null;
+      throw new Error('已下载的安装包不存在，请重新下载更新');
+    }
+
+    // GitHub 公共更新走手动下载安装器流程，启动安装程序后退出当前应用，
+    // 避免继续依赖 electron-updater 对错误资产名的自动解析。
+    const child = spawn(installerPath, [], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: false,
+    });
+    child.unref();
+    pendingManualUpdate = null;
+    app.quit();
+    return { success: true, mode: 'manual-github' };
+  }
+
+  if (!autoUpdater) throw new Error('自动更新模块不可用');
+  autoUpdater.quitAndInstall(false, true);
+  return { success: true };
+});
+
 // 创建内置浏览器窗口的辅助函数
 // 使用 persist:builtin-browser 命名持久化 session，确保 Cookie 跨窗口关闭后保留
 function openBuiltinBrowserWindow(url) {
-  const builtinSession = session.fromPartition('persist:builtin-browser');
+  const builtinSession = getBuiltinSession();
   const browserWin = new BrowserWindow({
     width: 1100,
     height: 750,
@@ -96,8 +541,23 @@ function openBuiltinBrowserWindow(url) {
     },
   });
   browserWin.loadURL(url);
+  const syncAccountState = () => {
+    syncAccountFromWebContents(browserWin.webContents).catch(() => {});
+  };
+  browserWin.webContents.on('did-finish-load', syncAccountState);
+  browserWin.webContents.on('did-navigate-in-page', syncAccountState);
+  browserWin.webContents.on('did-navigate', syncAccountState);
+  browserWin.webContents.on('will-navigate', (event, targetUrl) => {
+    if (!isSkillDownloadUrl(targetUrl)) return;
+    event.preventDefault();
+    browserWin.webContents.downloadURL(targetUrl);
+  });
   // 内置浏览器窗口内部的新窗口也在同一内置浏览器中打开（同一 session，复用 cookie）
   browserWin.webContents.setWindowOpenHandler(({ url: newUrl }) => {
+    if (isSkillDownloadUrl(newUrl)) {
+      browserWin.webContents.downloadURL(newUrl);
+      return { action: 'deny' };
+    }
     openBuiltinBrowserWindow(newUrl);
     return { action: 'deny' };
   });
@@ -119,6 +579,322 @@ function getLocalIP() {
     }
   }
   return '127.0.0.1';
+}
+
+function tokenPath() {
+  return path.join(app.getPath('userData'), ACCOUNT_TOKEN_FILE);
+}
+
+function saveAccountToken(token) {
+  const file = tokenPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const buffer = Buffer.from(String(token), 'utf8');
+  const encrypted = safeStorage && safeStorage.isEncryptionAvailable()
+    ? safeStorage.encryptString(String(token))
+    : buffer;
+  fs.writeFileSync(file, encrypted);
+}
+
+function readAccountToken() {
+  const file = tokenPath();
+  if (!fs.existsSync(file)) return '';
+  const data = fs.readFileSync(file);
+  try {
+    if (safeStorage && safeStorage.isEncryptionAvailable()) {
+      return safeStorage.decryptString(data);
+    }
+  } catch (_) {}
+  return data.toString('utf8');
+}
+
+function clearAccountToken() {
+  try { fs.unlinkSync(tokenPath()); } catch (_) {}
+}
+
+async function shopRequest(apiPath, options = {}) {
+  const url = `${SHOP_BASE_URL}${apiPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    ...(options.headers || {}),
+  };
+  const token = options.token || '';
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  const fetchImpl = global.fetch;
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('当前 Electron 运行时不支持 fetch');
+  }
+  const response = await fetchImpl(url, {
+    method: options.method || 'GET',
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+  const text = await response.text();
+  let payload = {};
+  try { payload = text ? JSON.parse(text) : {}; } catch (_) { payload = { raw: text }; }
+  if (!response.ok) {
+    throw new Error(payload?.message || payload?.error || payload?.detail || `请求失败: ${response.status}`);
+  }
+  return payload;
+}
+
+function isCodebotMember(accessPayload) {
+  const payload = accessPayload?.data || accessPayload || {};
+  if (payload.canDownloadUpdates === true) return true;
+  if (payload.entitlements?.canDownloadUpdates === true) return true;
+  const memberships = payload.entitlements?.activeMemberships || payload.activeMemberships || [];
+  return memberships.some((item) => {
+    const key = item?.planKey || item?.typeCategory || item?.category || item;
+    return key === 'codebot' || key === 'all';
+  });
+}
+
+async function fetchCodebotAccess() {
+  const sessionAccess = await loadAccountSnapshotFromSession();
+  if (sessionAccess.authenticated) {
+    return {
+      authenticated: true,
+      canDownloadUpdates: Boolean(sessionAccess.canDownloadUpdates),
+    };
+  }
+  const token = readAccountToken();
+  if (!token) return { authenticated: false, canDownloadUpdates: false };
+  try {
+    const payload = await shopRequest('/api/users/electron/access?typeCategory=codebot', { token });
+    return {
+      authenticated: true,
+      canDownloadUpdates: isCodebotMember(payload),
+    };
+  } catch (error) {
+    return { authenticated: false, canDownloadUpdates: false, error: error.message || String(error) };
+  }
+}
+
+async function loadAccountSnapshot() {
+  const sessionSnapshot = await loadAccountSnapshotFromSession();
+  if (sessionSnapshot.authenticated) {
+    return sessionSnapshot;
+  }
+  const token = readAccountToken();
+  if (!token) return { authenticated: false, canDownloadUpdates: false };
+  try {
+    const [me, access] = await Promise.all([
+      shopRequest('/api/users/electron/me?typeCategory=codebot', { token }),
+      fetchCodebotAccess(),
+    ]);
+    return {
+      authenticated: true,
+      user: toSerializable(me?.user || me?.data?.user || me?.data || me),
+      canDownloadUpdates: Boolean(access.canDownloadUpdates),
+    };
+  } catch (error) {
+    return { authenticated: false, canDownloadUpdates: false, error: error.message || String(error) };
+  }
+}
+
+function sendUpdateEvent(type, payload = {}) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('update:status', toSerializable({ type, source: lastUpdateSource, ...payload }));
+  }
+}
+
+function normalizeAssetName(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+}
+
+async function fetchGithubReleaseByVersion(version) {
+  const fetchImpl = global.fetch;
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('当前 Electron 运行时不支持 GitHub Release 查询');
+  }
+
+  const tag = String(version || '').trim().replace(/^v/i, '');
+  if (!tag) {
+    throw new Error('缺少可下载的版本号，请先重新检查更新');
+  }
+
+  const response = await fetchImpl(`${CODEBOT_GITHUB_RELEASES_API}/tags/v${encodeURIComponent(tag)}`, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'Codebot-Updater',
+    },
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.message || `查询 GitHub Release 失败: ${response.status}`);
+  }
+  return payload;
+}
+
+function resolveGithubInstallerAsset(releasePayload, version) {
+  const assets = Array.isArray(releasePayload?.assets) ? releasePayload.assets : [];
+  const normalizedVersion = String(version || '').trim().replace(/^v/i, '');
+  const expectedNames = [
+    `Codebot-Setup-${normalizedVersion}.exe`,
+    `Codebot.Setup.${normalizedVersion}.exe`,
+    `Codebot Setup ${normalizedVersion}.exe`,
+  ];
+  const expectedNameSet = new Set(expectedNames.map((item) => normalizeAssetName(item)));
+
+  // GitHub Release 资产名可能因为上传方式不同出现空格/点号/连字符差异，
+  // 这里统一归一化后做匹配，优先锁定 setup 安装包，避免 portable 包被误选。
+  let asset = assets.find((item) => expectedNameSet.has(normalizeAssetName(item?.name)));
+  if (!asset) {
+    asset = assets.find((item) => {
+      const name = String(item?.name || '');
+      return /\.exe$/i.test(name) && /setup/i.test(name) && name.includes(normalizedVersion);
+    });
+  }
+
+  if (!asset?.browser_download_url) {
+    throw new Error(`未找到 ${normalizedVersion} 对应的安装包资源`);
+  }
+  return asset;
+}
+
+function downloadFileWithRedirects(url, destinationPath, onProgress, redirectCount = 0) {
+  if (redirectCount > 5) {
+    return Promise.reject(new Error('下载重定向次数过多'));
+  }
+
+  return new Promise((resolve, reject) => {
+    const transport = String(url).startsWith('https:') ? https : http;
+    const request = transport.get(url, {
+      headers: {
+        'User-Agent': 'Codebot-Updater',
+        Accept: 'application/octet-stream',
+      },
+    }, (response) => {
+      const statusCode = Number(response.statusCode || 0);
+      const redirectLocation = response.headers.location;
+
+      if ([301, 302, 303, 307, 308].includes(statusCode) && redirectLocation) {
+        response.resume();
+        const nextUrl = new URL(redirectLocation, url).toString();
+        resolve(downloadFileWithRedirects(nextUrl, destinationPath, onProgress, redirectCount + 1));
+        return;
+      }
+
+      if (statusCode !== 200) {
+        response.resume();
+        reject(new Error(`Cannot download "${url}", status ${statusCode}`));
+        return;
+      }
+
+      fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
+      const fileStream = fs.createWriteStream(destinationPath);
+      const totalBytes = Number(response.headers['content-length'] || 0);
+      let receivedBytes = 0;
+      let settled = false;
+
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        try { fileStream.destroy(); } catch (_) {}
+        try { fs.unlinkSync(destinationPath); } catch (_) {}
+        reject(error);
+      };
+
+      response.on('data', (chunk) => {
+        receivedBytes += chunk.length;
+        if (typeof onProgress === 'function') {
+          onProgress({
+            percent: totalBytes > 0 ? (receivedBytes / totalBytes) * 100 : 0,
+            transferred: receivedBytes,
+            total: totalBytes,
+          });
+        }
+      });
+      response.on('error', fail);
+      fileStream.on('error', fail);
+
+      fileStream.on('finish', () => {
+        if (settled) return;
+        settled = true;
+        fileStream.close(() => resolve(destinationPath));
+      });
+
+      response.pipe(fileStream);
+    });
+
+    request.on('error', (error) => {
+      try { fs.unlinkSync(destinationPath); } catch (_) {}
+      reject(error);
+    });
+  });
+}
+
+async function downloadGithubReleaseInstaller(version) {
+  const releasePayload = await fetchGithubReleaseByVersion(version);
+  const installerAsset = resolveGithubInstallerAsset(releasePayload, version);
+  const updatesDir = ensureDir(path.join(app.getPath('userData'), 'updates'));
+  const targetFileName = sanitizeFileName(installerAsset.name || `Codebot-Setup-${version}.exe`);
+  const targetPath = path.join(updatesDir, targetFileName);
+
+  pendingManualUpdate = null;
+  sendUpdateEvent('download-progress', {
+    progress: { percent: 0, transferred: 0, total: Number(installerAsset.size || 0) },
+  });
+
+  await downloadFileWithRedirects(installerAsset.browser_download_url, targetPath, (progress) => {
+    sendUpdateEvent('download-progress', { progress });
+  });
+
+  pendingManualUpdate = {
+    installerPath: targetPath,
+    version: String(version || '').trim(),
+    source: 'github',
+  };
+  sendUpdateEvent('downloaded', {
+    info: lastCheckedUpdateInfo,
+    message: '安装包已下载，点击“安装重启”启动安装程序',
+  });
+  return { success: true, path: targetPath, mode: 'manual-github' };
+}
+
+function configureAutoUpdater(source, token = '') {
+  if (!autoUpdater) return;
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+  const useGenericFeed = source === 'object-storage';
+  autoUpdater.requestHeaders = useGenericFeed && token ? { Authorization: `Bearer ${token}` } : {};
+  lastUpdateSource = useGenericFeed ? 'object-storage' : 'github';
+  if (useGenericFeed) {
+    autoUpdater.setFeedURL({ provider: 'generic', url: CODEBOT_UPDATE_GENERIC_URL });
+  } else {
+    autoUpdater.setFeedURL({ provider: 'github', owner: CODEBOT_GITHUB_OWNER, repo: CODEBOT_GITHUB_REPO });
+  }
+}
+
+async function checkForCodebotUpdates() {
+  if (!autoUpdater) throw new Error('自动更新模块不可用，请确认 electron-updater 已安装');
+  const token = readAccountToken();
+  const access = await fetchCodebotAccess();
+  const preferredSource = access.authenticated && access.canDownloadUpdates ? 'object-storage' : 'github';
+  configureAutoUpdater(preferredSource, token);
+  const result = await autoUpdater.checkForUpdates();
+  lastCheckedUpdateInfo = toSerializable(result?.updateInfo || null);
+  pendingManualUpdate = null;
+  return {
+    success: true,
+    source: lastUpdateSource,
+    canDownloadUpdates: Boolean(access.canDownloadUpdates),
+    updateInfo: lastCheckedUpdateInfo,
+  };
+}
+
+function bindAutoUpdaterEvents() {
+  if (!autoUpdater) return;
+  autoUpdater.on('checking-for-update', () => sendUpdateEvent('checking'));
+  autoUpdater.on('update-available', (info) => sendUpdateEvent('available', { info }));
+  autoUpdater.on('update-not-available', (info) => sendUpdateEvent('not-available', { info }));
+  autoUpdater.on('download-progress', (progress) => sendUpdateEvent('download-progress', { progress }));
+  autoUpdater.on('update-downloaded', (info) => sendUpdateEvent('downloaded', { info }));
+  autoUpdater.on('error', (error) => sendUpdateEvent('error', { message: error.message || String(error) }));
 }
 
 function createWindow() {
@@ -154,8 +930,8 @@ function createWindow() {
 ╔════════════════════════════════════════╗
 ║        Codebot 已启动！                ║
 ╠════════════════════════════════════════╣
-║  本地访问：http://127.0.0.1:8080      ║
-║  局域网访问：http://${localIP}:8080    ║
+║  本地访问：http://127.0.0.1:${backendPort}      ║
+║  局域网访问：http://${localIP}:${backendPort}    ║
 ║  移动端：使用手机浏览器访问局域网地址  ║
 ╚════════════════════════════════════════╝
       `);
@@ -217,7 +993,7 @@ function createMenu() {
 }
 
 async function startBackend() {
-  const isDev = !app.isPackaged;
+  const isDev = isDevRuntime;
   try {
     const payload = await checkHealth();
     const opencodeConnected = Boolean(payload?.opencode_connected);
@@ -285,8 +1061,10 @@ async function startBackend() {
     CODEBOT_DOCS_SOURCE: docsSource,
     CODEBOT_OPENCODE_PATH: opencodePath,
     CODEBOT_FORCE_OPENCODE_AUTOSTART: '1',
-    CODEBOT_OPENCODE_PREFERRED_PORT: '1120',
-    CODEBOT_OPENCODE_FALLBACK_PORT: '4096',
+    CODEBOT_BACKEND_PORT: backendPort,
+    CODEBOT_OPENCODE_SERVER_URL: `http://127.0.0.1:${opencodePort}`,
+    CODEBOT_OPENCODE_PREFERRED_PORT: opencodePort,
+    CODEBOT_OPENCODE_FALLBACK_PORT: opencodePort,
   };
   // 清除可能污染 PyInstaller 运行时的 Python 环境变量
   delete env.PYTHONHOME;
@@ -351,7 +1129,7 @@ async function startBackend() {
     if (!isDev && code === 1 && signal === null) {
       try {
         await checkHealth();
-        const runningMsg = `[backend] 新进程退出，但已有后端正在监听 8080，继续使用现有实例\n`;
+        const runningMsg = `[backend] 新进程退出，但已有后端正在监听 ${backendPort}，继续使用现有实例\n`;
         console.log(runningMsg);
         logStream.write(runningMsg);
         return;
@@ -477,12 +1255,14 @@ function showAbout() {
   const { dialog } = require('electron');
   dialog.showMessageBox({
     title: '关于 Codebot',
-    message: 'Codebot v2.1.0',
+    message: `Codebot v${app.getVersion()}`,
     detail: '基于 OpenCode 的个人 AI 助手\n\n© 2024'
   });
 }
 
 app.whenReady().then(() => {
+  bindBuiltinSessionEvents();
+  bindAutoUpdaterEvents();
   createWindow();
 
   app.on('activate', () => {

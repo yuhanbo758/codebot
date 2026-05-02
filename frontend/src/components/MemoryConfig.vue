@@ -39,7 +39,7 @@
       <el-divider content-position="left">自动整理</el-divider>
       <el-form-item label="每日自动整理">
         <el-switch v-model="config.organize_enabled" />
-        <span class="hint">开启后，每天在指定时间自动对记忆进行 AI 优化（合并重复、补全描述、修正矛盾）</span>
+        <span class="hint">开启后，会参考 Hermes 的持续学习闭环，定期对记忆、任务、技能沉淀进行整理和补漏</span>
       </el-form-item>
       <template v-if="config.organize_enabled">
         <el-form-item label="整理聊天记录">
@@ -125,7 +125,7 @@ const config = ref({
   vector_search_top_k: 5,
   similarity_threshold: 0.7,
   show_archived_in_search: true,
-  organize_enabled: false,
+  organize_enabled: true,
   organize_chat_enabled: true,
   organize_time: '03:00',
   organize_last_run: null,

@@ -83,7 +83,7 @@ onMounted(loadDoc)
 
 <style scoped>
 .docs-view {
-  padding: 20px;
+  padding: 0;
 }
 
 .docs-header {

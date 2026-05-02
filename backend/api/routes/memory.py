@@ -24,6 +24,7 @@ class MemoryConfigRequest(BaseModel):
     """记忆配置请求"""
     auto_cleanup_enabled: bool
     cleanup_days: int
+    cleanup_archived_memories: bool = True
     archive_enabled: bool
     archive_days: int
     vector_search_top_k: int
@@ -302,6 +303,7 @@ async def update_memory_config(request: MemoryConfigRequest):
         app_config.memory = MemoryConfig(
             auto_cleanup_enabled=request.auto_cleanup_enabled,
             cleanup_days=request.cleanup_days,
+            cleanup_archived_memories=request.cleanup_archived_memories,
             archive_enabled=request.archive_enabled,
             archive_days=request.archive_days,
             vector_search_top_k=request.vector_search_top_k,

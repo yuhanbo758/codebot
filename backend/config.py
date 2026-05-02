@@ -13,13 +13,14 @@ class MemoryConfig(BaseModel):
     """记忆配置"""
     auto_cleanup_enabled: bool = False
     cleanup_days: int = Field(ge=0, le=365, default=180)
+    cleanup_archived_memories: bool = True
     archive_enabled: bool = True
     archive_days: int = Field(ge=0, le=365, default=90)
     vector_search_top_k: int = Field(ge=1, le=100, default=5)
     similarity_threshold: float = Field(ge=0.0, le=1.0, default=0.7)
     show_archived_in_search: bool = True
     # 自动整理
-    organize_enabled: bool = False
+    organize_enabled: bool = True
     organize_chat_enabled: bool = True
     organize_time: str = "03:00"          # 每日整理时间，格式 "HH:MM"
     organize_last_run: Optional[str] = None  # ISO datetime，上次整理时间
@@ -152,7 +153,7 @@ class SandboxConfig(BaseModel):
 
 class AppConfig(BaseModel):
     """应用配置"""
-    version: str = "2.8.0"
+    version: str = "3.2.0"
     general: GeneralConfig = GeneralConfig()
     memory: MemoryConfig = MemoryConfig()
     logs: LogConfig = LogConfig()

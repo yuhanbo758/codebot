@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "3.0.0",
   "general": {
     "link_open_mode": "system",
     "file_storage_path": "",
@@ -7,8 +7,9 @@
     "chat_default_model": ""
   },
   "memory": {
-    "auto_cleanup_enabled": true,
+    "auto_cleanup_enabled": false,
     "cleanup_days": 180,
+    "cleanup_archived_memories": true,
     "archive_enabled": true,
     "archive_days": 90,
     "vector_search_top_k": 5,
@@ -17,7 +18,7 @@
     "organize_enabled": true,
     "organize_chat_enabled": true,
     "organize_time": "03:00",
-    "organize_last_run": "2026-03-07T02:59:19.674395",
+    "organize_last_run": "2026-05-01T23:59:22.113980",
     "organize_model": null
   },
   "logs": {
@@ -30,8 +31,8 @@
     "app_enabled": true,
     "desktop_enabled": false,
     "lark_enabled": false,
-    "lark_webhook_url": "",
-    "lark_secret": "",
+    "lark_webhook_url": null,
+    "lark_secret": null,
     "email_enabled": false,
     "email_smtp_host": "smtp.gmail.com",
     "email_smtp_port": 587,
@@ -42,16 +43,16 @@
     "poll_interval": 30
   },
   "lark_bot": {
-    "enabled": true,
+    "enabled": false,
     "connection_mode": "ws",
-    "app_id": "cli_a9132cb571789cc1",
-    "app_secret": "ECe6ejwecLk0aQmg6e0cPhblAt5YMUtj",
+    "app_id": "",
+    "app_secret": "",
     "verify_token": "",
     "encrypt_key": "",
     "receive_id_type": "chat_id"
   },
   "opencode": {
-    "server_url": "http://127.0.0.1:1120",
+    "server_url": "http://127.0.0.1:11200",
     "auto_install": true,
     "auto_start": true
   },
@@ -65,7 +66,7 @@
     "port": 8080
   },
   "integration": {
-    "modelscope_api_key": "ms-59224e87-02f4-488c-bef6-10ca674d7699"
+    "modelscope_api_key": ""
   },
   "skills": {
     "custom_skill_dirs": []
@@ -79,11 +80,11 @@
     "runtime_binary": "",
     "image_path": "",
     "memory_mb": 2048,
-    "startup_timeout": 99,
+    "startup_timeout": 60,
     "ipc_dir": "",
-    "auto_download": true,
+    "auto_download": false,
     "extra_qemu_args": [],
-    "snapshot_mode": true,
+    "snapshot_mode": false,
     "image_url": "",
     "runtime_url": ""
   }

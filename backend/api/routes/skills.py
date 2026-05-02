@@ -1,27 +1,38 @@
 import json
+import os
 import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
+from urllib.parse import unquote
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from config import settings, app_config
+from config import app_config, settings
 from core.opencode_ws import OpenCodeClient
+from core.skill_registry import (
+    AUTO_GENERATED,
+    BUILTIN,
+    EXTERNAL,
+    OPENCODE,
+    SOURCE_LABELS,
+    get_skill_registry,
+    read_skill_markdown,
+    write_auto_skill_md,
+)
 
 router = APIRouter()
 
-# codebot 同步到 opencode 的技能目录前缀，便于识别和管理
 CODEBOT_SKILL_PREFIX = "codebot-"
 
 
 class SkillCreateRequest(BaseModel):
     name: str
     description: str = ""
-    version: str = "2.0.0"
+    version: str = "1.0.0"
     source: Optional[str] = None
     enabled: bool = True
 
@@ -42,6 +53,10 @@ class SkillGenerateRequest(BaseModel):
     description: str
 
 
+class SkillContentUpdateRequest(BaseModel):
+    content: str
+
+
 def _ensure_skills_dir() -> Path:
     settings.SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     return settings.SKILLS_DIR
@@ -51,335 +66,110 @@ def _skill_path(skill_id: str) -> Path:
     return _ensure_skills_dir() / f"{skill_id}.json"
 
 
+def _decode_skill_id(skill_id: str) -> str:
+    return unquote(skill_id or "").strip()
+
+
 def _read_skill(path: Path) -> Optional[dict]:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return None
-        return data
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
-
-
-def _read_skill_markdown(path: Path) -> Optional[dict]:
-    try:
-        content = path.read_text(encoding="utf-8")
-    except Exception:
-        return None
-
-    # Try to parse YAML front matter (--- ... ---)
-    name = ""
-    description = ""
-    if content.startswith("---"):
-        end = content.find("\n---", 3)
-        if end != -1:
-            front = content[3:end].strip()
-            for line in front.splitlines():
-                if line.startswith("name:"):
-                    name = line[len("name:"):].strip().strip('"\'')
-                elif line.startswith("description:"):
-                    description = line[len("description:"):].strip().strip('"\'')
-
-    # Fall back to first heading / first paragraph if front matter missing
-    if not name:
-        lines = [line.strip() for line in content.splitlines() if line.strip()]
-        for line in lines:
-            if line.startswith("#"):
-                name = line.lstrip("#").strip()
-                break
-    if not description:
-        lines = [line.strip() for line in content.splitlines() if line.strip()]
-        for line in lines:
-            if line.startswith("#") or line.startswith("---"):
-                continue
-            description = line
-            break
-
-    return {
-        "name": name or path.parent.name,
-        "description": description
-    }
-
-
-def _list_opencode_skills() -> List[dict]:
-    skills_dir = Path.home() / ".agents" / "skills"
-    if not skills_dir.exists():
-        return []
-    items: List[dict] = []
-    for entry in skills_dir.iterdir():
-        if not entry.is_dir():
-            continue
-        skill_md = entry / "SKILL.md"
-        if not skill_md.exists():
-            continue
-        info = _read_skill_markdown(skill_md) or {}
-        stat = skill_md.stat()
-        installed_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
-        items.append({
-            "id": f"opencode:{entry.name}",
-            "name": info.get("name") or entry.name,
-            "description": info.get("description") or "",
-            "version": "2.0.0",
-            "source": "opencode",
-            "enabled": True,
-            "installed_at": installed_at
-        })
-    return items
-
-
-def _list_custom_dir_skills() -> List[dict]:
-    """从用户自定义的技能目录加载技能（支持多个文件夹路径）。"""
-    custom_dirs = app_config.skills.custom_skill_dirs if hasattr(app_config, 'skills') else []
-    if not custom_dirs:
-        return []
-    items: List[dict] = []
-    seen_names: set = set()
-    for dir_path_str in custom_dirs:
-        dir_path = Path(dir_path_str)
-        if not dir_path.exists() or not dir_path.is_dir():
-            continue
-        for entry in dir_path.iterdir():
-            if not entry.is_dir():
-                continue
-            skill_md = entry / "SKILL.md"
-            if not skill_md.exists():
-                continue
-            # 使用目录路径+名称作为唯一键，避免重复
-            unique_key = f"{dir_path_str}:{entry.name}"
-            if unique_key in seen_names:
-                continue
-            seen_names.add(unique_key)
-            info = _read_skill_markdown(skill_md) or {}
-            stat = skill_md.stat()
-            installed_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
-            items.append({
-                "id": f"custom:{dir_path_str}:{entry.name}",
-                "name": info.get("name") or entry.name,
-                "description": info.get("description") or "",
-                "version": "2.0.0",
-                "source": "custom",
-                "source_dir": dir_path_str,
-                "enabled": True,
-                "installed_at": installed_at
-            })
-    return items
-
-
-def _delete_opencode_skill(skill_id: str):
-    if not skill_id.startswith("opencode:"):
-        raise HTTPException(status_code=400, detail="无效的 OpenCode 技能标识")
-    slug = skill_id.split(":", 1)[1].strip()
-    if not slug:
-        raise HTTPException(status_code=400, detail="无效的 OpenCode 技能标识")
-    skills_dir = Path.home() / ".agents" / "skills"
-    target = skills_dir / slug
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="OpenCode 技能不存在")
-    if not target.is_dir():
-        raise HTTPException(status_code=400, detail="OpenCode 技能路径无效")
-    shutil.rmtree(target)
-
-
-def _list_builtin_skills() -> List[dict]:
-    """List skills from the project's skills/ directory (SKILL.md format).
-    Excludes auto_* directories which are handled by _list_auto_skills().
-    """
-    skills_dir = _ensure_skills_dir()
-    items: List[dict] = []
-    for entry in skills_dir.iterdir():
-        if not entry.is_dir():
-            continue
-        # auto_* 目录归 auto 来源，不列为内置
-        if entry.name.startswith("auto_"):
-            continue
-        skill_md = entry / "SKILL.md"
-        if not skill_md.exists():
-            continue
-        info = _read_skill_markdown(skill_md) or {}
-        stat = skill_md.stat()
-        installed_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
-        items.append({
-            "id": f"builtin:{entry.name}",
-            "name": info.get("name") or entry.name,
-            "description": info.get("description") or "",
-            "version": "2.0.0",
-            "source": "builtin",
-            "enabled": True,
-            "installed_at": installed_at
-        })
-    return items
-
-
-def _list_auto_skills() -> List[dict]:
-    """List auto-generated skills (auto_* directories) from the skills/ directory."""
-    skills_dir = _ensure_skills_dir()
-    items: List[dict] = []
-    for entry in skills_dir.iterdir():
-        if not entry.is_dir():
-            continue
-        if not entry.name.startswith("auto_"):
-            continue
-        skill_md = entry / "SKILL.md"
-        if not skill_md.exists():
-            continue
-        info = _read_skill_markdown(skill_md) or {}
-        stat = skill_md.stat()
-        installed_at = datetime.fromtimestamp(stat.st_mtime).isoformat()
-        items.append({
-            "id": f"auto:{entry.name}",
-            "name": info.get("name") or entry.name,
-            "description": info.get("description") or "",
-            "version": "2.0.0",
-            "source": "auto",
-            "enabled": True,
-            "installed_at": installed_at
-        })
-    return items
-
-
-def _list_skills() -> List[dict]:
-    skills_dir = _ensure_skills_dir()
-    items: List[dict] = []
-    for file_path in skills_dir.glob("*.json"):
-        skill = _read_skill(file_path)
-        if skill:
-            items.append(skill)
-    items.extend(_list_builtin_skills())
-    items.extend(_list_auto_skills())
-    items.extend(_list_opencode_skills())
-    items.extend(_list_custom_dir_skills())
-
-    # ── 去重：builtin 优先于 opencode，同名技能只保留 builtin ──
-    builtin_names = {it["id"].split(":", 1)[1] for it in items if it.get("source") == "builtin"}
-    items = [
-        it for it in items
-        if not (it.get("source") == "opencode" and it["id"].split(":", 1)[1] in builtin_names)
-    ]
-
-    items.sort(key=lambda x: x.get("installed_at", ""), reverse=True)
-    return items
 
 
 def _write_skill(skill_id: str, data: dict):
     path = _skill_path(skill_id)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-# ── Skills 同步到 opencode ~/.agents/skills/ ──────────────────────────────
+def _list_skills() -> List[dict]:
+    return get_skill_registry().list_skills()
+
 
 def _opencode_agents_skills_dir() -> Path:
-    """返回 opencode 技能目录（~/.agents/skills/）"""
     return Path.home() / ".agents" / "skills"
 
 
 def _get_codebot_skill_slug(skill_dir_name: str) -> str:
-    """将 codebot 内置技能目录名转为 opencode 同步目录名（添加 codebot- 前缀）"""
     return f"{CODEBOT_SKILL_PREFIX}{skill_dir_name}"
 
 
+def _opencode_export_allowed() -> bool:
+    raw = os.environ.get("CODEBOT_ALLOW_OPENCODE_SKILL_EXPORT", "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _require_opencode_export_enabled():
+    if not _opencode_export_allowed():
+        raise HTTPException(
+            status_code=403,
+            detail="Codebot 技能默认不再同步到 OpenCode。若确需导出，请设置 CODEBOT_ALLOW_OPENCODE_SKILL_EXPORT=1 后重启。",
+        )
+
+
 def sync_builtin_skills_to_opencode() -> dict:
-    """
-    将 codebot 内置技能（skills/ 目录中的 SKILL.md 技能）同步到 opencode 的
-    ~/.agents/skills/ 目录，使 opencode CLI 能直接调用这些技能。
-
-    同步策略：
-    - 目标目录名使用 codebot-{slug} 前缀，避免与用户自己的技能冲突
-    - 只同步包含 SKILL.md 的技能目录
-    - 如果目标已存在则覆盖更新（确保内容最新）
-    - 删除 opencode 中 codebot- 前缀的目录，如果对应的 codebot 技能已被删除
-
-    返回同步结果 dict。
-    """
+    _require_opencode_export_enabled()
     result = {"synced": [], "removed": [], "errors": []}
-
-    skills_dir = settings.SKILLS_DIR
-    if not skills_dir.exists():
-        return result
-
     oc_dir = _opencode_agents_skills_dir()
-    try:
-        oc_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        result["errors"].append(f"创建 opencode 技能目录失败：{e}")
-        return result
+    oc_dir.mkdir(parents=True, exist_ok=True)
 
-    # 收集 codebot 当前有的技能 slug（目录名）
     codebot_slugs = set()
-    for entry in skills_dir.iterdir():
-        if not entry.is_dir():
+    for item in get_skill_registry().list_skills():
+        if item.get("source") not in {AUTO_GENERATED, BUILTIN}:
             continue
-        skill_md = entry / "SKILL.md"
-        if not skill_md.exists():
+        slug = item.get("slug") or ""
+        src = Path(item.get("path") or "")
+        if not slug or not src.is_dir():
             continue
-        codebot_slugs.add(entry.name)
-
-    # 同步到 opencode
-    for slug in codebot_slugs:
-        src = skills_dir / slug
-        dest_name = _get_codebot_skill_slug(slug)
-        dest = oc_dir / dest_name
+        codebot_slugs.add(slug)
+        dest = oc_dir / _get_codebot_skill_slug(slug)
         try:
             if dest.exists():
                 shutil.rmtree(dest)
             shutil.copytree(str(src), str(dest))
-            result["synced"].append(dest_name)
-        except Exception as e:
-            result["errors"].append(f"同步技能 {slug} 失败：{e}")
+            result["synced"].append(dest.name)
+        except Exception as exc:
+            result["errors"].append(f"{slug}: {exc}")
 
-    # 清理：删除 opencode 中 codebot- 前缀的目录，如果对应 codebot 技能已删除
-    for entry in oc_dir.iterdir():
-        if not entry.is_dir():
+    for entry in oc_dir.iterdir() if oc_dir.exists() else []:
+        if not entry.is_dir() or not entry.name.startswith(CODEBOT_SKILL_PREFIX):
             continue
-        if not entry.name.startswith(CODEBOT_SKILL_PREFIX):
+        original = entry.name[len(CODEBOT_SKILL_PREFIX):]
+        if original in codebot_slugs:
             continue
-        original_slug = entry.name[len(CODEBOT_SKILL_PREFIX):]
-        if original_slug not in codebot_slugs:
-            try:
-                shutil.rmtree(entry)
-                result["removed"].append(entry.name)
-            except Exception as e:
-                result["errors"].append(f"清理旧技能 {entry.name} 失败：{e}")
+        try:
+            shutil.rmtree(entry)
+            result["removed"].append(entry.name)
+        except Exception as exc:
+            result["errors"].append(f"{entry.name}: {exc}")
 
     return result
 
 
 def _sync_skill_to_opencode(skill_dir_name: str) -> bool:
-    """
-    将单个 codebot 内置技能同步到 opencode（新增/更新）。
-    skill_dir_name: skills/ 下的目录名（如 web_search）。
-    """
+    _require_opencode_export_enabled()
     src = settings.SKILLS_DIR / skill_dir_name
     if not src.is_dir() or not (src / "SKILL.md").exists():
         return False
     oc_dir = _opencode_agents_skills_dir()
     oc_dir.mkdir(parents=True, exist_ok=True)
-    dest_name = _get_codebot_skill_slug(skill_dir_name)
-    dest = oc_dir / dest_name
-    try:
-        if dest.exists():
-            shutil.rmtree(dest)
-        shutil.copytree(str(src), str(dest))
-        return True
-    except Exception:
-        return False
-
-
-def _remove_skill_from_opencode(skill_dir_name: str) -> bool:
-    """
-    从 opencode 中删除对应的 codebot 技能目录。
-    skill_dir_name: skills/ 下的原始目录名。
-    """
-    oc_dir = _opencode_agents_skills_dir()
     dest = oc_dir / _get_codebot_skill_slug(skill_dir_name)
-    if dest.exists() and dest.is_dir():
-        try:
-            shutil.rmtree(dest)
-            return True
-        except Exception:
-            return False
-    return False
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(str(src), str(dest))
+    return True
+
+
+def _source_is_read_only(source: str) -> bool:
+    return source in {EXTERNAL, OPENCODE}
+
+
+def _slug_from_description(description: str) -> str:
+    base = description.strip().lower().replace(" ", "_")[:40]
+    base = re.sub(r"[^a-z0-9_]+", "_", base)
+    base = re.sub(r"_+", "_", base).strip("_")
+    return base or f"generated_{uuid4().hex[:8]}"
 
 
 @router.get("")
@@ -387,451 +177,258 @@ def _remove_skill_from_opencode(skill_dir_name: str) -> bool:
 async def list_skills():
     try:
         items = _list_skills()
-        return {
-            "success": True,
-            "data": {
-                "items": items,
-                "total": len(items)
-            }
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"success": True, "data": {"items": items, "total": len(items)}}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("")
 @router.post("/")
 async def install_skill(request: SkillCreateRequest):
     try:
-        skill_id = uuid4().hex
-        skill = {
-            "id": skill_id,
-            "name": request.name,
-            "description": request.description,
-            "version": request.version,
-            "source": request.source,
-            "enabled": request.enabled,
-            "installed_at": datetime.now().isoformat()
-        }
-        _write_skill(skill_id, skill)
-        return {
-            "success": True,
-            "data": skill,
-            "message": "技能已安装"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.patch("/{skill_id}")
-async def update_skill(skill_id: str, request: SkillUpdateRequest):
-    try:
-        if skill_id.startswith("opencode:"):
-            raise HTTPException(status_code=400, detail="OpenCode 技能不支持更新")
-        if skill_id.startswith("builtin:"):
-            raise HTTPException(status_code=400, detail="内置技能不支持更新")
-        if skill_id.startswith("auto:"):
-            raise HTTPException(status_code=400, detail="自动生成技能请使用 SKILL.md 编辑接口")
-        path = _skill_path(skill_id)
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="技能不存在")
-        skill = _read_skill(path) or {}
-        updates = request.model_dump(exclude_unset=True)
-        skill.update(updates)
-        _write_skill(skill_id, skill)
-        return {
-            "success": True,
-            "data": skill,
-            "message": "技能已更新"
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.delete("/{skill_id}")
-async def delete_skill(skill_id: str):
-    try:
-        if skill_id.startswith("opencode:"):
-            _delete_opencode_skill(skill_id)
-            return {
-                "success": True,
-                "message": "OpenCode 技能已卸载"
-            }
-        if skill_id.startswith("builtin:"):
-            raise HTTPException(status_code=400, detail="内置技能不支持卸载")
-        if skill_id.startswith("custom:"):
-            raise HTTPException(status_code=400, detail="外部目录技能不支持卸载，请在设置中移除对应目录")
-        if skill_id.startswith("auto:"):
-            slug = skill_id.split(":", 1)[1].strip()
-            if not slug:
-                raise HTTPException(status_code=400, detail="无效的自动技能标识")
-            skill_dir = settings.SKILLS_DIR / slug
-            if not skill_dir.exists():
-                raise HTTPException(status_code=404, detail="自动技能不存在")
-            shutil.rmtree(skill_dir)
-            return {
-                "success": True,
-                "message": "自动生成技能已删除"
-            }
-        path = _skill_path(skill_id)
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="技能不存在")
-        path.unlink(missing_ok=True)
-        return {
-            "success": True,
-            "message": "技能已卸载"
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class SkillContentUpdateRequest(BaseModel):
-    content: str
-
-
-@router.get("/{skill_id}/content")
-async def get_skill_content(skill_id: str):
-    """返回技能的原始 SKILL.md 全文（builtin/auto/opencode/custom 类型支持）。"""
-    try:
-        if skill_id.startswith("builtin:"):
-            slug = skill_id.split(":", 1)[1].strip()
-            skill_md = settings.SKILLS_DIR / slug / "SKILL.md"
-            if not skill_md.exists():
-                raise HTTPException(status_code=404, detail="SKILL.md 不存在")
-            return {"success": True, "data": {"content": skill_md.read_text(encoding="utf-8")}}
-
-        if skill_id.startswith("auto:"):
-            slug = skill_id.split(":", 1)[1].strip()
-            skill_md = settings.SKILLS_DIR / slug / "SKILL.md"
-            if not skill_md.exists():
-                raise HTTPException(status_code=404, detail="SKILL.md 不存在")
-            return {"success": True, "data": {"content": skill_md.read_text(encoding="utf-8")}}
-
-        if skill_id.startswith("opencode:"):
-            slug = skill_id.split(":", 1)[1].strip()
-            skill_md = Path.home() / ".agents" / "skills" / slug / "SKILL.md"
-            if not skill_md.exists():
-                raise HTTPException(status_code=404, detail="SKILL.md 不存在")
-            return {"success": True, "data": {"content": skill_md.read_text(encoding="utf-8")}}
-
-        if skill_id.startswith("custom:"):
-            parts = skill_id.split(":", 2)
-            if len(parts) < 3:
-                raise HTTPException(status_code=400, detail="无效的 custom 技能标识")
-            dir_path_str, entry_name = parts[1], parts[2]
-            skill_md = Path(dir_path_str) / entry_name / "SKILL.md"
-            if not skill_md.exists():
-                raise HTTPException(status_code=404, detail="SKILL.md 不存在")
-            return {"success": True, "data": {"content": skill_md.read_text(encoding="utf-8")}}
-
-        raise HTTPException(status_code=400, detail="此类型技能不支持查看原始内容")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.put("/{skill_id}/content")
-async def update_skill_content(skill_id: str, request: SkillContentUpdateRequest):
-    """保存技能的原始 SKILL.md 全文（builtin/auto/opencode 类型支持；custom 只读）。"""
-    try:
-        if skill_id.startswith("builtin:"):
-            slug = skill_id.split(":", 1)[1].strip()
-            skill_dir = settings.SKILLS_DIR / slug
-            skill_dir.mkdir(parents=True, exist_ok=True)
-            skill_md = skill_dir / "SKILL.md"
-            skill_md.write_text(request.content, encoding="utf-8")
-            info = _read_skill_markdown(skill_md) or {}
-            return {
-                "success": True,
-                "message": "SKILL.md 已保存",
-                "data": {
-                    "id": skill_id,
-                    "name": info.get("name") or slug,
-                    "description": info.get("description") or "",
-                }
-            }
-
-        if skill_id.startswith("auto:"):
-            slug = skill_id.split(":", 1)[1].strip()
-            skill_dir = settings.SKILLS_DIR / slug
-            if not skill_dir.exists():
-                raise HTTPException(status_code=404, detail="自动技能目录不存在")
-            skill_md = skill_dir / "SKILL.md"
-            skill_md.write_text(request.content, encoding="utf-8")
-            info = _read_skill_markdown(skill_md) or {}
-            return {
-                "success": True,
-                "message": "SKILL.md 已保存",
-                "data": {
-                    "id": skill_id,
-                    "name": info.get("name") or slug,
-                    "description": info.get("description") or "",
-                }
-            }
-
-        if skill_id.startswith("opencode:"):
-            slug = skill_id.split(":", 1)[1].strip()
-            skill_md = Path.home() / ".agents" / "skills" / slug / "SKILL.md"
-            if not skill_md.exists():
-                raise HTTPException(status_code=404, detail="技能不存在")
-            skill_md.write_text(request.content, encoding="utf-8")
-            return {"success": True, "message": "SKILL.md 已保存"}
-
-        if skill_id.startswith("custom:"):
-            raise HTTPException(status_code=400, detail="外部目录技能为只读，请直接编辑对应目录中的 SKILL.md 文件")
-
-        raise HTTPException(status_code=400, detail="此类型技能不支持编辑原始内容")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
-async def batch_delete_skills(request: BatchDeleteRequest):
-    """批量删除/卸载技能。builtin 和 custom 技能会被跳过，其余逐一删除。"""
-    results = {"success": [], "failed": [], "skipped": []}
-    for skill_id in request.ids:
-        try:
-            if skill_id.startswith("builtin:") or skill_id.startswith("custom:"):
-                results["skipped"].append(skill_id)
-                continue
-            if skill_id.startswith("opencode:"):
-                _delete_opencode_skill(skill_id)
-                results["success"].append(skill_id)
-                continue
-            if skill_id.startswith("auto:"):
-                slug = skill_id.split(":", 1)[1].strip()
-                skill_dir = settings.SKILLS_DIR / slug
-                if skill_dir.exists():
-                    shutil.rmtree(skill_dir)
-                results["success"].append(skill_id)
-                continue
-            path = _skill_path(skill_id)
-            if not path.exists():
-                results["failed"].append({"id": skill_id, "reason": "不存在"})
-                continue
-            path.unlink(missing_ok=True)
-            results["success"].append(skill_id)
-        except Exception as e:
-            results["failed"].append({"id": skill_id, "reason": str(e)})
-    return {
-        "success": True,
-        "data": results,
-        "message": f"已删除 {len(results['success'])} 个，跳过 {len(results['skipped'])} 个只读技能，失败 {len(results['failed'])} 个"
-    }
+        item = get_skill_registry().create_auto_skill(
+            name=request.name,
+            description=request.description or "",
+            body=request.description or "Describe the reusable workflow for this skill here.",
+            user_message=request.source or "",
+            slug_hint=request.name,
+        )
+        return {"success": True, "data": item, "message": "技能已安装到 Codebot 自动生成技能目录"}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/generate")
 async def generate_skill(request: SkillGenerateRequest):
-    """根据用户描述，调用 skill-creator skill 生成 SKILL.md 内容并保存到 skills/ 目录。"""
-    if not request.description.strip():
+    description = request.description.strip()
+    if not description:
         raise HTTPException(status_code=400, detail="请提供技能描述")
 
-    # 优先使用 skill-creator skill（opencode 安装目录或 codebot 内置）
-    # 构建 prompt，要求 OpenCode 使用 skill-creator skill 创建规范的 SKILL.md
-    skill_creator_available = (
-        (Path.home() / ".agents" / "skills" / "skill-creator" / "SKILL.md").exists()
-        or (settings.SKILLS_DIR / "skill-creator" / "SKILL.md").exists()
-    )
-
-    if skill_creator_available:
-        # 通过 skill-creator skill 生成，OpenCode 会加载对应 skill 的完整指令
-        prompt = (
-            f"/skill skill-creator\n\n"
-            f"请为以下功能创建一个新的 agent skill：\n\n"
-            f"{request.description}\n\n"
-            f"请生成完整的 SKILL.md 文件内容，只输出文件内容，不要其他说明。"
-        )
-    else:
-        # 回退：使用标准 prompt 直接生成
-        prompt = f"""请根据以下功能描述，生成一个规范的 SKILL.md 文件内容。
-
-功能描述：{request.description}
-
-要求：
-1. 文件以 YAML front matter 开头（用 --- 包裹），包含 name（简短英文标识符，如 my_skill）和 description（中文描述）字段
-2. 然后是 Markdown 正文，包含：技能概述、使用场景、主要功能列表、使用示例
-3. name 只包含小写字母、数字和下划线，不超过 30 个字符
-4. description 不超过 80 个字符
-
-请直接输出 SKILL.md 文件内容，不要添加任何额外说明。"""
-
+    body = ""
     try:
         client = OpenCodeClient(app_config.opencode.server_url)
-        ok = await client.try_connect(attempts=3, delay=0.4, open_timeout=1.0)
-        if not ok:
-            raise HTTPException(status_code=503, detail="AI 服务连接失败，请确认 OpenCode 服务正在运行")
-
-        result = await client.execute_task(prompt)
+        ok = await client.try_connect(attempts=2, delay=0.3, open_timeout=1.0)
+        if ok:
+            prompt = (
+                "请根据下面的需求生成一个可复用的 agent skill 操作说明。"
+                "只输出 Markdown 正文步骤，不要创建文件，不要写入 ~/.agents/skills。\n\n"
+                f"需求：{description}"
+            )
+            result = await client.execute_task(prompt, timeout=60)
+            if result.success and result.content:
+                body = result.content.strip()
         await client.close()
+    except Exception:
+        body = ""
 
-        if not result.success or not result.content:
-            raise HTTPException(status_code=500, detail="AI 生成失败，请重试")
+    if not body:
+        body = (
+            "Use this skill when the user asks for the workflow described below.\n\n"
+            f"User need: {description}\n\n"
+            "1. Clarify the exact input and output when needed.\n"
+            "2. Prefer existing project conventions and local tools.\n"
+            "3. Complete the workflow end to end and verify the result."
+        )
 
-        content = result.content.strip()
-        # 提取 name 字段用于目录命名
-        slug = None
-        if content.startswith("---"):
-            end = content.find("\n---", 3)
-            if end != -1:
-                front = content[3:end].strip()
-                for line in front.splitlines():
-                    if line.startswith("name:"):
-                        slug = line[len("name:"):].strip().strip('"\'')
-                        break
+    title = description[:32] if len(description) > 32 else description
+    item = get_skill_registry().create_auto_skill(
+        name=f"自动生成技能：{title}",
+        description=description[:180],
+        body=body,
+        user_message=description,
+        slug_hint=_slug_from_description(description),
+    )
+    return {
+        "success": True,
+        "data": item,
+        "message": f"技能已生成到 Codebot 技能目录：{item.get('slug')}",
+    }
 
-        if not slug:
-            # 从描述生成 slug
-            slug = re.sub(r"[^a-z0-9_]", "_", request.description[:20].lower().replace(" ", "_"))
-            slug = re.sub(r"_+", "_", slug).strip("_") or "generated_skill"
 
-        # 确保 slug 以 auto_ 前缀开头，以便被识别为自动生成技能
-        if not slug.startswith("auto_"):
-            slug = f"auto_{slug}"
-
-        # 避免目录冲突
-        skills_dir = _ensure_skills_dir()
-        target_dir = skills_dir / slug
-        counter = 1
-        while target_dir.exists():
-            target_dir = skills_dir / f"{slug}_{counter}"
-            counter += 1
-
-        target_dir.mkdir(parents=True, exist_ok=True)
-        skill_md = target_dir / "SKILL.md"
-        skill_md.write_text(content, encoding="utf-8")
-
-        info = _read_skill_markdown(skill_md) or {}
-        return {
-            "success": True,
-            "data": {
-                "id": f"auto:{target_dir.name}",
-                "name": info.get("name") or target_dir.name,
-                "description": info.get("description") or "",
-                "source": "auto",
-                "enabled": True,
-                "installed_at": datetime.now().isoformat()
-            },
-            "message": f"技能已生成并保存到 skills/{target_dir.name}/"
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@router.post("/batch-delete")
+async def batch_delete_skills(request: BatchDeleteRequest):
+    results = {"success": [], "failed": [], "skipped": []}
+    registry = get_skill_registry()
+    for raw_id in request.ids:
+        skill_id = _decode_skill_id(raw_id)
+        try:
+            item = registry.find(skill_id)
+            if not item:
+                results["failed"].append({"id": skill_id, "reason": "不存在"})
+                continue
+            item_path = Path(item.get("path") or "")
+            if item_path.suffix == ".json" and item_path.exists():
+                item_path.unlink()
+                results["success"].append(skill_id)
+                continue
+            source = item.get("source")
+            if source == AUTO_GENERATED:
+                registry.delete_auto_skill(skill_id)
+                results["success"].append(skill_id)
+            elif source in {BUILTIN, EXTERNAL, OPENCODE}:
+                results["skipped"].append(skill_id)
+            else:
+                path = _skill_path(skill_id)
+                if path.exists():
+                    path.unlink()
+                    results["success"].append(skill_id)
+                else:
+                    results["failed"].append({"id": skill_id, "reason": "不存在"})
+        except Exception as exc:
+            results["failed"].append({"id": skill_id, "reason": str(exc)})
+    return {
+        "success": True,
+        "data": results,
+        "message": f"已删除 {len(results['success'])} 个，跳过 {len(results['skipped'])} 个只读技能，失败 {len(results['failed'])} 个",
+    }
 
 
 @router.post("/sync-to-opencode")
 async def sync_skills_to_opencode():
-    """
-    将所有 codebot 内置技能同步到 opencode ~/.agents/skills/ 目录。
-    使 opencode CLI 能直接调用这些技能。
-    """
-    try:
-        result = sync_builtin_skills_to_opencode()
-        synced = len(result.get("synced", []))
-        removed = len(result.get("removed", []))
-        errors = result.get("errors", [])
-        msg = f"同步完成：已同步 {synced} 个技能到 opencode"
-        if removed:
-            msg += f"，清理 {removed} 个旧技能"
-        if errors:
-            msg += f"，{len(errors)} 个错误"
-        return {
-            "success": True,
-            "data": result,
-            "message": msg
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/{skill_id:path}/sync-to-opencode")
-async def sync_single_skill_to_opencode(skill_id: str):
-    """
-    将单个 codebot 技能（内置/自动生成/聊天生成）同步到 opencode ~/.agents/skills/ 目录。
-    支持 builtin:、auto:、chat 来源技能。
-    """
-    try:
-        # 解析技能目录名
-        if skill_id.startswith("builtin:"):
-            slug = skill_id[len("builtin:"):].strip()
-        elif skill_id.startswith("auto:"):
-            slug = skill_id[len("auto:"):].strip()
-        else:
-            # 普通 JSON 技能（如 chat 生成的），skill_id 就是 UUID，不是目录型
-            raise HTTPException(status_code=400, detail="该技能类型不支持同步到 OpenCode（仅支持内置或自动生成技能）")
-
-        if not slug:
-            raise HTTPException(status_code=400, detail="无效的技能 ID")
-
-        src = settings.SKILLS_DIR / slug
-        if not src.is_dir() or not (src / "SKILL.md").exists():
-            raise HTTPException(status_code=404, detail=f"技能目录不存在或缺少 SKILL.md：{slug}")
-
-        ok = _sync_skill_to_opencode(slug)
-        if not ok:
-            raise HTTPException(status_code=500, detail="同步失败，请检查 opencode 技能目录权限")
-
-        dest_name = _get_codebot_skill_slug(slug)
-        oc_dir = _opencode_agents_skills_dir()
-        return {
-            "success": True,
-            "data": {
-                "slug": slug,
-                "dest": str(oc_dir / dest_name),
-            },
-            "message": f"技能 {slug} 已同步到 OpenCode（{dest_name}）"
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = sync_builtin_skills_to_opencode()
+    return {
+        "success": True,
+        "data": result,
+        "message": f"同步完成：已同步 {len(result.get('synced', []))} 个技能到 OpenCode",
+    }
 
 
 @router.get("/opencode-sync-status")
 async def get_opencode_sync_status():
-    """
-    查询 codebot 内置技能与 opencode 的同步状态。
-    """
+    oc_dir = _opencode_agents_skills_dir()
+    codebot_slugs = {
+        item.get("slug")
+        for item in get_skill_registry().list_skills()
+        if item.get("source") in {AUTO_GENERATED, BUILTIN} and item.get("slug")
+    }
+    synced_slugs = set()
+    if oc_dir.exists():
+        for entry in oc_dir.iterdir():
+            if entry.is_dir() and entry.name.startswith(CODEBOT_SKILL_PREFIX):
+                synced_slugs.add(entry.name[len(CODEBOT_SKILL_PREFIX):])
+    not_synced = sorted(codebot_slugs - synced_slugs)
+    stale = sorted(synced_slugs - codebot_slugs)
+    return {
+        "success": True,
+        "data": {
+            "enabled": _opencode_export_allowed(),
+            "total_codebot": len(codebot_slugs),
+            "total_synced": len(synced_slugs),
+            "not_synced": not_synced,
+            "stale_in_opencode": stale,
+            "in_sync": not not_synced and not stale,
+            "opencode_skills_dir": str(oc_dir),
+        },
+    }
+
+
+@router.post("/{skill_id:path}/sync-to-opencode")
+async def sync_single_skill_to_opencode(skill_id: str):
+    skill_id = _decode_skill_id(skill_id)
+    item = get_skill_registry().find(skill_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="技能不存在")
+    if item.get("source") not in {AUTO_GENERATED, BUILTIN}:
+        raise HTTPException(status_code=400, detail="仅 Codebot 内部技能支持高级导出")
+    ok = _sync_skill_to_opencode(item.get("slug") or "")
+    if not ok:
+        raise HTTPException(status_code=500, detail="同步失败")
+    return {
+        "success": True,
+        "data": {"slug": item.get("slug")},
+        "message": "技能已导出到 OpenCode",
+    }
+
+
+@router.get("/{skill_id:path}/content")
+async def get_skill_content(skill_id: str):
+    skill_id = _decode_skill_id(skill_id)
     try:
-        skills_dir = settings.SKILLS_DIR
-        oc_dir = _opencode_agents_skills_dir()
+        content = get_skill_registry().read_content(skill_id)
+        return {"success": True, "data": {"content": content}}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="SKILL.md 不存在")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
-        # codebot 当前有的技能
-        codebot_slugs = set()
-        if skills_dir.exists():
-            for entry in skills_dir.iterdir():
-                if entry.is_dir() and (entry / "SKILL.md").exists():
-                    codebot_slugs.add(entry.name)
 
-        # opencode 中 codebot 同步的技能
-        synced_slugs = set()
-        if oc_dir.exists():
-            for entry in oc_dir.iterdir():
-                if entry.is_dir() and entry.name.startswith(CODEBOT_SKILL_PREFIX):
-                    original = entry.name[len(CODEBOT_SKILL_PREFIX):]
-                    synced_slugs.add(original)
-
-        # 未同步的
-        not_synced = [s for s in codebot_slugs if s not in synced_slugs]
-        # 已同步但 codebot 已删除的（需清理）
-        stale = [s for s in synced_slugs if s not in codebot_slugs]
-
+@router.put("/{skill_id:path}/content")
+async def update_skill_content(skill_id: str, request: SkillContentUpdateRequest):
+    skill_id = _decode_skill_id(skill_id)
+    registry = get_skill_registry()
+    item = registry.find(skill_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="技能不存在")
+    if _source_is_read_only(item.get("source") or ""):
+        raise HTTPException(status_code=400, detail=f"{item.get('sourceLabel') or item.get('source')} 技能为只读，请在其原工具中管理")
+    try:
+        updated = registry.write_content(skill_id, request.content)
         return {
             "success": True,
+            "message": "SKILL.md 已保存",
             "data": {
-                "total_codebot": len(codebot_slugs),
-                "total_synced": len(synced_slugs),
-                "not_synced": not_synced,
-                "stale_in_opencode": stale,
-                "in_sync": len(not_synced) == 0 and len(stale) == 0,
-                "opencode_skills_dir": str(oc_dir),
-            }
+                "id": skill_id,
+                "name": updated.get("name"),
+                "description": updated.get("description"),
+            },
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except PermissionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.patch("/{skill_id:path}")
+async def update_skill(skill_id: str, request: SkillUpdateRequest):
+    skill_id = _decode_skill_id(skill_id)
+    item = get_skill_registry().find(skill_id)
+    if item and item.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, OPENCODE}:
+        raise HTTPException(status_code=400, detail="该技能类型请通过 SKILL.md 或原工具管理")
+    path = _skill_path(skill_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="技能不存在")
+    skill = _read_skill(path) or {}
+    skill.update(request.model_dump(exclude_unset=True))
+    _write_skill(skill_id, skill)
+    return {"success": True, "data": skill, "message": "技能已更新"}
+
+
+@router.delete("/{skill_id:path}")
+async def delete_skill(skill_id: str):
+    skill_id = _decode_skill_id(skill_id)
+    registry = get_skill_registry()
+    item = registry.find(skill_id)
+    if item:
+        item_path = Path(item.get("path") or "")
+        if item_path.suffix == ".json" and item_path.exists():
+            item_path.unlink()
+            return {"success": True, "message": "技能已卸载"}
+        source = item.get("source")
+        if source == AUTO_GENERATED:
+            registry.delete_auto_skill(skill_id)
+            return {"success": True, "message": "自动生成技能已删除"}
+        if source == BUILTIN:
+            raise HTTPException(status_code=400, detail="内置技能不支持卸载")
+        if source == EXTERNAL:
+            raise HTTPException(status_code=400, detail="外部兼容目录技能为只读，请在设置中移除对应目录")
+        if source == OPENCODE:
+            raise HTTPException(status_code=400, detail="OpenCode 技能由 OpenCode CLI 管理，Codebot 不再直接卸载")
+
+    path = _skill_path(skill_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="技能不存在")
+    path.unlink()
+    return {"success": True, "message": "技能已卸载"}
+
+
+def update_auto_skill_file(skill_md_path: Path, name: str, description: str, user_message: str, assistant_response: str) -> None:
+    info = read_skill_markdown(skill_md_path) or {}
+    slug = str(info.get("slug") or skill_md_path.parent.name)
+    write_auto_skill_md(
+        skill_md_path,
+        name=name,
+        description=description,
+        body=assistant_response,
+        user_message=user_message,
+        slug=slug,
+    )
