@@ -2,22 +2,145 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  prepare-release:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+      commit_sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Bump application version
+        id: bump
+        shell: bash
+        run: |
+          VERSION=$(node scripts/bump_version.js)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Commit bumped version
+        shell: bash
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          git add backend/__init__.py backend/config.py frontend/package.json frontend/package-lock.json electron/package.json electron/package-lock.json
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m "ci: bump version to $VERSION [skip ci]"
+          git push origin "HEAD:$BRANCH_NAME"
+
+      - name: Create release tag
+        shell: bash
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Capture release commit
+        id: commit
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   build-windows:
+    needs: prepare-release
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare-release.outputs.commit_sha }}
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            frontend/package-lock.json
+            electron/package-lock.json
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pyinstaller
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Build backend executable
+        working-directory: backend
+        shell: pwsh
+        run: |
+          pyinstaller codebot-backend.spec --noconfirm
+          if (Test-Path dist_build) { Remove-Item dist_build -Recurse -Force }
+          New-Item -ItemType Directory -Path dist_build | Out-Null
+          Copy-Item dist/codebot-backend dist_build/codebot-backend -Recurse
+
+      - name: Install electron dependencies
+        working-directory: electron
+        run: npm ci
+
+      - name: Build Windows artifacts
+        working-directory: electron
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run build -- --win nsis portable --publish never
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-dist
+          path: |
+            electron/dist/electron_new/*.exe
+            electron/dist/electron_new/*.blockmap
+            electron/dist/electron_new/latest.yml
+          if-no-files-found: error
+
+  build-macos:
+    needs: prepare-release
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare-release.outputs.commit_sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
           cache: "npm"
@@ -48,28 +171,141 @@ jobs:
         working-directory: backend
         run: |
           pyinstaller codebot-backend.spec --noconfirm
-          if (Test-Path dist_build) { Remove-Item dist_build -Recurse -Force }
-          New-Item -ItemType Directory -Path dist_build | Out-Null
-          Copy-Item dist/codebot-backend dist_build/codebot-backend -Recurse
+          rm -rf dist_build
+          mkdir -p dist_build
+          cp -R dist/codebot-backend dist_build/codebot-backend
 
       - name: Install electron dependencies
         working-directory: electron
         run: npm ci
 
-      - name: Build and publish GitHub release
+      - name: Build macOS artifacts
         working-directory: electron
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npm run build -- --publish always
+        run: npm run build -- --mac zip --publish never
 
-      - name: Upload object storage artifacts
-        if: ${{ vars.CODEBOT_UPLOAD_OBJECT_STORAGE == 'true' }}
-        shell: pwsh
-        env:
-          RCLONE_CONFIG_CODEBOT: ${{ secrets.CODEBOT_RCLONE_CONFIG }}
-          CODEBOT_RCLONE_REMOTE: ${{ secrets.CODEBOT_RCLONE_REMOTE }}
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dist
+          path: |
+            electron/dist/electron_new/*mac*.zip
+            electron/dist/electron_new/*mac*.zip.blockmap
+            electron/dist/electron_new/latest-mac.yml
+          if-no-files-found: error
+
+  build-linux:
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare-release.outputs.commit_sha }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            frontend/package-lock.json
+            electron/package-lock.json
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Linux packaging dependencies
         run: |
-          choco install rclone -y
-          $dist = "electron/dist/electron_new"
-          rclone copy $dist "$env:CODEBOT_RCLONE_REMOTE/Download/codebot" --include "latest.yml" --include "*.exe" --include "*.blockmap" --include "*.yml"
+          sudo apt-get update
+          sudo apt-get install -y libarchive-tools rpm
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pyinstaller
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Build backend executable
+        working-directory: backend
+        run: |
+          pyinstaller codebot-backend.spec --noconfirm
+          rm -rf dist_build
+          mkdir -p dist_build
+          cp -R dist/codebot-backend dist_build/codebot-backend
+
+      - name: Install electron dependencies
+        working-directory: electron
+        run: npm ci
+
+      - name: Build Linux artifacts
+        working-directory: electron
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run build -- --linux AppImage --publish never
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-dist
+          path: |
+            electron/dist/electron_new/*.AppImage
+            electron/dist/electron_new/*.AppImage.zsync
+            electron/dist/electron_new/latest-linux.yml
+          if-no-files-found: error
+
+  publish-release:
+    needs:
+      - prepare-release
+      - build-windows
+      - build-macos
+      - build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-dist
+          path: release-assets/windows
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-dist
+          path: release-assets/macos
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-dist
+          path: release-assets/linux
+
+      - name: Create GitHub release and upload assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare-release.outputs.version }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          TARGET_SHA: ${{ needs.prepare-release.outputs.commit_sha }}
+        run: |
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_SHA" \
+            --title "Codebot v$VERSION" \
+            --notes "Automated multi-platform build for commit $TARGET_SHA"
+
+          mapfile -t FILES < <(find release-assets -type f)
+          gh release upload "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber

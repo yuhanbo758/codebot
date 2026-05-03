@@ -31,12 +31,16 @@
       {
         "from": "../backend/dist_build/codebot-backend",
         "to": "backend/codebot-backend",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "../frontend/dist",
         "to": "frontend-dist",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "../README.md",
@@ -45,22 +49,31 @@
       {
         "from": "../skills",
         "to": "skills",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "vendor/opencode",
         "to": "opencode",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
-      "target": ["dmg"]
+      "target": [
+        "zip"
+      ]
     },
     "win": {
       "icon": "../logo.ico",
       "signingHashAlgorithms": null,
-      "target": ["nsis", "portable"]
+      "target": [
+        "nsis",
+        "portable"
+      ]
     },
     "nsis": {
       "artifactName": "Codebot-Setup-${version}.${ext}"
@@ -69,7 +82,10 @@
       "artifactName": "Codebot-${version}.${ext}"
     },
     "linux": {
-      "target": ["AppImage", "deb"]
+      "target": [
+        "AppImage"
+      ],
+      "artifactName": "Codebot-${version}.${ext}"
     },
     "publish": [
       {

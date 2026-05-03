@@ -2,7 +2,7 @@
 
 基于 OpenCode 的第三方能力工作台 - 所有聊天统一由 OpenCode 处理，Codebot 负责提供 MCP / Skills / 记忆 / 定时任务能力并展示结果
 
-当前发布版本：`3.2.0`
+发布版本通过 GitHub Actions 在每次推送到 `main` 后自动递增并发布到 Releases。
 
 ## ✨ 特性
 

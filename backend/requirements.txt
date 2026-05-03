@@ -59,7 +59,7 @@ beautifulsoup4>=4.12.0
 
 # Desktop Notifications
 plyer>=2.1.0
-windows-toasts>=1.1.0
+windows-toasts>=1.1.0; platform_system == "Windows"
 
 # Sandbox SSH
 paramiko>=3.0.0
