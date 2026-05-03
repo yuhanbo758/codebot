@@ -18,7 +18,6 @@
   "build": {
     "appId": "ai.codebot.app",
     "productName": "Codebot",
-    "icon": "../logo.ico",
     "directories": {
       "output": "dist/electron_new"
     },
