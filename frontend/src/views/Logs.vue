@@ -193,6 +193,58 @@
           </div>
         </div>
       </el-tab-pane>
+
+      <!-- ── Tab 3: 已归档对话 ────────────────────────────────────────── -->
+      <el-tab-pane label="已归档对话" name="archived">
+        <div class="tab-content">
+          <div class="tab-header">
+            <div class="header-actions">
+              <el-input
+                v-model="archivedSearch"
+                placeholder="搜索归档对话..."
+                clearable
+                style="width: 220px"
+                @clear="loadArchivedConversations"
+                @keyup.enter="loadArchivedConversations"
+              />
+              <el-button @click="loadArchivedConversations" style="margin-left: 10px">查询</el-button>
+            </div>
+          </div>
+
+          <div class="table-wrapper">
+            <el-table :data="filteredArchivedConversations" style="width: 100%" height="100%">
+              <el-table-column prop="title" label="对话标题" min-width="220" show-overflow-tooltip />
+              <el-table-column prop="created_at" label="创建时间" width="175">
+                <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
+              </el-table-column>
+              <el-table-column prop="updated_at" label="归档/更新时间" width="175">
+                <template #default="{ row }">{{ formatDateTime(row.updated_at) }}</template>
+              </el-table-column>
+              <el-table-column label="标记" width="120">
+                <template #default="{ row }">
+                  <el-tag v-if="row.is_group" size="small" type="success">群聊</el-tag>
+                  <el-tag v-else size="small" type="info">普通</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="操作" width="180" fixed="right">
+                <template #default="{ row }">
+                  <el-button size="small" type="primary" link @click="viewArchivedConversation(row)">
+                    <el-icon><View /></el-icon>查看
+                  </el-button>
+                  <el-button size="small" type="success" link @click="restoreArchivedConversation(row)">
+                    恢复
+                  </el-button>
+                </template>
+              </el-table-column>
+            </el-table>
+          </div>
+
+          <div class="archive-tip">
+            <el-icon style="margin-right:6px"><InfoFilled /></el-icon>
+            归档对话仍保存在 `data/conversations.db` 的 conversations/messages 表中，只是不再显示在聊天页左侧列表。可在此查看或恢复。
+          </div>
+        </div>
+      </el-tab-pane>
     </el-tabs>
 
     <!-- 任务日志详情对话框 -->
@@ -264,6 +316,47 @@
       <template #footer>
         <el-button @click="detailVisible = false">关闭</el-button>
         <el-button type="danger" @click="deleteFromDetail(selectedLog)">删除此日志</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 归档对话详情对话框 -->
+    <el-dialog
+      v-model="archivedDetailVisible"
+      title="归档对话详情"
+      width="760px"
+      top="3vh"
+      destroy-on-close
+    >
+      <div v-if="selectedArchivedConversation" class="log-detail">
+        <el-descriptions :column="2" border>
+          <el-descriptions-item label="标题" :span="2">
+            {{ selectedArchivedConversation.title }}
+          </el-descriptions-item>
+          <el-descriptions-item label="创建时间">
+            {{ formatDateTime(selectedArchivedConversation.created_at) }}
+          </el-descriptions-item>
+          <el-descriptions-item label="更新时间">
+            {{ formatDateTime(selectedArchivedConversation.updated_at) }}
+          </el-descriptions-item>
+        </el-descriptions>
+
+        <div class="archived-message-list">
+          <div
+            v-for="msg in archivedMessages"
+            :key="msg.id"
+            class="archived-message"
+            :class="msg.role"
+          >
+            <div class="detail-label">{{ msg.role === 'user' ? '用户' : '助手' }}</div>
+            <div class="archived-message-content">{{ msg.content }}</div>
+            <div class="time">{{ formatDateTime(msg.created_at) }}</div>
+          </div>
+          <el-empty v-if="archivedMessages.length === 0" description="暂无消息" :image-size="80" />
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="archivedDetailVisible = false">关闭</el-button>
+        <el-button type="success" @click="restoreArchivedConversation(selectedArchivedConversation)">恢复此对话</el-button>
       </template>
     </el-dialog>
 
@@ -350,7 +443,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, View, InfoFilled } from '@element-plus/icons-vue'
 import axios from 'axios'
@@ -392,6 +485,19 @@ const chatLogTableRef = ref(null)
 
 const chatDetailVisible = ref(false)
 const selectedChatLog = ref(null)
+
+// ── 已归档对话 ────────────────────────────────────────────────────────────
+const archivedConversations = ref([])
+const archivedSearch = ref('')
+const archivedDetailVisible = ref(false)
+const selectedArchivedConversation = ref(null)
+const archivedMessages = ref([])
+
+const filteredArchivedConversations = computed(() => {
+  const kw = archivedSearch.value.trim().toLowerCase()
+  if (!kw) return archivedConversations.value
+  return archivedConversations.value.filter((item) => (item.title || '').toLowerCase().includes(kw))
+})
 
 // ── 共用工具函数 ──────────────────────────────────────────────────────────
 const getStatusType = (status) => {
@@ -731,11 +837,49 @@ const batchDeleteChatLogs = async () => {
   }
 }
 
+const loadArchivedConversations = async () => {
+  try {
+    const response = await axios.get('/api/chat/conversations', {
+      params: { archived: true, limit: 200 }
+    })
+    archivedConversations.value = response.data?.data?.items || []
+  } catch (error) {
+    ElMessage.error('加载归档对话失败')
+  }
+}
+
+const viewArchivedConversation = async (conversation) => {
+  selectedArchivedConversation.value = conversation
+  archivedDetailVisible.value = true
+  try {
+    const response = await axios.get(`/api/chat/conversations/${conversation.id}/messages`, {
+      params: { limit: 1000 }
+    })
+    archivedMessages.value = response.data?.data?.items || []
+  } catch (error) {
+    archivedMessages.value = []
+    ElMessage.error('加载归档消息失败')
+  }
+}
+
+const restoreArchivedConversation = async (conversation) => {
+  if (!conversation) return
+  try {
+    await axios.post(`/api/chat/conversations/${conversation.id}/archive`, { archived: false })
+    ElMessage.success('对话已恢复，可在聊天页左侧查看')
+    archivedDetailVisible.value = false
+    await loadArchivedConversations()
+  } catch (error) {
+    ElMessage.error('恢复归档对话失败')
+  }
+}
+
 onMounted(() => {
   loadTasks()
   loadConfig()
   loadLogs()
   loadChatLogs()
+  loadArchivedConversations()
 })
 </script>
 
@@ -835,13 +979,45 @@ onMounted(() => {
   margin: 12px 0;
 }
 
-.chat-log-tip {
+.chat-log-tip,
+.archive-tip {
   flex-shrink: 0;
   display: flex;
   align-items: center;
   font-size: 12px;
   color: #909399;
   padding: 4px 0;
+}
+
+.archived-message-list {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.archived-message {
+  border: 1px solid #e4e7ed;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fafafa;
+}
+
+.archived-message.user {
+  background: #ecf5ff;
+}
+
+.archived-message-content {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.6;
+  color: #303133;
+}
+
+.time {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #909399;
 }
 
 /* 日志详情样式 */

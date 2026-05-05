@@ -121,6 +121,10 @@ class MemoryManager:
             cursor.execute("ALTER TABLE conversations ADD COLUMN share_id TEXT")
         if "project_dir" not in existing:
             cursor.execute("ALTER TABLE conversations ADD COLUMN project_dir TEXT")
+        if "conversation_type" not in existing:
+            cursor.execute("ALTER TABLE conversations ADD COLUMN conversation_type TEXT DEFAULT 'normal'")
+        if "group_role" not in existing:
+            cursor.execute("ALTER TABLE conversations ADD COLUMN group_role TEXT")
 
     def _ensure_long_term_memory_columns(self, cursor: sqlite3.Cursor):
         columns = cursor.execute("PRAGMA table_info(long_term_memories)").fetchall()
@@ -133,17 +137,44 @@ class MemoryManager:
                 "WHERE updated_at IS NULL"
             )
     
-    async def create_conversation(self, title: str = "新对话", project_dir: str = None) -> int:
+    async def create_conversation(self, title: str = "新对话", project_dir: str = None, conversation_type: str = "normal") -> int:
         """创建对话"""
         cursor = self.sqlite_db.cursor()
         cursor.execute(
-            "INSERT INTO conversations (title, project_dir) VALUES (?, ?)",
-            (title, project_dir)
+            "INSERT INTO conversations (title, project_dir, conversation_type) VALUES (?, ?, ?)",
+            (title, project_dir, conversation_type)
         )
         self.sqlite_db.commit()
         conversation_id = cursor.lastrowid
         logger.info(f"创建对话：{conversation_id}")
         return conversation_id
+
+    async def ensure_multi_agent_hub(self) -> Dict:
+        """确保系统级多 Agent 群聊工作台存在，并始终置顶。"""
+        cursor = self.sqlite_db.cursor()
+        row = cursor.execute(
+            "SELECT * FROM conversations WHERE conversation_type = 'multi_agent_hub' AND is_archived = 0 ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        if row:
+            hub = dict(row)
+            if not hub.get("is_pinned") or hub.get("title") != "多Agent群聊" or not hub.get("is_group"):
+                cursor.execute(
+                    """UPDATE conversations
+                       SET title = '多Agent群聊', is_pinned = 1, is_group = 1, updated_at = CURRENT_TIMESTAMP
+                       WHERE id = ?""",
+                    (hub["id"],)
+                )
+                self.sqlite_db.commit()
+                hub = await self.get_conversation(hub["id"])
+            return hub
+
+        hub_id = await self.create_conversation("多Agent群聊", conversation_type="multi_agent_hub")
+        cursor.execute(
+            "UPDATE conversations SET is_pinned = 1, is_group = 1, group_role = '多Agent调度中心' WHERE id = ?",
+            (hub_id,)
+        )
+        self.sqlite_db.commit()
+        return await self.get_conversation(hub_id)
     
     async def get_conversations(
         self,
@@ -156,7 +187,8 @@ class MemoryManager:
         cursor.execute(
             """SELECT * FROM conversations 
                WHERE is_archived = ?
-               ORDER BY is_pinned DESC, updated_at DESC 
+               ORDER BY CASE WHEN conversation_type = 'multi_agent_hub' THEN 0 ELSE 1 END,
+                        is_pinned DESC, updated_at DESC 
                LIMIT ? OFFSET ?""",
             (1 if archived else 0, limit, offset)
         )
@@ -169,6 +201,16 @@ class MemoryManager:
         cursor.execute(
             "SELECT * FROM conversations WHERE id = ?",
             (conversation_id,)
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_conversation_by_share_id(self, share_id: str) -> Optional[Dict]:
+        """通过分享 ID 获取对话详情。"""
+        cursor = self.sqlite_db.cursor()
+        cursor.execute(
+            "SELECT * FROM conversations WHERE share_id = ?",
+            (share_id,)
         )
         row = cursor.fetchone()
         return dict(row) if row else None
@@ -216,12 +258,38 @@ class MemoryManager:
         )
         self.sqlite_db.commit()
 
-    async def set_conversation_group(self, conversation_id: int, is_group: bool):
+    async def set_conversation_group(self, conversation_id: int, is_group: bool, group_role: str = None):
         cursor = self.sqlite_db.cursor()
         cursor.execute(
-            "UPDATE conversations SET is_group = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (1 if is_group else 0, conversation_id)
+            """UPDATE conversations
+               SET is_group = ?, group_role = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND conversation_type != 'multi_agent_hub'""",
+            (1 if is_group else 0, group_role if is_group else None, conversation_id)
         )
+        self.sqlite_db.commit()
+
+    async def get_multi_agent_members(self, project_dir: str = None) -> List[Dict]:
+        cursor = self.sqlite_db.cursor()
+        if project_dir:
+            rows = cursor.execute(
+                """SELECT * FROM conversations
+                   WHERE is_archived = 0 AND is_group = 1 AND conversation_type != 'multi_agent_hub'
+                     AND (project_dir = ? OR project_dir IS NULL OR project_dir = '')
+                   ORDER BY updated_at DESC""",
+                (project_dir,)
+            ).fetchall()
+        else:
+            rows = cursor.execute(
+                """SELECT * FROM conversations
+                   WHERE is_archived = 0 AND is_group = 1 AND conversation_type != 'multi_agent_hub'
+                   ORDER BY updated_at DESC"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    async def clear_conversation_messages(self, conversation_id: int):
+        cursor = self.sqlite_db.cursor()
+        cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        cursor.execute("UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (conversation_id,))
         self.sqlite_db.commit()
 
     async def set_conversation_share_id(self, conversation_id: int, share_id: str):

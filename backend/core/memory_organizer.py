@@ -368,18 +368,41 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
     except Exception:
         pass
 
-    window_start_iso = window_start.isoformat()
-    logger.info(f"[memory_organizer] 聊天整理时间窗口: {window_start_iso} → {now.isoformat()}")
+    window_start_sql = window_start.strftime("%Y-%m-%d %H:%M:%S")
+    logger.info(f"[memory_organizer] 聊天整理时间窗口: {window_start_sql} → {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
     cursor = memory_manager.sqlite_db.cursor()
     rows = cursor.execute(
         """SELECT id, conversation_id, role, content
            FROM messages
-           WHERE created_at >= ?
+           WHERE datetime(created_at) >= datetime(?)
            ORDER BY id ASC
            LIMIT 2000""",
-        (window_start_iso,),
+        (window_start_sql,),
     ).fetchall()
+    if not rows:
+        # 兼容旧库或驱动返回的非标准时间格式，避免字符串格式差异导致完全扫不到。
+        fallback_start_id = 0
+        try:
+            from config import app_config as fallback_config
+            last_run_raw = getattr(fallback_config.memory, "organize_last_run", "") or ""
+            if not last_run_raw:
+                raise ValueError("no organize_last_run")
+            last_dt = datetime.fromisoformat(last_run_raw)
+            fallback_start_id = int(cursor.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages WHERE datetime(created_at) <= datetime(?)",
+                (last_dt.strftime("%Y-%m-%d %H:%M:%S"),),
+            ).fetchone()[0] or 0)
+        except Exception:
+            fallback_start_id = max(0, int(cursor.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0] or 0) - 2000)
+        rows = cursor.execute(
+            """SELECT id, conversation_id, role, content
+               FROM messages
+               WHERE id > ?
+               ORDER BY id ASC
+               LIMIT 2000""",
+            (fallback_start_id,),
+        ).fetchall()
     if not rows:
         return stats
 
@@ -431,11 +454,13 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
         try:
             # _materialize_reusable_skill 内部已做 _should_materialize_skill 判断
             # 以及全量技能查重（包含 opencode/builtin/custom），无需额外检查
-            chat_router._materialize_reusable_skill(
+            materialized = chat_router._materialize_reusable_skill(
                 user_message=user_text,
                 assistant_response=assistant_text,
                 conversation_id=conv_id,
             )
+            if materialized:
+                stats["skills_materialized"] += 1
         except Exception:
             pass
 

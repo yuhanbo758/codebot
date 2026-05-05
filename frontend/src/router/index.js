@@ -11,6 +11,11 @@ const routes = [
     component: () => import('@/views/Chat.vue')
   },
   {
+    path: '/share/:shareId',
+    name: 'SharedConversation',
+    component: () => import('@/views/SharedConversation.vue')
+  },
+  {
     path: '/memory',
     name: 'Memory',
     component: () => import('@/views/Memory.vue'),

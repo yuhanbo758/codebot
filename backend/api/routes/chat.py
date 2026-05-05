@@ -22,7 +22,7 @@ from loguru import logger
 from config import settings, app_config
 from database.init_db import conversations_db
 from core.memory_manager import MemoryManager
-from core.opencode_ws import OpenCodeClient, _conversation_current_session, is_conversation_running, unmark_conversation_running
+from core.opencode_ws import OpenCodeClient, _conversation_current_session, is_conversation_running, mark_conversation_running, unmark_conversation_running
 from core.memory_extractor import extract_and_save_background
 from core.growth import record_chat_growth_candidates
 from core.skill_registry import AUTO_GENERATED, BUILTIN, EXTERNAL, OPENCODE, get_skill_registry, write_auto_skill_md
@@ -84,6 +84,7 @@ async def _ensure_opencode_client_connected(client: OpenCodeClient) -> bool:
 _task_queues: dict = {}
 _queue_runners: dict = {}  # key=conversation_id -> asyncio.Task
 _runtime_stream_state: Dict[str, Dict[str, Any]] = {}
+_multi_agent_dispatch_state: Dict[str, Dict[str, Any]] = {}
 
 
 class MessageRequest(BaseModel):
@@ -125,6 +126,16 @@ class ToggleArchiveRequest(BaseModel):
 
 class ToggleGroupRequest(BaseModel):
     is_group: bool
+    group_role: Optional[str] = None
+
+class MultiAgentDispatchRequest(BaseModel):
+    message: str
+    model: Optional[str] = None
+    mode: Optional[str] = None
+    project_dir: Optional[str] = None
+
+class ClearConversationRequest(BaseModel):
+    confirm: bool = True
 
 class SkillGenerateRequest(BaseModel):
     name: Optional[str] = None
@@ -530,6 +541,172 @@ def _runtime_snapshot(conv_id: str, since_seq: int = 0) -> Dict[str, Any]:
         "content": state.get("content", "") or "",
         "running": bool(state.get("running")),
     }
+
+
+def _is_multi_agent_hub(conversation: Optional[Dict]) -> bool:
+    return bool(conversation and conversation.get("conversation_type") == "multi_agent_hub")
+
+
+def _conversation_role_label(conversation: Dict) -> str:
+    role = str(conversation.get("group_role") or "").strip()
+    if role:
+        return role
+    title = str(conversation.get("title") or "").strip()
+    return title or f"Agent-{conversation.get('id')}"
+
+
+def _find_member_by_label(label: str, members: List[Dict]) -> Optional[Dict]:
+    target = (label or "").strip().lower()
+    if not target:
+        return None
+    for member in members:
+        role = str(member.get("group_role") or "").strip().lower()
+        title = str(member.get("title") or "").strip().lower()
+        if target in {role, title} or target in role or target in title:
+            return member
+    return None
+
+
+def _pick_member_for_task(task_text: str, members: List[Dict]) -> Dict:
+    text = (task_text or "").lower()
+    explicit_targets = re.findall(r"(?:分配给|交给|给)\s*[“\"']([^”\"']+)[”\"']\s*(?:对话|agent|Agent)?", task_text or "")
+    for target in explicit_targets:
+        member = _find_member_by_label(target, members)
+        if member:
+            return member
+    keyword_map = [
+        ("鉴赏", ["鉴赏", "赏析", "点评", "评价", "review", "critique"]),
+        ("评论", ["评论", "点评", "评价", "review", "critique"]),
+        ("写作", ["写", "创作", "文案", "文章", "诗", "故事", "小说", "write"]),
+        ("前端", ["前端", "vue", "react", "ui", "页面", "组件", "样式", "css", "frontend"]),
+        ("后端", ["后端", "api", "接口", "fastapi", "python", "服务", "backend"]),
+        ("数据库", ["数据库", "sqlite", "sql", "表", "字段", "迁移", "database", "db"]),
+        ("测试", ["测试", "验证", "用例", "test", "pytest", "build", "检查"]),
+    ]
+    for preferred_role, words in keyword_map:
+        if not any(word in text for word in words):
+            continue
+        for member in members:
+            haystack = f"{member.get('title') or ''} {member.get('group_role') or ''}".lower()
+            if preferred_role in haystack or any(word in haystack for word in words):
+                return member
+    return members[0]
+
+
+def _split_multi_agent_task_text(user_message: str) -> List[str]:
+    lines = [line.strip("- 　\t") for line in re.split(r"[\n；;]+", user_message or "") if line.strip()]
+    if len(lines) <= 1:
+        sentences = [s.strip() for s in re.split(r"(?<=[。！？!?])", user_message or "") if s.strip()]
+        lines = sentences if len(sentences) > 1 else [user_message.strip()]
+    return [line for line in lines if line]
+
+
+def _extract_explicit_multi_agent_steps(user_message: str, members: List[Dict]) -> List[Dict[str, Any]]:
+    text = user_message or ""
+    pattern = re.compile(
+        r"(?:将|把)\s*(?P<task>.+?)\s*(?:分配给|交给)\s*[“\"'](?P<label>[^”\"']+)[”\"']\s*(?:对话|agent|Agent)?"
+    )
+    matches = list(pattern.finditer(text))
+    assignments: List[Dict[str, Any]] = []
+    for idx, match in enumerate(matches):
+        label = match.group("label") or ""
+        member = _find_member_by_label(label, members)
+        if not member:
+            continue
+        task_text = (match.group("task") or "").strip(" ，,。；;\n\t")
+        prefix = text[:match.start()].strip(" ，,。；;\n\t") if idx == 0 else ""
+        next_start = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        tail = text[match.end():next_start].strip(" ，,。；;\n\t")
+        tail = re.sub(r"^(?:写完.*?之后|写完.*?后|完成.*?之后|完成.*?后|然后|再|接着|随后|之后|最后)", "", tail).strip(" ，,。；;\n\t")
+        if prefix and task_text and len(prefix) <= 80:
+            task_text = f"{prefix}；明确负责：{task_text}"
+        if tail:
+            task_text = f"{task_text}；{tail}" if task_text else tail
+        if not task_text:
+            task_text = f"按用户要求处理分配给 {label} 的任务"
+        assignments.append({"task_id": len(assignments) + 1, "task": task_text, "member": member})
+    return assignments
+
+
+def _plan_multi_agent_tasks(user_message: str, members: List[Dict]) -> List[List[Dict[str, Any]]]:
+    text = (user_message or "").strip()
+    if not text:
+        return []
+
+    explicit_assignments = _extract_explicit_multi_agent_steps(text, members)
+    has_sequential_signal = bool(re.search(r"写完|完成后|完成之后|然后|再|接着|随后|之后|最后|交给", text))
+    if explicit_assignments:
+        if has_sequential_signal:
+            return [[{**assignment, "depends_on_previous": idx > 0}] for idx, assignment in enumerate(explicit_assignments)]
+        return [[{**assignment, "depends_on_previous": False} for assignment in explicit_assignments]]
+
+    # Chinese prompts often encode dependencies with "then/after" in one sentence.
+    sequential_parts = [p.strip(" ，,。；;\n\t") for p in re.split(r"(?:写完(?:之后|后)?|完成(?:之后|后)?|然后|再|接着|随后|之后|最后|交给)", text) if p.strip(" ，,。；;\n\t")]
+    raw_tasks = sequential_parts if has_sequential_signal and len(sequential_parts) > 1 else _split_multi_agent_task_text(text)
+
+    steps: List[List[Dict[str, Any]]] = []
+    if has_sequential_signal and len(raw_tasks) > 1:
+        for idx, task_text in enumerate(raw_tasks, 1):
+            member = _pick_member_for_task(task_text, members)
+            steps.append([{"task_id": idx, "task": task_text, "member": member, "depends_on_previous": idx > 1}])
+        return steps
+
+    parallel_step: List[Dict[str, Any]] = []
+    for idx, task_text in enumerate(raw_tasks, 1):
+        member = _pick_member_for_task(task_text, members)
+        parallel_step.append({"task_id": idx, "task": task_text, "member": member, "depends_on_previous": False})
+    return [parallel_step] if parallel_step else []
+
+
+def _split_multi_agent_tasks(user_message: str, members: List[Dict]) -> List[Dict[str, Any]]:
+    return [assignment for step in _plan_multi_agent_tasks(user_message, members) for assignment in step]
+
+
+def _format_multi_agent_plan(user_message: str, steps: List[List[Dict[str, Any]]]) -> str:
+    lines = ["## 多Agent任务计划", "", f"用户任务：{user_message}", ""]
+    if not steps:
+        lines.append("暂无可执行任务。")
+        return "\n".join(lines).strip()
+    for step_index, step in enumerate(steps, 1):
+        mode = "并行" if len(step) > 1 else "串行"
+        lines.append(f"### 第 {step_index} 步（{mode}）")
+        for assignment in step:
+            member = assignment["member"]
+            role = _conversation_role_label(member)
+            dependency = "，依赖上一轮产物" if assignment.get("depends_on_previous") else ""
+            lines.append(f"- {role}（对话 #{member.get('id')}）：{assignment['task']}{dependency}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _append_hub_progress(conv_id: str, lines: List[str], message: str, event_type: str = "status", **extra):
+    lines.append(message)
+    content = "\n".join(lines).strip()
+    _runtime_set_content(conv_id, content)
+    payload = {"type": event_type, "message": message, **extra}
+    _runtime_append_event(conv_id, payload)
+
+
+async def _build_multi_agent_hub_reply(user_message: str, members: List[Dict], results: List[Dict[str, str]], plan_text: str = "") -> str:
+    lines = [
+        "## 多Agent群聊任务结果",
+        "",
+        f"用户任务：{user_message}",
+        "",
+    ]
+    if plan_text:
+        lines.extend([plan_text, ""])
+    lines.append("### 执行过程")
+    for item in results:
+        lines.append(f"- 第 {item.get('step', 1)} 步：{item['role']}（对话 #{item['conversation_id']}）完成 `{item['task']}`")
+    lines.extend(["", "### 成员回复"])
+    for item in results:
+        lines.append(f"#### {item['role']}")
+        lines.append(item.get("reply") or "未返回内容")
+        lines.append("")
+    member_names = "、".join(_conversation_role_label(m) for m in members) or "暂无成员"
+    lines.extend(["### 协作状态", f"参与成员：{member_names}"])
+    return "\n".join(lines).strip()
 
 
 async def _execute_opencode_client(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None, system: Optional[str] = None, user_message: str = "") -> Tuple[Optional[str], bool]:
@@ -2047,14 +2224,14 @@ def _skill_name_similar(a: str, b: str) -> bool:
     return overlap >= 0.6
 
 
-def _materialize_reusable_skill(user_message: str, assistant_response: str, conversation_id: Optional[int] = None) -> None:
+def _materialize_reusable_skill(user_message: str, assistant_response: str, conversation_id: Optional[int] = None) -> bool:
     cleaned_response = _sanitize_assistant_output(assistant_response or "")
     if not _should_materialize_skill(user_message, cleaned_response, conversation_id=conversation_id):
-        return
+        return False
     title = generate_conversation_title(user_message or "自动技能")
     desc = cleaned_response.strip().replace("\n", " ")
     if _skill_content_is_noise(desc):
-        return
+        return False
     if len(desc) > 180:
         desc = f"{desc[:180]}..."
     new_name = f"自动技能-{title}"
@@ -2083,13 +2260,13 @@ def _materialize_reusable_skill(user_message: str, assistant_response: str, conv
             if skill_md.exists():
                 _write_auto_skill_md(skill_md, new_name, desc, user_message, cleaned_response)
                 logger.info(f"升级已有自动技能: {slug}")
-                return
+                return True
         # 对于其他类型（builtin/opencode/custom），不覆盖，仅跳过
         logger.info(
             f"[skill] 跳过技能生成：已有相似技能 '{similar_skill.get('name')}' "
             f"(id={skill_id})"
         )
-        return
+        return False
 
     digest = hashlib.sha1(f"{user_message}\n{cleaned_response[:300]}".encode("utf-8")).hexdigest()[:8]
     slug_base = re.sub(r"[^a-z0-9_]", "_", title[:20].lower().replace(" ", "_"))
@@ -2102,6 +2279,7 @@ def _materialize_reusable_skill(user_message: str, assistant_response: str, conv
         slug_hint=f"{slug_base}_{digest}",
     )
     logger.info(f"生成新自动技能（本地）: {item.get('slug')}")
+    return True
 
 
 async def _async_create_skill_via_opencode(session_id: str, prompt: str) -> None:
@@ -2211,7 +2389,8 @@ def _write_skill(skill_id: str, data: dict):
 @router.post("/conversations", response_model=MessageResponse)
 async def create_conversation(
     title: str = Body("新对话"),
-    project_dir: Optional[str] = Body(None)
+    project_dir: Optional[str] = Body(None),
+    conversation_type: str = Body("normal")
 ):
     """创建对话"""
     try:
@@ -2219,6 +2398,14 @@ async def create_conversation(
         conversations_db.connect()
         
         memory_manager = MemoryManager()
+        if conversation_type == "multi_agent_hub":
+            conversation = await memory_manager.ensure_multi_agent_hub()
+            return MessageResponse(
+                success=True,
+                data=conversation,
+                message="多Agent群聊已就绪"
+            )
+
         conversation_id = await memory_manager.create_conversation(title, project_dir=project_dir)
         
         return MessageResponse(
@@ -2241,6 +2428,9 @@ async def list_conversations(
         conversations_db.connect()
         memory_manager = MemoryManager()
         
+        if not archived:
+            await memory_manager.ensure_multi_agent_hub()
+
         conversations = await memory_manager.get_conversations(
             limit=limit,
             offset=offset,
@@ -2307,6 +2497,12 @@ async def delete_conversation(conversation_id: int):
         conversations_db.connect()
         memory_manager = MemoryManager()
         
+        conversation = await memory_manager.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="对话不存在")
+        if _is_multi_agent_hub(conversation):
+            raise HTTPException(status_code=400, detail="多Agent群聊不能删除，请使用清空")
+
         await memory_manager.delete_conversation(conversation_id)
         
         return {
@@ -2364,13 +2560,156 @@ async def toggle_conversation_group(conversation_id: int, request: ToggleGroupRe
     try:
         conversations_db.connect()
         memory_manager = MemoryManager()
-        await memory_manager.set_conversation_group(conversation_id, request.is_group)
+        conversation = await memory_manager.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="对话不存在")
+        if _is_multi_agent_hub(conversation):
+            raise HTTPException(status_code=400, detail="多Agent群聊工作台不能退出群聊")
+        role = request.group_role or conversation.get("group_role") or conversation.get("title")
+        await memory_manager.set_conversation_group(conversation_id, request.is_group, role)
         return {
             "success": True,
             "message": "群聊状态已更新"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/conversations/{conversation_id}/clear")
+async def clear_conversation(conversation_id: int, request: ClearConversationRequest):
+    try:
+        conversations_db.connect()
+        memory_manager = MemoryManager()
+        conversation = await memory_manager.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="对话不存在")
+        if not request.confirm:
+            raise HTTPException(status_code=400, detail="需要确认清空")
+        await memory_manager.clear_conversation_messages(conversation_id)
+        return {"success": True, "message": "对话内容已清空"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/multi-agent/members")
+async def list_multi_agent_members(project_dir: Optional[str] = None):
+    try:
+        conversations_db.connect()
+        memory_manager = MemoryManager()
+        await memory_manager.ensure_multi_agent_hub()
+        members = await memory_manager.get_multi_agent_members(project_dir=project_dir)
+        return {"success": True, "data": {"items": members, "total": len(members)}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/multi-agent/{hub_id}/dispatch")
+async def dispatch_multi_agent_task(hub_id: int, request: MultiAgentDispatchRequest):
+    hub_key = str(hub_id)
+    try:
+        conversations_db.connect()
+        memory_manager = MemoryManager()
+        hub = await memory_manager.get_conversation(hub_id)
+        if not _is_multi_agent_hub(hub):
+            raise HTTPException(status_code=400, detail="当前对话不是多Agent群聊")
+
+        members = await memory_manager.get_multi_agent_members(project_dir=request.project_dir)
+        if not members:
+            content = "请先把至少一个普通对话加入多Agent群聊，并为它设置角色（如前端、后端、数据库、测试）。"
+            await memory_manager.save_message(hub_id, "assistant", content)
+            return {"success": True, "data": {"content": content, "results": []}}
+
+        steps = _plan_multi_agent_tasks(request.message, members)
+        plan_text = _format_multi_agent_plan(request.message, steps)
+        progress_lines = [plan_text, "", "## 执行过程"]
+        _runtime_start(hub_key)
+        mark_conversation_running(hub_key)
+        _multi_agent_dispatch_state[hub_key] = {
+            "member_ids": [str(assignment["member"].get("id")) for step in steps for assignment in step],
+            "aborted": False,
+            "updated_at": datetime.now(),
+        }
+        _runtime_set_content(hub_key, "\n".join(progress_lines).strip())
+        _runtime_append_event(hub_key, {"type": "status", "message": "已生成多Agent任务计划"})
+
+        results: List[Dict[str, str]] = []
+        upstream_outputs: List[Dict[str, str]] = []
+        for step_index, step in enumerate(steps, 1):
+            state = _multi_agent_dispatch_state.get(hub_key) or {}
+            if state.get("aborted"):
+                raise asyncio.CancelledError()
+            _append_hub_progress(hub_key, progress_lines, f"### 第 {step_index} 步开始：{'并行' if len(step) > 1 else '串行'}")
+
+            for assignment in step:
+                member = assignment["member"]
+                role = _conversation_role_label(member)
+                task_text = assignment["task"]
+                upstream_text = "\n\n".join(
+                    f"【上游产物 - {item['role']}】\n{item['reply']}" for item in upstream_outputs
+                )
+                delegated_message = (
+                    f"【多Agent群聊分配任务】\n"
+                    f"你的角色：{role}\n"
+                    f"总任务：{request.message}\n"
+                    f"当前步骤：第 {step_index} 步\n"
+                    f"你负责的子任务：{task_text}\n"
+                )
+                if assignment.get("depends_on_previous") and upstream_text:
+                    delegated_message += f"\n上游 Agent 已完成的产物如下，请基于它继续处理：\n{upstream_text}\n"
+                delegated_message += "\n请只处理与你角色相关的部分，完成后说明结果、修改点、风险和需要其他 Agent 配合的事项。"
+
+                _append_hub_progress(hub_key, progress_lines, f"- 分配给 {role}（对话 #{member['id']}）：{task_text}")
+                await memory_manager.save_message(member["id"], "user", delegated_message)
+                reply = await _execute_opencode(
+                    delegated_message,
+                    model=request.model,
+                    mode=request.mode or "agent",
+                    conversation_id=str(member["id"]),
+                    project_dir=member.get("project_dir") or request.project_dir,
+                )
+                state = _multi_agent_dispatch_state.get(hub_key) or {}
+                if state.get("aborted"):
+                    raise asyncio.CancelledError()
+                await memory_manager.save_message(member["id"], "assistant", reply)
+                result = {
+                    "conversation_id": str(member["id"]),
+                    "role": role,
+                    "task": task_text,
+                    "reply": reply,
+                    "step": step_index,
+                }
+                results.append(result)
+                _append_hub_progress(hub_key, progress_lines, f"- {role} 已返回结果，继续汇总。")
+            upstream_outputs = [item for item in results if int(item.get("step", 0)) == step_index]
+
+        hub_reply = await _build_multi_agent_hub_reply(request.message, members, results, plan_text=plan_text)
+        await memory_manager.save_message(hub_id, "assistant", hub_reply)
+        _runtime_append_event(hub_key, {"type": "done", "content": hub_reply})
+        _runtime_finish(hub_key, hub_reply)
+        return {"success": True, "data": {"content": hub_reply, "results": results, "plan": plan_text}}
+    except asyncio.CancelledError:
+        content = _runtime_snapshot(hub_key).get("content", "") or "多Agent任务已被用户终止。"
+        content = f"{content}\n\n任务已被用户终止。".strip()
+        try:
+            await memory_manager.save_message(hub_id, "assistant", content)
+        except Exception:
+            pass
+        _runtime_append_event(hub_key, {"type": "error", "message": "多Agent任务已被用户终止"})
+        _runtime_finish(hub_key, content)
+        return {"success": True, "data": {"content": content, "results": [], "aborted": True}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        _runtime_append_event(hub_key, {"type": "error", "message": str(e)})
+        _runtime_finish(hub_key)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        _multi_agent_dispatch_state.pop(hub_key, None)
+        unmark_conversation_running(hub_key)
 
 
 @router.post("/conversations/{conversation_id}/share")
@@ -2390,6 +2729,30 @@ async def share_conversation(conversation_id: int):
                 "share_path": f"/share/{share_id}"
             },
             "message": "分享链接已生成"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/share/{share_id}")
+async def get_shared_conversation(share_id: str):
+    """公开只读分享接口：通过 share_id 返回对话和消息。"""
+    try:
+        conversations_db.connect()
+        memory_manager = MemoryManager()
+        conversation = await memory_manager.get_conversation_by_share_id(share_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="分享不存在或已失效")
+
+        messages = await memory_manager.get_messages(conversation["id"], limit=1000)
+        return {
+            "success": True,
+            "data": {
+                "conversation": conversation,
+                "messages": messages,
+            }
         }
     except HTTPException:
         raise
@@ -2612,8 +2975,11 @@ def _build_files_context(attached_files: List[AttachedFile]) -> str:
                 content_preview = content_preview[:50000] + "\n... [内容已截断]"
             parts.append(f"【附件：{f.name}】\n```\n{content_preview}\n```")
         else:
-            # 二进制（图片等）：只标注存在
-            parts.append(f"【附件：{f.name}（二进制文件，类型：{f.type}）】")
+            # 图片等二进制文件暂以 data URL 注入。多模态模型可读取；普通文本模型也能看到附件存在。
+            if str(f.type or "").startswith("image/") and f.content:
+                parts.append(f"【图片附件：{f.name}，类型：{f.type}】\ndata:{f.type};base64,{f.content}")
+            else:
+                parts.append(f"【附件：{f.name}（二进制文件，类型：{f.type}）】")
 
     return "\n\n".join(parts)
 
@@ -3212,10 +3578,21 @@ async def abort_task(request: AbortRequest):
     """终止指定对话的当前运行任务"""
     conv_id = str(request.conversation_id)
     client = opencode_ws
+    target_conv_ids = [conv_id]
+    dispatch_state = _multi_agent_dispatch_state.get(conv_id)
+    if dispatch_state:
+        dispatch_state["aborted"] = True
+        dispatch_state["updated_at"] = datetime.now()
+        for member_id in dispatch_state.get("member_ids") or []:
+            member_key = str(member_id)
+            if member_key and member_key not in target_conv_ids:
+                target_conv_ids.append(member_key)
 
     # 清空队列中等待的任务
-    if conv_id in _task_queues:
-        q = _task_queues[conv_id]
+    for target_id in target_conv_ids:
+        if target_id not in _task_queues:
+            continue
+        q = _task_queues[target_id]
         cleared = 0
         while not q.empty():
             try:
@@ -3225,25 +3602,32 @@ async def abort_task(request: AbortRequest):
             except Exception:
                 break
         if cleared:
-            logger.info(f"已清空对话 {conv_id} 的 {cleared} 个排队任务")
+            logger.info(f"已清空对话 {target_id} 的 {cleared} 个排队任务")
 
     # 终止当前正在运行的 OpenCode session
-    session_id = _conversation_current_session.get(conv_id)
-    if session_id and client:
+    aborted_sessions = 0
+    for target_id in target_conv_ids:
+        session_id = _conversation_current_session.get(target_id)
+        if not session_id or not client:
+            continue
         try:
             ok = await client.abort_session(session_id)
-            logger.info(f"终止 session {session_id}: {'成功' if ok else '失败'}")
+            if ok:
+                aborted_sessions += 1
+            logger.info(f"终止对话 {target_id} session {session_id}: {'成功' if ok else '失败'}")
         except Exception as e:
             logger.warning(f"终止 session 出错: {e}")
         finally:
-            _conversation_current_session.pop(conv_id, None)
-            unmark_conversation_running(conv_id)
-            _runtime_append_event(conv_id, {"type": "error", "message": "任务已被用户终止"})
-            _runtime_finish(conv_id)
+            _conversation_current_session.pop(target_id, None)
+            unmark_conversation_running(target_id)
+
+    _runtime_append_event(conv_id, {"type": "error", "message": "任务已被用户终止"})
+    _runtime_finish(conv_id)
 
     return {
         "success": True,
-        "message": "已发送终止信号"
+        "message": "已发送终止信号",
+        "data": {"conversations": target_conv_ids, "aborted_sessions": aborted_sessions}
     }
 
 

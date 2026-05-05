@@ -24,7 +24,7 @@
             v-model="selectAll" 
             :indeterminate="isIndeterminate"
             @change="handleSelectAll"
-          >全选 ({{ selectedConvIds.length }}/{{ conversations.length }})</el-checkbox>
+          >全选 ({{ selectedConvIds.length }}/{{ deletableConversations.length }})</el-checkbox>
           <div class="batch-actions">
             <el-button 
               size="small" 
@@ -54,7 +54,7 @@
             v-for="conv in filteredConversations"
             :key="conv.id"
             class="conversation-item"
-            :class="{ active: currentConversationId === conv.id, 'batch-selected': selectedConvIds.includes(conv.id) }"
+            :class="{ active: currentConversationId === conv.id, 'batch-selected': selectedConvIds.includes(conv.id), 'multi-agent-hub-item': isMultiAgentHub(conv) }"
             @click="batchMode ? toggleConvSelection(conv.id) : selectConversation(conv.id)"
           >
             <div v-if="batchMode" class="batch-checkbox" @click.stop>
@@ -67,7 +67,8 @@
               <div class="conversation-title">
                 <span class="conversation-title-text">{{ conv.title }}</span>
                 <el-tag v-if="conv.is_pinned" size="small" type="info">置顶</el-tag>
-                <el-tag v-if="conv.is_group" size="small" type="success">群聊</el-tag>
+                <el-tag v-if="isMultiAgentHub(conv)" size="small" type="danger">多Agent</el-tag>
+                <el-tag v-else-if="conv.is_group" size="small" type="success">{{ conv.group_role || 'Agent' }}</el-tag>
                 <el-tag v-if="conv.project_dir" size="small" type="warning" :title="conv.project_dir">📁</el-tag>
               </div>
               <div class="conversation-time">{{ formatDate(conv.updated_at) }}</div>
@@ -78,13 +79,17 @@
                 <template #dropdown>
                   <el-dropdown-menu>
                     <el-dropdown-item command="share">分享</el-dropdown-item>
-                    <el-dropdown-item command="group">开始群聊</el-dropdown-item>
-                    <el-dropdown-item command="rename">重命名</el-dropdown-item>
-                    <el-dropdown-item :command="conv.is_pinned ? 'unpin' : 'pin'">
+                    <el-dropdown-item v-if="!isMultiAgentHub(conv)" :command="conv.is_group ? 'ungroup' : 'group'">
+                      {{ conv.is_group ? '退出多Agent群聊' : '加入多Agent群聊' }}
+                    </el-dropdown-item>
+                    <el-dropdown-item v-if="!isMultiAgentHub(conv)" command="rename">重命名</el-dropdown-item>
+                    <el-dropdown-item v-if="!isMultiAgentHub(conv)" :command="conv.is_pinned ? 'unpin' : 'pin'">
                       {{ conv.is_pinned ? '取消置顶' : '置顶聊天' }}
                     </el-dropdown-item>
-                    <el-dropdown-item command="archive">归档</el-dropdown-item>
-                    <el-dropdown-item command="delete" divided>删除</el-dropdown-item>
+                    <el-dropdown-item v-if="!isMultiAgentHub(conv)" command="archive">归档</el-dropdown-item>
+                    <el-dropdown-item :command="isMultiAgentHub(conv) ? 'clear' : 'delete'" divided>
+                      {{ isMultiAgentHub(conv) ? '清空' : '删除' }}
+                    </el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
               </el-dropdown>
@@ -98,7 +103,14 @@
       
       <!-- 主聊天区域 -->
       <el-main>
-        <div class="chat-main" v-if="currentConversationId">
+          <div class="chat-main" v-if="currentConversationId">
+          <div v-if="currentConversation?.conversation_type === 'multi_agent_hub'" class="multi-agent-members">
+            <el-tag v-for="member in multiAgentMembers" :key="member.id" type="success" effect="plain">
+              {{ member.group_role || member.title }} #{{ member.id }}
+            </el-tag>
+            <span v-if="multiAgentMembers.length === 0" class="empty-members">暂无成员，请在普通对话菜单中选择“加入多Agent群聊”。</span>
+            <el-button size="small" text class="refresh-members-btn" @click="loadMultiAgentMembers">刷新成员</el-button>
+          </div>
           <div v-if="thirdPartyStatus" class="third-party-banner">
             <el-tag size="small" :type="thirdPartyStatus.opencode_connected ? 'success' : 'info'">
               {{ thirdPartyStatus.opencode_connected ? 'OpenCode 已连接' : 'OpenCode 未连接' }}
@@ -375,6 +387,7 @@
               :rows="3"
               placeholder="输入消息... (Shift+Enter 换行，/ 命令，@ 插入文件)"
               @keydown="onInputKeydown"
+              @paste="onInputPaste"
               @input="onInputChange"
               resize="none"
             />
@@ -689,6 +702,7 @@ const LAST_CONVERSATION_KEY = 'codebot:lastConversationId'
 const conversations = ref([])
 const messages = ref([])
 const currentConversationId = ref(null)
+const currentConversation = ref(null)
 const inputMessage = ref('')
 const loadingCounts = ref({})
 const messageListRef = ref(null)
@@ -715,6 +729,8 @@ const patchConversation = (conversationId, patch) => {
   updated[idx] = { ...updated[idx], ...patch }
   conversations.value = updated
 }
+
+const isMultiAgentHub = (conv) => conv?.conversation_type === 'multi_agent_hub'
 
 const refreshConversationTitleOnce = async (conversationId) => {
   const response = await axios.get(`/api/chat/conversations/${conversationId}`)
@@ -864,6 +880,18 @@ let timeRefreshTimer = null
 let thirdPartyStatusTimer = null
 const thirdPartyStatus = ref(null)
 const thirdPartyStatusRefreshing = ref(false)
+const multiAgentMembers = ref([])
+
+const loadMultiAgentMembers = async () => {
+  try {
+    const params = {}
+    if (currentProjectDir.value) params.project_dir = currentProjectDir.value
+    const res = await axios.get('/api/chat/multi-agent/members', { params })
+    multiAgentMembers.value = res.data?.data?.items || []
+  } catch {
+    multiAgentMembers.value = []
+  }
+}
 
 // ── 附件管理 ─────────────────────────────────────────────────────────────────
 const attachedFiles = ref([])  // [{name, type, content, is_text}]
@@ -904,6 +932,24 @@ const processFiles = async (files) => {
     ElMessage.error(`上传失败：${errors.join(', ')}`)
   }
   uploadingFile.value = false
+}
+
+const onInputPaste = async (e) => {
+  const items = Array.from(e.clipboardData?.items || [])
+  const imageFiles = items
+    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+    .map((item, idx) => {
+      const file = item.getAsFile()
+      if (!file) return null
+      if (file.name) return file
+      const ext = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg')
+      return new File([file], `screenshot-${Date.now()}-${idx + 1}.${ext}`, { type: file.type })
+    })
+    .filter(Boolean)
+
+  if (imageFiles.length === 0) return
+  e.preventDefault()
+  await processFiles(imageFiles)
 }
 
 const triggerFileUpload = () => {
@@ -1237,11 +1283,13 @@ const selectedConvIds = ref([])
 const selectAll = ref(false)
 
 const isIndeterminate = computed(() => {
-  return selectedConvIds.value.length > 0 && selectedConvIds.value.length < conversations.value.length
+  return selectedConvIds.value.length > 0 && selectedConvIds.value.length < deletableConversations.value.length
 })
 
+const deletableConversations = computed(() => conversations.value.filter((conv) => !isMultiAgentHub(conv)))
+
 watch(selectedConvIds, (val) => {
-  selectAll.value = val.length === conversations.value.length && conversations.value.length > 0
+  selectAll.value = val.length === deletableConversations.value.length && deletableConversations.value.length > 0
 })
 
 const toggleBatchMode = () => {
@@ -1251,6 +1299,8 @@ const toggleBatchMode = () => {
 }
 
 const toggleConvSelection = (id) => {
+  const conv = conversations.value.find((item) => item.id === id)
+  if (isMultiAgentHub(conv)) return
   const idx = selectedConvIds.value.indexOf(id)
   if (idx === -1) {
     selectedConvIds.value.push(id)
@@ -1261,7 +1311,7 @@ const toggleConvSelection = (id) => {
 
 const handleSelectAll = (val) => {
   if (val) {
-    selectedConvIds.value = conversations.value.map(c => c.id)
+    selectedConvIds.value = deletableConversations.value.map(c => c.id)
   } else {
     selectedConvIds.value = []
   }
@@ -1279,7 +1329,8 @@ const batchDeleteConversations = async () => {
         type: 'warning'
       }
     )
-    const ids = [...selectedConvIds.value]
+    const hubIds = new Set(conversations.value.filter(isMultiAgentHub).map((item) => item.id))
+    const ids = [...selectedConvIds.value].filter((id) => !hubIds.has(id))
     let successCount = 0
     for (const id of ids) {
       try {
@@ -1524,6 +1575,9 @@ const loadConversations = async (autoSelect = false) => {
     const response = await axios.get('/api/chat/conversations')
     conversations.value = response.data.data.items || []
     if (currentConversationId.value) {
+      currentConversation.value = conversations.value.find((item) => item.id === currentConversationId.value) || currentConversation.value
+    }
+    if (currentConversationId.value) {
       const currentConversation = conversations.value.find((item) => item.id === currentConversationId.value)
       if (currentConversation) {
         if (isPlaceholderConversationTitle(currentConversation.title)) {
@@ -1622,7 +1676,11 @@ const selectConversation = async (conversationId) => {
     // 加载对话详情以获取 project_dir
     const convResponse = await axios.get(`/api/chat/conversations/${conversationId}`)
     const convData = convResponse.data?.data
+    currentConversation.value = convData || null
     currentProjectDir.value = convData?.project_dir || ''
+    if (isMultiAgentHub(convData)) {
+      await loadMultiAgentMembers()
+    }
 
     const response = await axios.get(`/api/chat/conversations/${conversationId}/messages`)
     const dbMessages = response.data.data.items || []
@@ -1743,6 +1801,53 @@ const sendMessage = async () => {
   const displayContent = filesToSend.length > 0
     ? `${filesToSend.map(f => `[附件: ${f.name}]`).join(' ')}\n${content}`.trim()
     : content
+
+  if (currentConversation.value?.conversation_type === 'multi_agent_hub') {
+    messages.value.push({
+      id: Date.now(),
+      role: 'user',
+      content: displayContent,
+      created_at: new Date().toISOString()
+    })
+    const assistantMessage = {
+      id: Date.now() + 1,
+      role: 'assistant',
+      content: '正在生成多Agent任务计划...',
+      streaming: true,
+      created_at: new Date().toISOString()
+    }
+    messages.value.push(assistantMessage)
+    runtimeAssistantIdByConversation.value = { ...runtimeAssistantIdByConversation.value, [conversationId]: assistantMessage.id }
+    runtimeSeqByConversation.value = { ...runtimeSeqByConversation.value, [conversationId]: 0 }
+    runtimeReloadDoneByConversation.value = { ...runtimeReloadDoneByConversation.value, [conversationId]: false }
+    incrementLoading(conversationId)
+    await nextTick()
+    scrollToBottom(true)
+    try {
+      await axios.post(`/api/chat/conversations/${conversationId}/messages`, { content: displayContent })
+      fetchQueueStatus(conversationId)
+      const response = await axios.post(`/api/chat/multi-agent/${conversationId}/dispatch`, {
+        message: content,
+        model: selectedModel.value || null,
+        mode: agentMode.value || 'agent',
+        project_dir: currentProjectDir.value || null,
+      })
+      assistantMessage.content = response.data?.data?.content || '多Agent任务已完成。'
+      assistantMessage.streaming = false
+      runtimeReloadDoneByConversation.value = { ...runtimeReloadDoneByConversation.value, [conversationId]: 'pending' }
+      await loadMultiAgentMembers()
+      await loadConversations()
+    } catch (error) {
+      assistantMessage.content = '多Agent任务分配失败，请检查成员对话和 OpenCode 连接。'
+      assistantMessage.streaming = false
+      ElMessage.error('多Agent任务分配失败')
+    } finally {
+      decrementLoading(conversationId)
+      await nextTick()
+      scrollToBottom(true)
+    }
+    return
+  }
 
   // If already loading, still save locally and send to queue
   if (isLoading) {
@@ -1991,6 +2096,26 @@ const deleteConversation = async (conversationId) => {
   }
 }
 
+const clearConversation = async (conversationId) => {
+  try {
+    await ElMessageBox.confirm('确定清空这个对话的全部消息吗？对话入口会保留。', '清空对话', {
+      confirmButtonText: '清空',
+      cancelButtonText: '取消',
+      type: 'warning'
+    })
+    await axios.post(`/api/chat/conversations/${conversationId}/clear`, { confirm: true })
+    if (currentConversationId.value === conversationId) {
+      messages.value = []
+    }
+    await loadConversations()
+    ElMessage.success('对话内容已清空')
+  } catch (error) {
+    if (error !== 'cancel') {
+      ElMessage.error('清空对话失败')
+    }
+  }
+}
+
 const renameConversation = async (conversationId, currentTitle) => {
   try {
     const result = await ElMessageBox.prompt('输入新的对话标题', '重命名', {
@@ -2039,13 +2164,24 @@ const archiveConversation = async (conversationId) => {
   }
 }
 
-const startGroupConversation = async (conversationId) => {
+const setGroupConversation = async (conversationId, isGroup) => {
   try {
-    await axios.post(`/api/chat/conversations/${conversationId}/group`, { is_group: true })
+    let groupRole = null
+    if (isGroup) {
+      const conv = conversations.value.find((item) => item.id === conversationId)
+      const result = await ElMessageBox.prompt('请输入这个 Agent 在群聊中的角色，例如：前端、后端、数据库、测试', '加入多Agent群聊', {
+        confirmButtonText: '加入',
+        cancelButtonText: '取消',
+        inputValue: conv?.group_role || conv?.title || ''
+      })
+      groupRole = result.value?.trim() || conv?.title || 'Agent'
+    }
+    await axios.post(`/api/chat/conversations/${conversationId}/group`, { is_group: isGroup, group_role: groupRole })
     await loadConversations()
-    ElMessage.success('群聊已开启')
+    await loadMultiAgentMembers()
+    ElMessage.success(isGroup ? '已加入多Agent群聊' : '已退出多Agent群聊')
   } catch (error) {
-    ElMessage.error('开启群聊失败')
+    if (error !== 'cancel') ElMessage.error(isGroup ? '加入多Agent群聊失败' : '退出多Agent群聊失败')
   }
 }
 
@@ -2053,9 +2189,14 @@ const shareConversation = async (conversationId) => {
   try {
     const response = await axios.post(`/api/chat/conversations/${conversationId}/share`)
     const sharePath = response.data.data.share_path
-    const shareUrl = `${window.location.origin}${sharePath}`
+    let baseUrl = window.location.origin
+    try {
+      const info = await axios.get('/api/network-info')
+      baseUrl = info.data?.lan_url || baseUrl
+    } catch {}
+    const shareUrl = `${baseUrl}${sharePath}`
     await copyToClipboard(shareUrl)
-    ElMessage.success('分享链接已复制')
+    ElMessage.success('局域网分享链接已复制')
   } catch (error) {
     ElMessage.error('生成分享链接失败')
   }
@@ -2063,11 +2204,13 @@ const shareConversation = async (conversationId) => {
 
 const handleConversationCommand = async (conv, command) => {
   if (command === 'share') { await shareConversation(conv.id); return }
-  if (command === 'group') { await startGroupConversation(conv.id); return }
+  if (command === 'group') { await setGroupConversation(conv.id, true); return }
+  if (command === 'ungroup') { await setGroupConversation(conv.id, false); return }
   if (command === 'rename') { await renameConversation(conv.id, conv.title); return }
   if (command === 'pin') { await togglePinConversation(conv.id, true); return }
   if (command === 'unpin') { await togglePinConversation(conv.id, false); return }
   if (command === 'archive') { await archiveConversation(conv.id); return }
+  if (command === 'clear') { await clearConversation(conv.id); return }
   if (command === 'delete') { await deleteConversation(conv.id) }
 }
 
@@ -2307,6 +2450,23 @@ onUnmounted(() => {
   color: #409EFF;
 }
 
+.conversation-item.multi-agent-hub-item {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: linear-gradient(135deg, #1f2937, #4338ca);
+  color: #fff;
+  box-shadow: 0 8px 18px rgba(67, 56, 202, 0.22);
+}
+
+.conversation-item.multi-agent-hub-item .conversation-time {
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.conversation-item.multi-agent-hub-item.active {
+  background: linear-gradient(135deg, #111827, #2563eb);
+}
+
 .conversation-info {
   flex: 1;
   min-width: 0;
@@ -2356,6 +2516,25 @@ onUnmounted(() => {
   border-bottom: 1px solid #e4ecff;
   color: #3f5873;
   font-size: 13px;
+}
+
+.multi-agent-members {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 16px;
+  background: #f8fafc;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.refresh-members-btn {
+  margin-left: auto;
+}
+
+.empty-members {
+  font-size: 12px;
+  color: #909399;
 }
 
 .message-list {
