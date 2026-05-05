@@ -3,4 +3,4 @@ Codebot Backend
 基于 OpenCode 的个人 AI 助手
 """
 
-__version__ = "3.4.0"
+__version__ = "3.5.0"
