@@ -25,6 +25,7 @@ class LoadConfigFromPathRequest(BaseModel):
 
 
 class GeneralConfigUpdateRequest(BaseModel):
+    language: Optional[str] = None
     link_open_mode: Optional[str] = None
     file_storage_path: Optional[str] = None
     file_search_dirs: Optional[List[str]] = None
@@ -146,6 +147,10 @@ async def update_general_config(request: GeneralConfigUpdateRequest):
     """更新通用配置"""
     try:
         updates = request.model_dump(exclude_unset=True)
+        # 验证 language
+        if "language" in updates:
+            if updates["language"] not in ("zh-CN", "en-US"):
+                raise HTTPException(status_code=400, detail="language 仅支持 'zh-CN' 或 'en-US'")
         # 验证 link_open_mode
         if "link_open_mode" in updates:
             if updates["link_open_mode"] not in ("system", "builtin"):

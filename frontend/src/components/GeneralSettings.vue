@@ -195,8 +195,21 @@ const activeConfigPath = ref('')
 const importConfigPath = ref('')
 const importLoading = ref(false)
 
-const save = () => {
-  ElMessage.success('设置已保存')
+const save = async () => {
+  try {
+    const res = await fetch('/api/config/general', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ language: form.value.language || 'zh-CN' })
+    })
+    const json = await res.json()
+    if (!res.ok || !json?.success) {
+      throw new Error(json?.detail || json?.message || `HTTP ${res.status}`)
+    }
+    ElMessage.success('设置已保存')
+  } catch (e) {
+    ElMessage.error(`保存失败：${e.message}`)
+  }
 }
 
 const loadGeneralConfig = async () => {
@@ -205,6 +218,7 @@ const loadGeneralConfig = async () => {
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const json = await res.json()
     if (json?.success && json?.data) {
+      form.value.language = json.data.language || 'zh-CN'
       generalForm.value.link_open_mode = json.data.link_open_mode || 'system'
       generalForm.value.file_storage_path = json.data.file_storage_path || ''
       generalForm.value.file_search_dirs = json.data.file_search_dirs || []

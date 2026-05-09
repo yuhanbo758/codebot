@@ -45,7 +45,7 @@
           </el-button>
         </div>
       </div>
-      <div class="skills-subtitle">管理 Codebot 的技能。调用优先级为自动生成、内置、外部兼容目录、OpenCode。Codebot 技能仅供 Codebot 使用，不再默认同步到 OpenCode CLI。</div>
+      <div class="skills-subtitle">管理 Codebot 的技能。调用优先级为自动生成、内置、外部兼容目录、OpenClaw、OpenCode。Codebot 技能仅供 Codebot 使用，不再默认同步到 OpenCode CLI。</div>
     </div>
 
     <!-- 可滚动表格区域 -->
@@ -88,7 +88,7 @@
               <el-button size="small" type="danger" plain @click="deleteSkill(row)" :loading="row.deleting">删除</el-button>
             </template>
             <!-- custom: 外部目录只读 -->
-            <el-text v-else-if="row.id?.startsWith('custom:') || row.id?.startsWith('external:')" type="info" size="small">外部只读</el-text>
+            <el-text v-else-if="row.id?.startsWith('custom:') || row.id?.startsWith('external:') || row.id?.startsWith('openclaw:')" type="info" size="small">外部只读</el-text>
             <el-text v-else-if="row.id?.startsWith('opencode:')" type="info" size="small">OpenCode 管理</el-text>
             <!-- opencode: / 普通 JSON 技能 -->
             <template v-else>
@@ -247,11 +247,11 @@ const editForm = ref({ id: '', content: '' })
 /**
  * 支持编辑的技能类型：
  *  - builtin: / auto: / opencode: → SKILL.md 全文编辑
- *  - custom:                      → 外部目录只读
+ *  - custom/openclaw:             → 外部目录只读
  *  - 普通 JSON（source=chat）     → 也走全文编辑（content 为空时可填写）
  */
 const isEditable = (row) => {
-  if (row.id?.startsWith('custom:') || row.id?.startsWith('external:')) return false   // 外部目录只读
+  if (row.id?.startsWith('custom:') || row.id?.startsWith('external:') || row.id?.startsWith('openclaw:')) return false   // 外部目录只读
   if (row.id?.startsWith('opencode:')) return false // OpenCode 技能由 OpenCode CLI 管理
   if (row.id?.startsWith('builtin:')) return true
   if (row.id?.startsWith('auto:')) return true
@@ -338,11 +338,13 @@ const sourceLabel = (row) => {
   if (row?.source === 'auto_generated') return '自动生成'
   if (row?.source === 'builtin') return '内置'
   if (row?.source === 'external') return '外部兼容'
+  if (row?.source === 'openclaw') return 'OpenClaw'
   if (row?.source === 'opencode') return 'OpenCode'
   if (!id) return '自定义'
   if (id.startsWith('builtin:')) return '内置'
   if (id.startsWith('auto:')) return '自动生成'
   if (id.startsWith('opencode:')) return 'OpenCode'
+  if (id.startsWith('openclaw:')) return 'OpenClaw'
   if (id.startsWith('custom:') || id.startsWith('external:')) return '外部兼容'
   return '自定义'
 }
@@ -351,7 +353,7 @@ const sourceTagType = (source) => {
   if (source === 'builtin') return 'warning'
   if (source === 'auto' || source === 'auto_generated') return 'success'
   if (source === 'opencode') return 'info'
-  if (source === 'custom' || source === 'external') return ''
+  if (source === 'custom' || source === 'external' || source === 'openclaw') return ''
   return 'primary'
 }
 

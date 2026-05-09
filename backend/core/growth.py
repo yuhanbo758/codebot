@@ -153,7 +153,7 @@ def record_chat_growth_candidates(user_message: str, assistant_response: str, co
             title="可能需要沉淀为技能",
             content=answer[:3000],
             confidence=0.85 if explicit_skill else 0.65,
-            payload={"user_message": user, "conversation_id": conversation_id},
+            payload={"user_message": user, "assistant_response": answer[:6000], "conversation_id": conversation_id},
             evidence=user[:1000],
         )
         if item:

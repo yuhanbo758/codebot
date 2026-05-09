@@ -454,7 +454,7 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
         try:
             # _materialize_reusable_skill 内部已做 _should_materialize_skill 判断
             # 以及全量技能查重（包含 opencode/builtin/custom），无需额外检查
-            materialized = chat_router._materialize_reusable_skill(
+            materialized = await chat_router._materialize_reusable_skill(
                 user_message=user_text,
                 assistant_response=assistant_text,
                 conversation_id=conv_id,

@@ -1584,19 +1584,12 @@ async def _call_codebot_tool(name: str, arguments: dict) -> dict:
 
 
 def _read_skill_content_by_id(skill_id: str) -> Optional[str]:
-    if skill_id.startswith("builtin:"):
-        slug = skill_id.split(":", 1)[1]
-        path = settings.SKILLS_DIR / slug / "SKILL.md"
-        return path.read_text(encoding="utf-8") if path.exists() else None
-    if skill_id.startswith("opencode:"):
-        slug = skill_id.split(":", 1)[1]
-        path = Path.home() / ".agents" / "skills" / slug / "SKILL.md"
-        return path.read_text(encoding="utf-8") if path.exists() else None
-    if skill_id.startswith("custom:"):
-        body = skill_id[len("custom:"):]
-        raw_path, slug = body.rsplit(":", 1)
-        path = Path(raw_path) / slug / "SKILL.md"
-        return path.read_text(encoding="utf-8") if path.exists() else None
+    try:
+        from core.skill_registry import get_skill_registry
+
+        return get_skill_registry().read_content(skill_id)
+    except Exception:
+        pass
     return None
 
 

@@ -25,7 +25,20 @@ from core.memory_manager import MemoryManager
 from core.opencode_ws import OpenCodeClient, _conversation_current_session, is_conversation_running, mark_conversation_running, unmark_conversation_running
 from core.memory_extractor import extract_and_save_background
 from core.growth import record_chat_growth_candidates
-from core.skill_registry import AUTO_GENERATED, BUILTIN, EXTERNAL, OPENCODE, get_skill_registry, write_auto_skill_md
+from core.skill_generator import generate_skill_body_from_chat
+from core.skill_registry import (
+    AUTO_GENERATED,
+    BUILTIN,
+    EXTERNAL,
+    OPENCLAW,
+    OPENCODE,
+    capture_opencode_skill_snapshot,
+    get_skill_registry,
+    migrate_new_opencode_skills_to_codebot,
+    migrate_skill_dir_to_codebot_auto,
+    opencode_skill_dirs,
+    write_auto_skill_md,
+)
 from api.routes import scheduler as scheduler_router
 from api.routes import mcp as mcp_router
 from utils.installer import start_opencode_server
@@ -85,6 +98,118 @@ _task_queues: dict = {}
 _queue_runners: dict = {}  # key=conversation_id -> asyncio.Task
 _runtime_stream_state: Dict[str, Dict[str, Any]] = {}
 _multi_agent_dispatch_state: Dict[str, Dict[str, Any]] = {}
+
+
+def _configured_reply_language() -> str:
+    language = (getattr(app_config.general, "language", "") or "zh-CN").strip()
+    return language if language in {"zh-CN", "en-US"} else "zh-CN"
+
+
+def _reply_language_instruction() -> str:
+    if _configured_reply_language() == "en-US":
+        return "Default to English for user-facing replies unless the user explicitly asks for another language."
+    return "默认使用简体中文回复用户，除非用户明确要求使用其他语言。"
+
+
+def _looks_like_skill_creation_intent(message: str) -> bool:
+    text = re.sub(r"\s+", " ", (message or "").strip())
+    if not text:
+        return False
+    lower = text.lower()
+    if "skill-creator" in lower:
+        return True
+    has_skill_term = bool(re.search(r"(?<![a-z0-9_])skills?(?![a-z0-9_])|skill\.md|技能|能力", lower, flags=re.IGNORECASE))
+    if not has_skill_term:
+        return False
+    use_only = re.search(r"(?:调用|使用|运行|执行|invoke|call|run|use)\s*(?:一个|这个|该)?\s*(?:skills?|技能)", lower, flags=re.IGNORECASE)
+    create_near_skill = re.search(
+        r"(?:创建|新建|生成|制作|写(?:一个|个)?|做成|沉淀|固化|保存(?:为|成)?|转(?:为|成)|提炼|提取|create|generate|make|write|save|materialize|scaffold)"
+        r".{0,24}(?:skills?|skill\.md|技能|能力)",
+        lower,
+        flags=re.IGNORECASE,
+    ) or re.search(
+        r"(?:skills?|skill\.md|技能|能力).{0,24}"
+        r"(?:创建|新建|生成|制作|写|做成|沉淀|固化|保存|转(?:为|成)|提炼|提取|create|generate|make|write|save|materialize|scaffold)",
+        lower,
+        flags=re.IGNORECASE,
+    )
+    return bool(create_near_skill and not use_only)
+
+
+def _migrate_opencode_skill_refs_from_reply(assistant_response: str) -> List[Dict[str, Any]]:
+    text = (assistant_response or "").replace("/", "\\")
+    if not text:
+        return []
+    migrated: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    candidate_dirs: List[Path] = []
+
+    for root in opencode_skill_dirs():
+        root_text = str(root).replace("/", "\\")
+        pattern = re.escape(root_text.rstrip("\\")) + r"\\+([^\\\r\n\"'`<>|]+)"
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            slug = (match.group(1) or "").strip().strip(" .。；;，,")
+            if slug:
+                candidate_dirs.append(root / slug)
+
+    for match in re.finditer(r"(?:^|[\\\s])\.agents\\skills\\([^\\\r\n\"'`<>|]+)", text, flags=re.IGNORECASE):
+        slug = (match.group(1) or "").strip().strip(" .。；;，,")
+        if slug:
+            for root in opencode_skill_dirs():
+                if root.name.lower() == "skills":
+                    candidate_dirs.append(root / slug)
+
+    for skill_dir in candidate_dirs:
+        try:
+            key = str(skill_dir.resolve()).lower()
+        except Exception:
+            key = str(skill_dir).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        item = migrate_skill_dir_to_codebot_auto(skill_dir, move=True)
+        if not item:
+            slug_base = re.sub(r"[^a-z0-9_]+", "_", skill_dir.name.strip().lower().replace("-", "_").replace(" ", "_"))
+            slug_base = re.sub(r"_+", "_", slug_base).strip("_")
+            auto_slug = f"auto_{slug_base}" if slug_base and not slug_base.startswith("auto_") else slug_base
+            if auto_slug:
+                registry = get_skill_registry()
+                for existing_dir in settings.SKILLS_DIR.glob(f"{auto_slug}*"):
+                    if existing_dir.is_dir() and (existing_dir / "SKILL.md").exists():
+                        item = registry.find(f"auto:{existing_dir.name}")
+                        if item:
+                            break
+        if item:
+            item["migration_reason"] = "codebot_reply_skill_path"
+            migrated.append(item)
+    if migrated:
+        logger.info(f"[skill] 已按助手回复中的 OpenCode skill 路径迁移 {len(migrated)} 个技能")
+    return migrated
+
+
+def _begin_codebot_skill_creation_watch(message: str) -> Optional[Dict[str, Any]]:
+    if not _looks_like_skill_creation_intent(message):
+        return None
+    import time
+
+    return {
+        "snapshot": capture_opencode_skill_snapshot(),
+        "since": time.time(),
+        "message": message,
+    }
+
+
+def _finish_codebot_skill_creation_watch(context: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not context:
+        return []
+    migrated = migrate_new_opencode_skills_to_codebot(
+        snapshot=context.get("snapshot") or {},
+        since=context.get("since"),
+        reason="codebot_chat_skill_creation",
+    )
+    if migrated:
+        logger.info(f"[skill] Codebot 聊天已迁移 {len(migrated)} 个 OpenCode 生成技能到 Codebot skills")
+    return migrated
 
 
 class MessageRequest(BaseModel):
@@ -289,6 +414,8 @@ async def _run_chat_post_processing(
     assistant_response: str,
     conversation_id: Optional[int] = None,
 ) -> None:
+    skill_creation_intent = _looks_like_skill_creation_intent(user_message)
+    migrated_skills: List[Dict[str, Any]] = []
     try:
         await extract_and_save_background(
             user_message=user_message,
@@ -304,12 +431,29 @@ async def _run_chat_post_processing(
     except Exception as exc:
         logger.debug(f"后台定时任务沉淀失败: {exc}")
 
+    if skill_creation_intent:
+        try:
+            migrated_skills.extend(_migrate_opencode_skill_refs_from_reply(assistant_response))
+            if not migrated_skills:
+                import time
+
+                migrated_skills.extend(
+                    migrate_new_opencode_skills_to_codebot(
+                        snapshot=None,
+                        since=time.time() - 600,
+                        reason="codebot_post_processing_recent_skill",
+                    )
+                )
+        except Exception as exc:
+            logger.debug(f"后台 OpenCode skill 迁移兜底失败: {exc}")
+
     try:
-        _materialize_reusable_skill(
-            user_message=user_message,
-            assistant_response=assistant_response,
-            conversation_id=conversation_id,
-        )
+        if not (skill_creation_intent and migrated_skills):
+            await _materialize_reusable_skill(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                conversation_id=conversation_id,
+            )
     except Exception as exc:
         logger.debug(f"后台技能沉淀失败: {exc}")
 
@@ -353,11 +497,25 @@ async def _auto_apply_growth_candidates(
                 from core.growth import ACCEPTED, mark_candidate
                 mark_candidate(candidate_id, ACCEPTED)
             elif kind == "skill":
+                source_user_message = payload.get("user_message") or user_message
+                source_assistant_response = (
+                    payload.get("assistant_response")
+                    or candidate.get("content")
+                    or assistant_response
+                    or ""
+                )
+                skill_body = await generate_skill_body_from_chat(
+                    user_message=source_user_message,
+                    assistant_response=_sanitize_assistant_output(source_assistant_response),
+                    title=candidate.get("title") or generate_conversation_title(user_message or "自动技能"),
+                    description=(candidate.get("evidence") or user_message or "")[:180],
+                    opencode_client=opencode_ws if opencode_ws and getattr(opencode_ws, "connected", False) else None,
+                )
                 item = get_skill_registry().create_auto_skill(
                     name=candidate.get("title") or generate_conversation_title(user_message or "自动技能"),
                     description=(candidate.get("evidence") or user_message or "")[:180],
-                    body=_sanitize_assistant_output(candidate.get("content") or assistant_response or ""),
-                    user_message=payload.get("user_message") or user_message,
+                    body=skill_body,
+                    user_message=source_user_message,
                 )
                 logger.info(f"[growth] 自动沉淀技能: {item.get('slug')}")
                 from core.growth import ACCEPTED, mark_candidate
@@ -1041,15 +1199,19 @@ async def _execute_opencode(message: str, model: Optional[str] = None, mode: Opt
     except Exception as _sync_err:
         logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
 
+    skill_watch = _begin_codebot_skill_creation_watch(message)
     # 系统指令通过独立 system 字段传递，用户消息保持纯净
     system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode, project_dir=project_dir)
-    content, _ = await _execute_opencode_client(user_message, model=model, mode=mode, conversation_id=conversation_id, system=system_prompt, user_message=message)
-    content = _sanitize_assistant_output(content or "", user_message=message)
+    try:
+        content, _ = await _execute_opencode_client(user_message, model=model, mode=mode, conversation_id=conversation_id, system=system_prompt, user_message=message)
+        content = _sanitize_assistant_output(content or "", user_message=message)
 
-    if not content:
-        content = "OpenCode 未连接，请先启动本地 opencode server 或检查 server_url 配置"
+        if not content:
+            content = "OpenCode 未连接，请先启动本地 opencode server 或检查 server_url 配置"
 
-    return content
+        return content
+    finally:
+        _finish_codebot_skill_creation_watch(skill_watch)
 
 
 async def _execute_opencode_with_meta(
@@ -1064,23 +1226,27 @@ async def _execute_opencode_with_meta(
     except Exception as _sync_err:
         logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
 
+    skill_watch = _begin_codebot_skill_creation_watch(message)
     # 系统指令通过独立 system 字段传递，用户消息保持纯净
     system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode, project_dir=project_dir)
-    content, _, parts = await _execute_opencode_client_with_parts(
-        user_message,
-        model=model,
-        mode=mode,
-        conversation_id=conversation_id,
-        system=system_prompt,
-        user_message=message
-    )
-    content = _sanitize_assistant_output(content or "", user_message=message)
+    try:
+        content, _, parts = await _execute_opencode_client_with_parts(
+            user_message,
+            model=model,
+            mode=mode,
+            conversation_id=conversation_id,
+            system=system_prompt,
+            user_message=message
+        )
+        content = _sanitize_assistant_output(content or "", user_message=message)
 
-    if not content:
-        content = "OpenCode 未连接，请先启动本地 opencode server 或检查 server_url 配置"
-        return content, []
+        if not content:
+            content = "OpenCode 未连接，请先启动本地 opencode server 或检查 server_url 配置"
+            return content, []
 
-    return content, parts or []
+        return content, parts or []
+    finally:
+        _finish_codebot_skill_creation_watch(skill_watch)
 
 
 async def _stream_execute_opencode_with_meta(
@@ -1095,6 +1261,7 @@ async def _stream_execute_opencode_with_meta(
     except Exception as _sync_err:
         logger.debug(f"[Codebot] 第三方能力同步失败（跳过）: {_sync_err}")
 
+    skill_watch = _begin_codebot_skill_creation_watch(message)
     # 系统指令通过独立 system 字段传递，用户消息保持纯净
     system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode, project_dir=project_dir)
     # 首先 yield 内部提示词事件，供聊天日志记录
@@ -1119,6 +1286,7 @@ async def _stream_execute_opencode_with_meta(
         ):
             yield event
     finally:
+        _finish_codebot_skill_creation_watch(skill_watch)
         if created_client and client and getattr(client, "connected", False):
             try:
                 await client.disconnect()
@@ -1781,6 +1949,7 @@ async def _try_answer_from_semantic_memory(message: str) -> Optional[str]:
 
 def _build_autonomous_execution_policy(mode: Optional[str] = None) -> List[str]:
     lines = [
+        _reply_language_instruction(),
         "请自主决策并持续执行，不要把流程决策反问给用户；遇到可恢复问题时优先自行切换替代方案。",
         "当前聊天由 OpenCode 统一处理；Codebot Desktop 作为能力面板，向你提供记忆、定时任务、技能与 MCP 工具。",
         "除非用户明确询问架构细节，否则不要在最终回答中解释内部桥接、同步或上下文包装。",
@@ -1976,11 +2145,17 @@ async def _build_opencode_prompt_parts(message: str, mode: Optional[str] = None,
     # ── 构建 system prompt（仅含系统指令，不含用户消息）─────────────────────
     system_lines: List[str] = ["你正在 OpenCode 中处理用户消息。"]
     system_lines.extend(policy_lines)
+    if _looks_like_skill_creation_intent(raw_message):
+        system_lines.append(
+            "本轮消息来自 Codebot 聊天，且用户有创建、生成、保存或沉淀 skill 的意图。"
+            "如果需要创建技能，请仍按 OpenCode 原有 skill-creator/agent-skill 逻辑完成，"
+            "但不要把 skill 保存到用户的文件存储路径；Codebot 会在任务结束后把本轮新生成的 skill 迁移为 Codebot 的自动生成技能。"
+        )
     if has_any:
         system_lines.append("以下是与当前问题相关的用户记忆，请在回答中参考；若与用户本轮消息冲突，以用户本轮消息为准。")
         system_lines.extend(memory_lines)
 
-    if selected_skill and selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL}:
+    if selected_skill and selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, OPENCLAW}:
         system_lines.append(_build_skill_system_context(selected_skill))
 
     # ── 注入文件存储/项目目录（项目目录优先）──────────────────────────────
@@ -2224,7 +2399,7 @@ def _skill_name_similar(a: str, b: str) -> bool:
     return overlap >= 0.6
 
 
-def _materialize_reusable_skill(user_message: str, assistant_response: str, conversation_id: Optional[int] = None) -> bool:
+async def _materialize_reusable_skill(user_message: str, assistant_response: str, conversation_id: Optional[int] = None) -> bool:
     cleaned_response = _sanitize_assistant_output(assistant_response or "")
     if not _should_materialize_skill(user_message, cleaned_response, conversation_id=conversation_id):
         return False
@@ -2258,7 +2433,14 @@ def _materialize_reusable_skill(user_message: str, assistant_response: str, conv
             slug = skill_id.split(":", 1)[1].strip()
             skill_md = settings.SKILLS_DIR / slug / "SKILL.md"
             if skill_md.exists():
-                _write_auto_skill_md(skill_md, new_name, desc, user_message, cleaned_response)
+                skill_body = await generate_skill_body_from_chat(
+                    user_message=user_message,
+                    assistant_response=cleaned_response,
+                    title=new_name,
+                    description=desc,
+                    opencode_client=opencode_ws if opencode_ws and getattr(opencode_ws, "connected", False) else None,
+                )
+                _write_auto_skill_md(skill_md, new_name, desc, user_message, skill_body)
                 logger.info(f"升级已有自动技能: {slug}")
                 return True
         # 对于其他类型（builtin/opencode/custom），不覆盖，仅跳过
@@ -2271,10 +2453,17 @@ def _materialize_reusable_skill(user_message: str, assistant_response: str, conv
     digest = hashlib.sha1(f"{user_message}\n{cleaned_response[:300]}".encode("utf-8")).hexdigest()[:8]
     slug_base = re.sub(r"[^a-z0-9_]", "_", title[:20].lower().replace(" ", "_"))
     slug_base = re.sub(r"_+", "_", slug_base).strip("_") or "auto"
+    skill_body = await generate_skill_body_from_chat(
+        user_message=user_message,
+        assistant_response=cleaned_response,
+        title=new_name,
+        description=desc,
+        opencode_client=opencode_ws if opencode_ws and getattr(opencode_ws, "connected", False) else None,
+    )
     item = get_skill_registry().create_auto_skill(
         name=new_name,
         description=desc,
-        body=cleaned_response,
+        body=skill_body,
         user_message=user_message,
         slug_hint=f"{slug_base}_{digest}",
     )
@@ -2286,61 +2475,32 @@ async def _async_create_skill_via_opencode(session_id: str, prompt: str) -> None
     """异步通过 OpenCode 的 skill-creator 技能创建新技能。"""
     try:
         if opencode_ws and getattr(opencode_ws, "connected", False):
+            snapshot = capture_opencode_skill_snapshot()
+            import time
+            started_at = time.time()
             await opencode_ws.send_message(
                 session_id=session_id,
                 message=prompt,
             )
             logger.info(f"[skill] skill-creator 异步任务完成: {session_id}")
-            # 后置检查：如果 skill-creator 错误地将文件保存到 ~/.agents/skills/，
-            # 将其移动到 codebot 的 skills/ 目录
-            await _rescue_misplaced_skills()
+            migrate_new_opencode_skills_to_codebot(
+                snapshot=snapshot,
+                since=started_at,
+                reason="codebot_async_skill_creator",
+            )
     except Exception as exc:
         logger.warning(f"[skill] skill-creator 异步任务失败: {exc}")
 
 
 async def _rescue_misplaced_skills() -> None:
-    """检查 ~/.agents/skills/ 中是否有最近创建的非 codebot- 前缀的技能目录，
-    如果是由 codebot 的 skill-creator 调用产生的，将其移动到 codebot 的 skills/ 目录。"""
-    import shutil
+    """Best-effort migration for recently created OpenCode skills."""
     import time
-    oc_skills = Path.home() / ".agents" / "skills"
-    if not oc_skills.exists():
-        return
-    codebot_skills = settings.SKILLS_DIR
-    codebot_skills.mkdir(parents=True, exist_ok=True)
-    now = time.time()
-    for entry in oc_skills.iterdir():
-        if not entry.is_dir():
-            continue
-        # 跳过 codebot- 前缀的目录（这些是同步过去的）
-        if entry.name.startswith("codebot-"):
-            continue
-        skill_md = entry / "SKILL.md"
-        if not skill_md.exists():
-            continue
-        # 只检查最近 60 秒内创建的目录（大概率是刚被 skill-creator 创建的）
-        try:
-            mtime = skill_md.stat().st_mtime
-            if now - mtime > 60:
-                continue
-        except Exception:
-            continue
-        # 检查名称是否包含"自动技能"标记，说明是 codebot 触发的
-        try:
-            content = skill_md.read_text(encoding="utf-8")
-            if "自动技能" not in content:
-                continue
-        except Exception:
-            continue
-        # 移动到 codebot 的 skills/ 目录
-        dest = codebot_skills / entry.name
-        if dest.exists():
-            continue  # 已存在则跳过
-        try:
-            shutil.move(str(entry), str(dest))
-            logger.info(f"[skill] 已将误放的技能从 {entry} 移动到 {dest}")
-        except Exception as e:
-            logger.warning(f"[skill] 移动误放技能失败: {e}")
+
+    migrate_new_opencode_skills_to_codebot(
+        snapshot=None,
+        since=time.time() - 60,
+        reason="codebot_recent_skill_rescue",
+    )
 
 
 def _write_auto_skill_md(skill_md_path, name: str, description: str,
@@ -2826,24 +2986,36 @@ async def generate_skill_from_conversation(
         if not messages:
             raise HTTPException(status_code=404, detail="对话不存在或无消息")
 
-        skill_id = uuid4().hex
         generated = _build_skill_from_conversation(messages, request)
-        skill = {
-            "id": skill_id,
-            "name": generated.get("name"),
-            "description": generated.get("description"),
-            "version": generated.get("version"),
-            "source": generated.get("source"),
-            "enabled": generated.get("enabled"),
-            "installed_at": datetime.now().isoformat()
-        }
-        _write_skill(skill_id, skill)
+        user_material = "\n\n".join(
+            str(item.get("content") or "").strip()
+            for item in messages
+            if item.get("role") == "user" and str(item.get("content") or "").strip()
+        )
+        assistant_material = "\n\n".join(
+            str(item.get("content") or "").strip()
+            for item in messages
+            if item.get("role") == "assistant" and str(item.get("content") or "").strip()
+        )
+        body = await generate_skill_body_from_chat(
+            user_message=user_material,
+            assistant_response=assistant_material,
+            title=generated.get("name") or "对话技能",
+            description=generated.get("description") or "",
+            opencode_client=opencode_ws if opencode_ws and getattr(opencode_ws, "connected", False) else None,
+        )
+        skill = get_skill_registry().create_auto_skill(
+            name=generated.get("name") or "对话技能",
+            description=generated.get("description") or "",
+            body=body,
+            user_message=user_material,
+        )
 
 
         return {
             "success": True,
             "data": skill,
-            "message": "技能已生成"
+            "message": "技能已生成到 Codebot 自动生成技能目录"
         }
     except HTTPException:
         raise

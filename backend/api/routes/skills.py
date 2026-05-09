@@ -17,6 +17,7 @@ from core.skill_registry import (
     AUTO_GENERATED,
     BUILTIN,
     EXTERNAL,
+    OPENCLAW,
     OPENCODE,
     SOURCE_LABELS,
     get_skill_registry,
@@ -162,7 +163,7 @@ def _sync_skill_to_opencode(skill_dir_name: str) -> bool:
 
 
 def _source_is_read_only(source: str) -> bool:
-    return source in {EXTERNAL, OPENCODE}
+    return source in {EXTERNAL, OPENCLAW, OPENCODE}
 
 
 def _slug_from_description(description: str) -> str:
@@ -217,7 +218,7 @@ async def generate_skill(request: SkillGenerateRequest):
             result = await client.execute_task(prompt, timeout=60)
             if result.success and result.content:
                 body = result.content.strip()
-        await client.close()
+        await client.disconnect()
     except Exception:
         body = ""
 
@@ -265,7 +266,7 @@ async def batch_delete_skills(request: BatchDeleteRequest):
             if source == AUTO_GENERATED:
                 registry.delete_auto_skill(skill_id)
                 results["success"].append(skill_id)
-            elif source in {BUILTIN, EXTERNAL, OPENCODE}:
+            elif source in {BUILTIN, EXTERNAL, OPENCLAW, OPENCODE}:
                 results["skipped"].append(skill_id)
             else:
                 path = _skill_path(skill_id)
@@ -382,7 +383,7 @@ async def update_skill_content(skill_id: str, request: SkillContentUpdateRequest
 async def update_skill(skill_id: str, request: SkillUpdateRequest):
     skill_id = _decode_skill_id(skill_id)
     item = get_skill_registry().find(skill_id)
-    if item and item.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, OPENCODE}:
+    if item and item.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, OPENCLAW, OPENCODE}:
         raise HTTPException(status_code=400, detail="该技能类型请通过 SKILL.md 或原工具管理")
     path = _skill_path(skill_id)
     if not path.exists():
@@ -411,6 +412,8 @@ async def delete_skill(skill_id: str):
             raise HTTPException(status_code=400, detail="内置技能不支持卸载")
         if source == EXTERNAL:
             raise HTTPException(status_code=400, detail="外部兼容目录技能为只读，请在设置中移除对应目录")
+        if source == OPENCLAW:
+            raise HTTPException(status_code=400, detail="OpenClaw 技能为只读，请在 OpenClaw/StepClaw 中管理")
         if source == OPENCODE:
             raise HTTPException(status_code=400, detail="OpenCode 技能由 OpenCode CLI 管理，Codebot 不再直接卸载")
 

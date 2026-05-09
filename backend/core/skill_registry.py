@@ -7,12 +7,15 @@ Codebot owns two writable skill classes:
 
 External skill stores are read-only from Codebot:
   - external: configured Hermes/OpenClaw/custom compatible directories
+  - openclaw: default OpenClaw/StepClaw skill directories such as ~/.stepclaw/skills
   - opencode: OpenCode CLI skills in ~/.agents/skills
 """
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -26,12 +29,14 @@ from config import app_config, settings
 AUTO_GENERATED = "auto_generated"
 BUILTIN = "builtin"
 EXTERNAL = "external"
+OPENCLAW = "openclaw"
 OPENCODE = "opencode"
 
 SOURCE_LABELS = {
     AUTO_GENERATED: "自动生成",
     BUILTIN: "内置",
     EXTERNAL: "外部兼容",
+    OPENCLAW: "OpenClaw",
     OPENCODE: "OpenCode",
 }
 
@@ -39,6 +44,7 @@ SOURCE_PRIORITY = {
     AUTO_GENERATED: 10,
     BUILTIN: 20,
     EXTERNAL: 30,
+    OPENCLAW: 35,
     OPENCODE: 40,
 }
 
@@ -216,6 +222,212 @@ def _iter_skill_dirs(base_dir: Path, recursive: bool = False) -> Iterable[Path]:
     return matches
 
 
+def _distinct_existing_dirs(candidates: Iterable[Path]) -> List[Path]:
+    result: List[Path] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        try:
+            path = raw.expanduser()
+            if not path.exists() or not path.is_dir():
+                continue
+            key = str(path.resolve()).lower()
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
+
+
+def _default_openclaw_skill_dirs() -> List[Path]:
+    candidates: List[Path] = []
+    for env_name in ["OPENCLAW_HOME", "STEPCLAW_HOME"]:
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            candidates.append(Path(raw) / "skills")
+    candidates.extend([
+        Path.home() / ".stepclaw" / "skills",
+        Path.home() / ".openclaw" / "skills",
+        Path.home() / ".claw" / "skills",
+    ])
+    appdata = os.environ.get("APPDATA", "").strip()
+    if appdata:
+        candidates.extend([
+            Path(appdata) / "OpenClaw" / "skills",
+            Path(appdata) / "StepClaw" / "skills",
+        ])
+    return _distinct_existing_dirs(candidates)
+
+
+def opencode_skill_dirs() -> List[Path]:
+    candidates: List[Path] = [
+        Path.home() / ".agents" / "skills",
+        Path.home() / ".opencode" / "skills",
+        settings.DATA_DIR / "opencode-config" / "skills",
+        settings.DATA_DIR / "opencode-config" / "opencode" / "skills",
+    ]
+    for env_name in ["OPENCODE_SKILLS_DIR", "AGENTS_SKILLS_DIR"]:
+        raw = os.environ.get(env_name, "").strip()
+        if raw:
+            candidates.append(Path(raw))
+    return _distinct_existing_dirs(candidates)
+
+
+def _skill_dir_mtime(skill_dir: Path) -> float:
+    values: List[float] = []
+    skill_md = skill_dir / "SKILL.md"
+    try:
+        values.append(skill_md.stat().st_mtime)
+    except Exception:
+        pass
+    try:
+        values.append(skill_dir.stat().st_mtime)
+    except Exception:
+        pass
+    return max(values) if values else 0.0
+
+
+def capture_opencode_skill_snapshot() -> Dict[str, float]:
+    snapshot: Dict[str, float] = {}
+    for root in opencode_skill_dirs():
+        for entry in _iter_skill_dirs(root):
+            try:
+                key = f"{root.resolve()}::{entry.name}".lower()
+            except Exception:
+                key = f"{root}::{entry.name}".lower()
+            snapshot[key] = _skill_dir_mtime(entry)
+    return snapshot
+
+
+def _split_front_matter(content: str) -> tuple[Dict[str, Any], str]:
+    front = _parse_front_matter(content)
+    if content.startswith("---"):
+        end = content.find("\n---", 3)
+        if end != -1:
+            return front, content[end + 4:].lstrip("\n")
+    return front, content
+
+
+def _ensure_auto_skill_front_matter(skill_md: Path, slug: str) -> None:
+    try:
+        original = skill_md.read_text(encoding="utf-8")
+    except Exception:
+        return
+    info = read_skill_markdown(skill_md) or {}
+    front, body = _split_front_matter(original)
+    name = str(info.get("name") or slug)
+    description = str(info.get("description") or "")
+    version = str(info.get("version") or "1.0.0")
+    created_at = str(front.get("created_at") or datetime.now().isoformat())
+    if not body.strip():
+        body = f"# {name}\n\n## Workflow\n\nDescribe the reusable workflow for this skill.\n"
+    content = f"""---
+name: {_quote_yaml(name)}
+slug: {_quote_yaml(slug)}
+description: {_quote_yaml(description[:180])}
+version: {_quote_yaml(version)}
+source: auto_generated
+compatibility:
+  - codebot
+  - hermes-agent
+  - openclaw
+created_at: {_quote_yaml(created_at)}
+---
+
+{body.lstrip()}
+"""
+    skill_md.write_text(content, encoding="utf-8")
+
+
+def _rewrite_migrated_skill_paths(skill_md: Path, old_dir: Path, new_dir: Path) -> None:
+    try:
+        content = skill_md.read_text(encoding="utf-8")
+    except Exception:
+        return
+    replacements = {
+        str(old_dir): str(new_dir),
+        old_dir.as_posix(): new_dir.as_posix(),
+        str(old_dir).replace("\\", "/"): str(new_dir).replace("\\", "/"),
+    }
+    updated = content
+    for old, new in replacements.items():
+        if old:
+            updated = updated.replace(old, new)
+    if updated != content:
+        skill_md.write_text(updated, encoding="utf-8")
+
+
+def migrate_skill_dir_to_codebot_auto(skill_dir: Path, *, move: bool = True) -> Optional[Dict[str, Any]]:
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_dir.is_dir() or not skill_md.exists():
+        return None
+    try:
+        settings.SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if settings.SKILLS_DIR.resolve() in skill_dir.resolve().parents:
+                return None
+        except Exception:
+            pass
+        slug_base = _slugify(skill_dir.name, fallback="generated_skill")
+        if not slug_base.startswith("auto_"):
+            slug_base = f"auto_{slug_base}"
+        slug = slug_base
+        target = settings.SKILLS_DIR / slug
+        counter = 1
+        while target.exists():
+            slug = f"{slug_base}_{counter}"
+            target = settings.SKILLS_DIR / slug
+            counter += 1
+        if move:
+            shutil.move(str(skill_dir), str(target))
+        else:
+            shutil.copytree(str(skill_dir), str(target))
+        target_skill_md = target / "SKILL.md"
+        _rewrite_migrated_skill_paths(target_skill_md, skill_dir, target)
+        _ensure_auto_skill_front_matter(target_skill_md, slug)
+        logger.info(f"[skills] migrated generated skill to Codebot: {skill_dir} -> {target}")
+        return SkillRegistry().find(f"auto:{slug}") or {
+            "id": f"auto:{slug}",
+            "slug": slug,
+            "source": AUTO_GENERATED,
+            "path": str(target),
+            "skill_md_path": str(target / "SKILL.md"),
+        }
+    except Exception as exc:
+        logger.warning(f"[skills] failed to migrate generated skill {skill_dir}: {exc}")
+        return None
+
+
+def migrate_new_opencode_skills_to_codebot(
+    *,
+    snapshot: Optional[Dict[str, float]] = None,
+    since: Optional[float] = None,
+    reason: str = "",
+) -> List[Dict[str, Any]]:
+    migrated: List[Dict[str, Any]] = []
+    for root in opencode_skill_dirs():
+        for entry in _iter_skill_dirs(root):
+            if entry.name.startswith("codebot-"):
+                continue
+            try:
+                key = f"{root.resolve()}::{entry.name}".lower()
+            except Exception:
+                key = f"{root}::{entry.name}".lower()
+            mtime = _skill_dir_mtime(entry)
+            previous = snapshot.get(key) if snapshot else None
+            if previous is not None and mtime <= previous:
+                continue
+            if previous is None and since is not None and mtime < since:
+                continue
+            item = migrate_skill_dir_to_codebot_auto(entry, move=True)
+            if item:
+                if reason:
+                    item["migration_reason"] = reason
+                migrated.append(item)
+    return migrated
+
+
 class SkillRegistry:
     def __init__(self, skills_dir: Optional[Path] = None):
         self.skills_dir = skills_dir or settings.SKILLS_DIR
@@ -225,6 +437,7 @@ class SkillRegistry:
         entries.extend(self._list_codebot_json_skills())
         entries.extend(self._list_codebot_dir_skills())
         entries.extend(self._list_external_skills())
+        entries.extend(self._list_openclaw_skills())
         entries.extend(self._list_opencode_skills())
         entries = self._dedupe(entries)
         entries.sort(key=lambda item: (item.priority, item.name.lower(), item.slug.lower()))
@@ -429,6 +642,36 @@ class SkillRegistry:
                         source_dir=str(dir_path),
                         installed_at=_mtime_iso(skill_md),
                         compatibility=info.get("compatibility") or ["codebot", "hermes-agent", "openclaw"],
+                        metadata=info.get("metadata") or {},
+                        skill_md_content=str(info.get("content") or ""),
+                    )
+                )
+        return entries
+
+    def _list_openclaw_skills(self) -> List[SkillEntry]:
+        entries: List[SkillEntry] = []
+        for index, dir_path in enumerate(_default_openclaw_skill_dirs()):
+            for entry in _iter_skill_dirs(dir_path, recursive=True):
+                skill_md = entry / "SKILL.md"
+                info = read_skill_markdown(skill_md) or {}
+                rel_name = entry.name
+                slug = _slugify(str(info.get("slug") or rel_name), fallback=rel_name)
+                entries.append(
+                    SkillEntry(
+                        id=f"openclaw:{index}:{slug}",
+                        slug=slug,
+                        name=str(info.get("name") or rel_name),
+                        description=str(info.get("description") or ""),
+                        version=str(info.get("version") or "1.0.0"),
+                        source=OPENCLAW,
+                        source_label=SOURCE_LABELS[OPENCLAW],
+                        priority=SOURCE_PRIORITY[OPENCLAW],
+                        writable=False,
+                        path=entry,
+                        skill_md_path=skill_md,
+                        source_dir=str(dir_path),
+                        installed_at=_mtime_iso(skill_md),
+                        compatibility=info.get("compatibility") or ["openclaw", "codebot"],
                         metadata=info.get("metadata") or {},
                         skill_md_content=str(info.get("content") or ""),
                     )
