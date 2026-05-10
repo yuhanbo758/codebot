@@ -60,6 +60,12 @@ class OpenCodeClient:
     _PROVIDER_ALIASES = {
         "copilot": "github-copilot",
     }
+
+    _MODEL_ALIASES = {
+        "GPT-41": "gpt-4.1",
+        "GPT-4.1": "gpt-4.1",
+        "GPT-4o": "gpt-4o",
+    }
     
     def __init__(self, server_url: str = "http://127.0.0.1:11200"):
         self.base_url = self._normalize_http_base_url(server_url)
@@ -120,13 +126,16 @@ class OpenCodeClient:
         }
         if system:
             payload["system"] = system
+        if mode in {"plan", "build"}:
+            payload["agent"] = mode
         if model:
             if "/" in model:
                 provider_id, model_id = model.split("/", 1)
                 provider_id = self._PROVIDER_ALIASES.get(provider_id, provider_id)
+                model_id = self._MODEL_ALIASES.get(model_id, model_id)
                 payload["model"] = {"providerID": provider_id, "modelID": model_id}
             else:
-                payload["model"] = {"modelID": model}
+                payload["model"] = {"modelID": self._MODEL_ALIASES.get(model, model)}
         return payload
 
     def _extract_text_from_parts(self, parts: Any) -> str:
@@ -189,7 +198,7 @@ class OpenCodeClient:
                 timeout=min(timeout, 30),
             )
             if prompt_resp.status_code not in (200, 202, 204):
-                raise RuntimeError(f"prompt_async 失败: HTTP {prompt_resp.status_code}")
+                raise RuntimeError(f"prompt_async 失败: HTTP {prompt_resp.status_code} {prompt_resp.text[:300]}")
 
         deadline = time.monotonic() + timeout
         last_content = ""
@@ -224,6 +233,11 @@ class OpenCodeClient:
         info = properties.get("info")
         if isinstance(info, dict):
             sid = info.get("sessionID")
+            if isinstance(sid, str) and sid:
+                return sid
+        tool = properties.get("tool")
+        if isinstance(tool, dict):
+            sid = tool.get("sessionID")
             if isinstance(sid, str) and sid:
                 return sid
         return None
@@ -344,6 +358,90 @@ class OpenCodeClient:
             return response.status_code == 200
         except Exception as e:
             logger.warning(f"终止 session 失败: {e}")
+            return False
+
+    async def reply_permission(
+        self,
+        request_id: str,
+        reply: str,
+        message: Optional[str] = None,
+        session_id: Optional[str] = None,
+        workspace: Optional[str] = None,
+    ) -> bool:
+        """回应 OpenCode 权限或用户确认请求。"""
+        try:
+            await self.ensure_connected()
+            client = await self._get_client()
+            body: Dict[str, Any] = {"reply": reply}
+            if message:
+                body["message"] = message
+            response = await client.post(
+                f"{self.base_url}/permission/{request_id}/reply",
+                params={"directory": workspace} if workspace else None,
+                json=body,
+                timeout=10,
+            )
+            if response.status_code in (200, 204):
+                return True
+            if response.status_code in (404, 405) and session_id:
+                legacy_response = await client.post(
+                    f"{self.base_url}/session/{session_id}/permissions/{request_id}",
+                    params={"directory": workspace} if workspace else None,
+                    json={"response": reply},
+                    timeout=10,
+                )
+                if legacy_response.status_code in (200, 204):
+                    return True
+            logger.warning(f"回应 OpenCode 权限请求失败: HTTP {response.status_code} {response.text[:200]}")
+            return False
+        except Exception as e:
+            logger.warning(f"回应 OpenCode 权限请求异常: {e}")
+            return False
+
+    async def reply_question(
+        self,
+        request_id: str,
+        answers: List[List[str]],
+        workspace: Optional[str] = None,
+    ) -> bool:
+        """回应 OpenCode question 工具请求。answers 格式与 OpenCode API 一致。"""
+        try:
+            await self.ensure_connected()
+            client = await self._get_client()
+            response = await client.post(
+                f"{self.base_url}/question/{request_id}/reply",
+                params={"directory": workspace} if workspace else None,
+                json={"answers": answers},
+                timeout=10,
+            )
+            if response.status_code in (200, 204):
+                return True
+            logger.warning(f"回应 OpenCode question 失败: HTTP {response.status_code} {response.text[:200]}")
+            return False
+        except Exception as e:
+            logger.warning(f"回应 OpenCode question 异常: {e}")
+            return False
+
+    async def reject_question(
+        self,
+        request_id: str,
+        workspace: Optional[str] = None,
+    ) -> bool:
+        """拒绝 OpenCode question 工具请求。"""
+        try:
+            await self.ensure_connected()
+            client = await self._get_client()
+            response = await client.post(
+                f"{self.base_url}/question/{request_id}/reject",
+                params={"directory": workspace} if workspace else None,
+                timeout=10,
+            )
+            if response.status_code in (200, 204):
+                return True
+            logger.warning(f"拒绝 OpenCode question 失败: HTTP {response.status_code} {response.text[:200]}")
+            return False
+        except Exception as e:
+            logger.warning(f"拒绝 OpenCode question 异常: {e}")
             return False
 
     async def delete_session(self, session_id: str) -> bool:
@@ -470,6 +568,7 @@ class OpenCodeClient:
             )
 
             payload = self._build_prompt_payload(prompt=prompt, model=model, mode=mode, system=system)
+            tracked_session_ids = {session_id}
 
             async with client.stream(
                 "GET",
@@ -485,6 +584,7 @@ class OpenCodeClient:
                 )
                 if prompt_resp.status_code not in (200, 202, 204):
                     session_id = await self._create_session(client=client, workspace=workspace)
+                    tracked_session_ids = {session_id}
                     if conversation_id:
                         _conversation_current_session[str(conversation_id)] = session_id
                     prompt_resp = await client.post(
@@ -493,10 +593,11 @@ class OpenCodeClient:
                         timeout=30
                     )
                     if prompt_resp.status_code not in (200, 202, 204):
-                        raise RuntimeError(f"prompt_async 失败: HTTP {prompt_resp.status_code}")
+                        raise RuntimeError(f"prompt_async 失败: HTTP {prompt_resp.status_code} {prompt_resp.text[:300]}")
 
                 part_buffers: Dict[str, str] = {}
-                assistant_message_id: Optional[str] = None
+                part_types: Dict[str, str] = {}  # partID -> part type (e.g. "text", "reasoning")
+                assistant_message_ids: Dict[str, str] = {}
                 delta_buffer = ""
                 last_emit = 0.0
 
@@ -538,27 +639,66 @@ class OpenCodeClient:
                     event_type = payload_obj.get("type")
                     properties = payload_obj.get("properties") if isinstance(payload_obj.get("properties"), dict) else {}
                     event_session_id = self._extract_event_session_id(properties)
-                    if event_session_id != session_id:
+                    if event_type in {"session.created", "session.updated"}:
+                        info = properties.get("info")
+                        if isinstance(info, dict):
+                            info_id = info.get("id")
+                            parent_id = info.get("parentID")
+                            if isinstance(info_id, str) and parent_id in tracked_session_ids:
+                                tracked_session_ids.add(info_id)
+                                event_session_id = info_id
+                    if event_session_id not in tracked_session_ids:
                         continue
 
                     if event_type == "message.updated":
                         info = properties.get("info")
                         if isinstance(info, dict) and info.get("role") == "assistant":
                             msg_id = info.get("id")
-                            if isinstance(msg_id, str) and msg_id:
-                                assistant_message_id = msg_id
+                            msg_session_id = info.get("sessionID")
+                            if isinstance(msg_id, str) and msg_id and isinstance(msg_session_id, str):
+                                assistant_message_ids[msg_session_id] = msg_id
+                            yield {
+                                "type": "opencode_event",
+                                "event_type": event_type,
+                                "properties": properties,
+                            }
+                        continue
+
+                    if event_type == "message.part.added":
+                        part = properties.get("part")
+                        if isinstance(part, dict):
+                            pid = part.get("id")
+                            ptype = part.get("type")
+                            if isinstance(pid, str) and pid and isinstance(ptype, str):
+                                part_types[pid] = ptype
                         continue
 
                     if event_type == "message.part.delta":
                         message_id = properties.get("messageID")
-                        if assistant_message_id and message_id != assistant_message_id:
+                        expected_message_id = assistant_message_ids.get(event_session_id)
+                        if expected_message_id and message_id != expected_message_id:
+                            continue
+                        part_id = properties.get("partID")
+                        # 跳过非 text part 的 delta（如 reasoning）
+                        if isinstance(part_id, str) and part_id:
+                            if part_types.get(part_id, "text") != "text":
+                                continue
+                        if event_session_id != session_id:
+                            # sub-session 的 text delta 转发为 opencode_event 而非丢弃
+                            if properties.get("field") == "text":
+                                delta = properties.get("delta")
+                                if isinstance(delta, str) and delta:
+                                    yield {
+                                        "type": "opencode_event",
+                                        "event_type": event_type,
+                                        "properties": properties,
+                                    }
                             continue
                         if properties.get("field") != "text":
                             continue
                         delta = properties.get("delta")
                         if not isinstance(delta, str) or delta == "":
                             continue
-                        part_id = properties.get("partID")
                         if isinstance(part_id, str) and part_id:
                             part_buffers[part_id] = part_buffers.get(part_id, "") + delta
                         delta_buffer += delta
@@ -572,11 +712,27 @@ class OpenCodeClient:
                         part = properties.get("part")
                         if not isinstance(part, dict):
                             continue
+                        # 更新 part type 映射
+                        pid = part.get("id")
+                        ptype = part.get("type")
+                        if isinstance(pid, str) and pid and isinstance(ptype, str):
+                            part_types[pid] = ptype
                         message_id = part.get("messageID")
-                        if assistant_message_id and message_id != assistant_message_id:
+                        expected_message_id = assistant_message_ids.get(event_session_id)
+                        if expected_message_id and message_id != expected_message_id:
                             continue
                         part_type = part.get("type")
                         if part_type == "text":
+                            if event_session_id != session_id:
+                                payload_event = await _emit_buffer()
+                                if payload_event:
+                                    yield payload_event
+                                yield {
+                                    "type": "opencode_event",
+                                    "event_type": event_type,
+                                    "properties": properties,
+                                }
+                                continue
                             part_id = part.get("id")
                             part_text = part.get("text")
                             if isinstance(part_id, str) and isinstance(part_text, str):
@@ -594,15 +750,41 @@ class OpenCodeClient:
                         payload_event = await _emit_buffer()
                         if payload_event:
                             yield payload_event
+                        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                        metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+                        child_session_id = metadata.get("sessionId") or metadata.get("sessionID")
+                        if isinstance(child_session_id, str) and child_session_id:
+                            tracked_session_ids.add(child_session_id)
                         final_parts.append(part)
-                        yield {"type": "tool_event", "part": part}
+                        yield {
+                            "type": "tool_event",
+                            "part": part,
+                            "event_type": event_type,
+                            "properties": properties,
+                        }
                         continue
 
                     if event_type == "session.idle":
                         payload_event = await _emit_buffer()
                         if payload_event:
                             yield payload_event
+                        yield {
+                            "type": "opencode_event",
+                            "event_type": event_type,
+                            "properties": properties,
+                        }
                         break
+
+                    if event_type:
+                        payload_event = await _emit_buffer()
+                        if payload_event:
+                            yield payload_event
+                        yield {
+                            "type": "opencode_event",
+                            "event_type": event_type,
+                            "properties": properties,
+                        }
+                        continue
 
             payload_event = await _emit_buffer()
             if payload_event:

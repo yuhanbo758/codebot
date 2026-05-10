@@ -1,5 +1,5 @@
 <template>
-  <div class="chat-container">
+  <div class="chat-container" :class="{ 'compact-mode': compactMode }">
     <el-container>
       <!-- 侧边栏 - 对话列表 -->
       <el-aside width="280px">
@@ -141,22 +141,151 @@
               <!-- 工具步骤事件：独立气泡展示，不显示头像 -->
               <div v-if="msg.role === 'event'" class="message event-message">
                 <div class="tool-event-item">
-                  <span class="tool-event-type">{{ toolEventLabel(msg.event) }}</span>
-                  <span class="tool-event-summary">{{ toolEventSummary(msg.event) }}</span>
+                  <div class="tool-event-header" @click="toggleEventDetails(msg)">
+                    <span class="tool-event-type">{{ toolEventLabel(msg.event) }}</span>
+                    <span class="tool-event-summary">{{ toolEventSummary(msg.event) }}</span>
+                    <span v-if="toolEventDetail(msg.event)" class="tool-event-toggle">
+                      {{ msg.expanded ? '收起' : '详情' }}
+                    </span>
+                  </div>
+                  <el-collapse-transition>
+                    <div v-if="msg.expanded && toolEventDetail(msg.event)" class="tool-event-detail markdown-body" v-html="renderMarkdown(toolEventDetail(msg.event))"></div>
+                  </el-collapse-transition>
+                  <div v-if="toolEventActions(msg.event).length > 0" class="tool-event-actions">
+                    <el-button
+                      v-for="action in toolEventActions(msg.event)"
+                      :key="`${action.reply}:${action.label}`"
+                      size="small"
+                      :type="action.type || 'primary'"
+                      :loading="msg.event.replying === toolEventActionKey(action)"
+                      :disabled="Boolean(msg.event.replied)"
+                      @click.stop="replyToolAction(msg.event, action)"
+                    >
+                      {{ action.label }}
+                    </el-button>
+                  </div>
                 </div>
               </div>
 
               <!-- 普通用户/助手消息气泡 -->
-              <div v-else class="message" :class="msg.role">
+              <div v-else class="message" :class="[msg.role, { 'cli-message': isCliDisplayMessage(msg) }]">
                 <div class="message-avatar">
                   <el-avatar v-if="msg.role === 'user'" icon="User" />
                   <el-avatar v-else :src="assistantAvatarUrl" />
                 </div>
                 <div class="message-content">
-                  <div v-if="msg.streaming" class="message-text streaming-text">{{ msg.content }}</div>
+                  <div v-if="isCliDisplayMessage(msg)" class="cli-output">{{ msg.content }}</div>
+                  <div v-else-if="msg.streaming" class="message-text streaming-text">{{ msg.content }}</div>
                   <div v-else class="message-text markdown-body" v-html="renderMarkdown(msg.content)"></div>
+                  <div v-if="msg.role === 'assistant' && toolEventActions(msg.pendingActionEvent).length > 0" class="cli-action-bar">
+                    <el-button
+                      v-for="action in toolEventActions(msg.pendingActionEvent)"
+                      :key="`${action.reply}:${action.label}`"
+                      size="small"
+                      :type="action.type || 'primary'"
+                      :loading="msg.pendingActionEvent.replying === toolEventActionKey(action)"
+                      :disabled="Boolean(msg.pendingActionEvent.replied)"
+                      @click.stop="replyToolAction(msg.pendingActionEvent, action)"
+                    >
+                      {{ action.label }}
+                    </el-button>
+                  </div>
+                  <div
+                    v-if="msg.role === 'assistant' && shouldShowQuestionPanel(msg.pendingActionEvent)"
+                    class="question-panel-host"
+                  >
+                    <div class="question-panel">
+                      <div class="question-panel-header">
+                        <div class="question-panel-title">{{ questionPanelProgress(msg.pendingActionEvent) }}</div>
+                        <div class="question-panel-progress">
+                          <button
+                            v-for="(question, index) in getQuestionEventQuestions(msg.pendingActionEvent)"
+                            :key="`${msg.pendingActionEvent.request_id || 'question'}-${index}`"
+                            type="button"
+                            class="question-progress-dot"
+                            :class="{
+                              active: getQuestionPanelTab(msg.pendingActionEvent) === index,
+                              answered: isQuestionPanelAnswered(msg.pendingActionEvent, index)
+                            }"
+                            :disabled="isQuestionPanelSending(msg.pendingActionEvent)"
+                            @click="setQuestionPanelTab(msg.pendingActionEvent, index)"
+                          />
+                        </div>
+                      </div>
+                      <div class="question-panel-body">
+                        <div class="question-panel-question">{{ currentQuestionPanelQuestion(msg.pendingActionEvent)?.question || msg.pendingActionEvent?.question }}</div>
+                        <div class="question-panel-hint">
+                          {{ currentQuestionPanelQuestion(msg.pendingActionEvent)?.multiple ? '可多选，完成后统一提交' : '单选，选择后可继续下一题或直接提交' }}
+                        </div>
+                        <div class="question-panel-options">
+                          <button
+                            v-for="option in currentQuestionPanelQuestion(msg.pendingActionEvent)?.options || []"
+                            :key="option.label"
+                            type="button"
+                            class="question-option"
+                            :class="{ picked: isQuestionOptionPicked(msg.pendingActionEvent, option.label) }"
+                            :disabled="isQuestionPanelSending(msg.pendingActionEvent)"
+                            @click="toggleQuestionOption(msg.pendingActionEvent, option.label)"
+                          >
+                            <span class="question-option-mark" :class="{ multi: currentQuestionPanelQuestion(msg.pendingActionEvent)?.multiple, picked: isQuestionOptionPicked(msg.pendingActionEvent, option.label) }"></span>
+                            <span class="question-option-main">
+                              <span class="question-option-label">{{ option.label }}</span>
+                              <span v-if="option.description" class="question-option-description">{{ option.description }}</span>
+                            </span>
+                          </button>
+                          <button
+                            v-if="currentQuestionPanelQuestion(msg.pendingActionEvent)?.custom"
+                            type="button"
+                            class="question-option"
+                            :class="{ picked: isQuestionCustomEnabled(msg.pendingActionEvent) }"
+                            :disabled="isQuestionPanelSending(msg.pendingActionEvent)"
+                            @click="toggleQuestionCustom(msg.pendingActionEvent)"
+                          >
+                            <span class="question-option-mark" :class="{ multi: currentQuestionPanelQuestion(msg.pendingActionEvent)?.multiple, picked: isQuestionCustomEnabled(msg.pendingActionEvent) }"></span>
+                            <span class="question-option-main">
+                              <span class="question-option-label">自定义回答</span>
+                              <span class="question-option-description">{{ currentQuestionCustomValue(msg.pendingActionEvent) || '输入你自己的回答' }}</span>
+                            </span>
+                          </button>
+                          <el-input
+                            v-if="currentQuestionPanelQuestion(msg.pendingActionEvent)?.custom && isQuestionCustomEnabled(msg.pendingActionEvent)"
+                            :model-value="currentQuestionCustomValue(msg.pendingActionEvent)"
+                            type="textarea"
+                            :rows="2"
+                            resize="none"
+                            placeholder="输入自定义回答"
+                            :disabled="isQuestionPanelSending(msg.pendingActionEvent)"
+                            @update:model-value="updateQuestionCustomValue(msg.pendingActionEvent, $event)"
+                          />
+                        </div>
+                      </div>
+                      <div class="question-panel-footer">
+                        <el-button size="small" :disabled="isQuestionPanelSending(msg.pendingActionEvent)" @click="cancelQuestionPanel(msg.pendingActionEvent)">取消</el-button>
+                        <div class="question-panel-footer-actions">
+                          <el-button
+                            v-if="getQuestionPanelTab(msg.pendingActionEvent) > 0"
+                            size="small"
+                            :disabled="isQuestionPanelSending(msg.pendingActionEvent)"
+                            @click="setQuestionPanelTab(msg.pendingActionEvent, getQuestionPanelTab(msg.pendingActionEvent) - 1)"
+                          >上一题</el-button>
+                          <el-button
+                            v-if="getQuestionPanelTab(msg.pendingActionEvent) < getQuestionEventQuestions(msg.pendingActionEvent).length - 1"
+                            size="small"
+                            :disabled="isQuestionPanelSending(msg.pendingActionEvent)"
+                            @click="setQuestionPanelTab(msg.pendingActionEvent, getQuestionPanelTab(msg.pendingActionEvent) + 1)"
+                          >下一题</el-button>
+                          <el-button
+                            type="primary"
+                            size="small"
+                            :loading="isQuestionPanelSending(msg.pendingActionEvent)"
+                            @click="submitQuestionPanel(msg.pendingActionEvent)"
+                          >提交</el-button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                   <!-- Plan 模式交互选项 -->
-                  <div v-if="!msg.streaming && msg.role === 'assistant' && extractOptions(msg.content).length > 0" class="plan-options">
+                  <div v-if="!isCliDisplayMessage(msg) && !msg.streaming && msg.role === 'assistant' && extractOptions(msg.content).length > 0" class="plan-options">
                     <div class="plan-options-label">请选择：</div>
                     <div class="plan-options-btns">
                       <el-button
@@ -704,6 +833,7 @@ const messages = ref([])
 const currentConversationId = ref(null)
 const currentConversation = ref(null)
 const inputMessage = ref('')
+const questionPanelState = ref({})
 const loadingCounts = ref({})
 const messageListRef = ref(null)
 const inputRef = ref(null)
@@ -871,6 +1001,9 @@ const runtimeEventSeqSeen = ref({})
 const runtimeAssistantIdByConversation = ref({})
 const activeStreamByConversation = ref({})
 const runtimeReloadDoneByConversation = ref({})
+const actionRequiredEventSeen = ref({})
+const opencodeCliDisplay = ref(true)
+const compactMode = ref(false)
 // 每个对话的 event 气泡缓存，用于切换对话后恢复推理过程展示
 const perConversationEventMessages = ref({})
 let queueStatusTimer = null
@@ -1177,12 +1310,31 @@ const abortTask = async () => {
 
 // 模型选择
 const LAST_MODEL_KEY = 'codebot:selectedModel'
-const _savedModel = localStorage.getItem(LAST_MODEL_KEY) || ''
+const normalizeModelId = (modelId) => {
+  const id = String(modelId || '').trim()
+  if (!id || !id.includes('/')) return id
+  const [rawProvider, ...modelParts] = id.split('/')
+  const rawModel = modelParts.join('/')
+  const providerAliases = {
+    copilot: 'github-copilot',
+  }
+  const modelAliases = {
+    'GPT-41': 'gpt-4.1',
+    'GPT-4.1': 'gpt-4.1',
+    'GPT-4o': 'gpt-4o',
+  }
+  const provider = providerAliases[rawProvider] || rawProvider
+  const model = modelAliases[rawModel] || rawModel
+  return `${provider}/${model}`
+}
+const makeModelOption = (id) => ({ id, name: id, provider: id.split('/')[0] || '', model: id.split('/')[1] || id })
+const _savedModel = normalizeModelId(localStorage.getItem(LAST_MODEL_KEY) || '')
+if (_savedModel) localStorage.setItem(LAST_MODEL_KEY, _savedModel)
 const selectedModel = ref(_savedModel)
 // Pre-populate with the saved model so el-select can resolve its label before the API responds
 const availableModels = ref(
   _savedModel
-    ? [{ id: _savedModel, name: _savedModel, provider: _savedModel.split('/')[0] || '', model: _savedModel.split('/')[1] || _savedModel }]
+    ? [makeModelOption(_savedModel)]
     : []
 )
 const modelsLoading = ref(false)
@@ -1393,6 +1545,139 @@ const setConversationLoadingState = (conversationId, running) => {
   loadingCounts.value = updated
 }
 
+const notifyActionRequiredEvent = (event) => {
+  if (!event?.requires_user_action) return
+  const key = event.request_id || event?.data?.id || event?.data?.requestID || `${event.event_type}:${event.summary}`
+  if (!key || actionRequiredEventSeen.value[key]) return
+  actionRequiredEventSeen.value = { ...actionRequiredEventSeen.value, [key]: true }
+  ElMessage({
+    type: 'warning',
+    message: event.summary || 'OpenCode 正在等待你的选择',
+    duration: 8000,
+    showClose: true,
+  })
+}
+
+const looksLikeCliOutput = (content = '') => {
+  const text = String(content || '')
+  return /(^|\n)# Todos\b/.test(text)
+    || /(^|\n)([→%*$✎◌!✓@>]|\[[ x.\-]\])\s/.test(text)
+}
+
+const isCliDisplayMessage = (msg) => {
+  if (msg?.role !== 'assistant') return false
+  return Boolean(msg.cli_display || (opencodeCliDisplay.value && looksLikeCliOutput(msg.content)))
+}
+
+const attachCliActionEvent = (assistantMsg, event) => {
+  notifyActionRequiredEvent(event)
+  if (assistantMsg && event?.requires_user_action) {
+    assistantMsg.pendingActionEvent = event
+  }
+}
+
+const shouldShowStructuredEvent = (event) => {
+  if (!event) return false
+  if (event.type === 'tool_event') {
+    return ['tool', 'tool-call', 'tool-result', 'patch', 'file', 'subtask'].includes(event.event_type)
+  }
+  if (event.requires_user_action) return true
+  return [
+    'permission.asked',
+    'permission.updated',
+    'permission.replied',
+    'permission.local_reply',
+    'question.asked',
+    'question.replied',
+    'question.rejected',
+    'question.local_reply',
+    'todo.updated'
+  ].includes(event.event_type)
+}
+
+const createStructuredEventMessage = (conversationId, event, seq) => ({
+  id: `runtime-event-${conversationId}-${seq || Date.now()}-${Math.random()}`,
+  role: 'event',
+  event,
+  expanded: false,
+  created_at: event?.created_at || new Date().toISOString()
+})
+
+const cacheStructuredEventMessage = (conversationId, eventMsg) => {
+  const convEvents = perConversationEventMessages.value[conversationId] || []
+  perConversationEventMessages.value = {
+    ...perConversationEventMessages.value,
+    [conversationId]: [...convEvents, eventMsg]
+  }
+}
+
+const eventActionKind = (event) => {
+  const type = String(event?.event_type || '')
+  if (type.startsWith('question.')) return 'question'
+  if (type.startsWith('permission.')) return 'permission'
+  return ''
+}
+
+const eventRequestId = (event) => {
+  const data = event?.data || {}
+  return String(
+    event?.request_id ||
+    data.request_id ||
+    data.requestID ||
+    data.permissionID ||
+    data.id ||
+    ''
+  ).trim()
+}
+
+const eventActionKey = (event) => {
+  const kind = eventActionKind(event)
+  const id = eventRequestId(event)
+  return kind && id ? `${kind}:${id}` : ''
+}
+
+const isActionResolvedEvent = (event) => [
+  'permission.replied',
+  'permission.local_reply',
+  'question.replied',
+  'question.rejected',
+  'question.local_reply',
+].includes(event?.event_type)
+
+const markActionResolved = (targetEvent, resolvedEvent) => {
+  if (!targetEvent) return
+  targetEvent.replied = resolvedEvent?.summary || true
+  targetEvent.requires_user_action = false
+  targetEvent.actions = []
+  if (resolvedEvent?.summary) targetEvent.summary = resolvedEvent.summary
+}
+
+const resolvePendingActionEvents = (conversationId, resolvedEvent) => {
+  if (!isActionResolvedEvent(resolvedEvent)) return
+  const key = eventActionKey(resolvedEvent)
+  if (!key) return
+  clearQuestionPanelState(resolvedEvent)
+
+  const clearMessage = (msg) => {
+    if (eventActionKey(msg?.pendingActionEvent) === key) {
+      markActionResolved(msg.pendingActionEvent, resolvedEvent)
+      msg.pendingActionEvent = null
+    }
+    if (eventActionKey(msg?.event) === key) {
+      markActionResolved(msg.event, resolvedEvent)
+    }
+  }
+
+  for (const msg of messages.value) clearMessage(msg)
+  const cached = perConversationEventMessages.value[conversationId] || []
+  for (const msg of cached) clearMessage(msg)
+}
+
+const toggleEventDetails = (msg) => {
+  if (!toolEventDetail(msg?.event)) return
+  msg.expanded = !msg.expanded
+}
+
 const ensureRuntimeAssistant = (conversationId) => {
   if (currentConversationId.value !== conversationId) return null
   const knownId = runtimeAssistantIdByConversation.value[conversationId]
@@ -1404,6 +1689,8 @@ const ensureRuntimeAssistant = (conversationId) => {
     id: `runtime-assistant-${conversationId}`,
     role: 'assistant',
     content: '',
+    cli_display: opencodeCliDisplay.value,
+    pendingActionEvent: null,
     streaming: true,
     created_at: new Date().toISOString()
   }
@@ -1425,12 +1712,17 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
     if (seq > 0 && seen.has(seq)) continue
     if (seq > 0) seen.add(seq)
     if (event?.type === 'tool_event' || event?.type === 'meta_event') {
-      const eventMsg = {
-        id: `runtime-event-${conversationId}-${seq || Date.now()}`,
-        role: 'event',
-        event: event,
-        created_at: event?.created_at || new Date().toISOString()
+      resolvePendingActionEvents(conversationId, event)
+      if (event?.cli_inline || opencodeCliDisplay.value) {
+        assistantMsg = assistantMsg || ensureRuntimeAssistant(conversationId)
+        attachCliActionEvent(assistantMsg, event)
+        continue
       }
+      if (!shouldShowStructuredEvent(event)) {
+        notifyActionRequiredEvent(event)
+        continue
+      }
+      const eventMsg = createStructuredEventMessage(conversationId, event, seq)
       if (assistantMsg) {
         const idx = messages.value.findIndex((m) => m.id === assistantMsg.id)
         if (idx >= 0) {
@@ -1442,10 +1734,14 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
         messages.value.push(eventMsg)
       }
       newEventMsgs.push(eventMsg)
+      notifyActionRequiredEvent(event)
       continue
     }
     if (event?.type === 'done' && assistantMsg) {
-      assistantMsg.content = sanitizeStreamContent(event.content || runtimeContent || assistantMsg.content)
+      assistantMsg.cli_display = Boolean(event?.cli_display || assistantMsg.cli_display)
+      assistantMsg.content = assistantMsg.cli_display
+        ? (event.content || runtimeContent || assistantMsg.content)
+        : sanitizeStreamContent(event.content || runtimeContent || assistantMsg.content)
       assistantMsg.streaming = false
       continue
     }
@@ -1457,7 +1753,10 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
       assistantMsg = ensureRuntimeAssistant(conversationId)
       if (!assistantMsg) continue
       if (event?.type === 'done') {
-        assistantMsg.content = sanitizeStreamContent(event.content || runtimeContent || assistantMsg.content)
+        assistantMsg.cli_display = Boolean(event?.cli_display || assistantMsg.cli_display)
+        assistantMsg.content = assistantMsg.cli_display
+          ? (event.content || runtimeContent || assistantMsg.content)
+          : sanitizeStreamContent(event.content || runtimeContent || assistantMsg.content)
         assistantMsg.streaming = false
       } else {
         assistantMsg.content = event.message || '执行失败'
@@ -1485,7 +1784,9 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
     assistantMsg = assistantMsg || ensureRuntimeAssistant(conversationId)
   }
   if (assistantMsg) {
-    if (typeof runtimeContent === 'string' && runtimeContent) assistantMsg.content = sanitizeStreamContent(runtimeContent)
+    if (typeof runtimeContent === 'string' && runtimeContent) {
+      assistantMsg.content = assistantMsg.cli_display ? runtimeContent : sanitizeStreamContent(runtimeContent)
+    }
     assistantMsg.streaming = Boolean(running)
   }
   nextTick(() => scrollToBottom())
@@ -1616,16 +1917,22 @@ const loadModels = async () => {
     }).filter(m => m.id)
 
     // 如果用户有已保存的模型，且新列表中没有对应条目，则保留一个占位条目以避免 el-select 显示空值
-    const saved = selectedModel.value
+    const saved = normalizeModelId(selectedModel.value)
+    if (saved && saved !== selectedModel.value) {
+      selectedModel.value = saved
+    }
     if (saved && !newList.find(m => m.id === saved)) {
-      newList.push({ id: saved, name: saved, provider: saved.split('/')[0] || '', model: saved.split('/')[1] || saved })
+      newList.push(makeModelOption(saved))
     }
     availableModels.value = newList
   } catch {
     // 加载失败时，如果有已保存模型，保留其占位条目
-    const saved = selectedModel.value
+    const saved = normalizeModelId(selectedModel.value)
+    if (saved && saved !== selectedModel.value) {
+      selectedModel.value = saved
+    }
     if (saved) {
-      availableModels.value = [{ id: saved, name: saved, provider: saved.split('/')[0] || '', model: saved.split('/')[1] || saved }]
+      availableModels.value = [makeModelOption(saved)]
     } else {
       availableModels.value = []
     }
@@ -1716,15 +2023,42 @@ const toolEventLabel = (event) => {
   const map = {
     'step-start': '步骤开始',
     'step-finish': '步骤完成',
+    'tool': '工具',
     'tool-call': '工具调用',
     'tool-result': '工具结果',
     'reasoning': '推理',
-    'plan': '计划'
+    'plan': '计划',
+    'subtask': '子任务',
+    'patch': '补丁',
+    'snapshot': '快照',
+    'agent': 'Agent',
+    'retry': '重试',
+    'compaction': '上下文压缩',
+    'permission.asked': '等待确认',
+    'permission.updated': '等待确认',
+    'permission.replied': '确认结果',
+    'permission.local_reply': '已回复',
+    'question.asked': '等待选择',
+    'question.replied': '选择结果',
+    'question.rejected': '已取消',
+    'question.local_reply': '已回复',
+    'todo.updated': '待办',
+    'session.status': '会话状态',
+    'session.idle': '会话状态',
+    'session.error': '会话错误',
+    'message.updated': '消息状态',
+    'message.part.updated': '消息片段',
+    'file.edited': '文件编辑',
+    'command.executed': '命令',
+    'tui.toast.show': 'OpenCode',
+    'tui.prompt.append': 'OpenCode',
+    'tui.command.execute': 'OpenCode'
   }
   return map[eventType] || eventType
 }
 
 const toolEventSummary = (event) => {
+  if (typeof event?.summary === 'string' && event.summary.trim()) return event.summary.trim()
   const data = event?.data || {}
   if (typeof data?.text === 'string' && data.text.trim()) return data.text.trim()
   if (typeof data?.name === 'string' && data.name.trim()) return data.name.trim()
@@ -1734,6 +2068,354 @@ const toolEventSummary = (event) => {
   if (typeof data?.summary === 'string' && data.summary.trim()) return data.summary.trim()
   if (typeof data?.status === 'string' && data.status.trim()) return data.status.trim()
   return '处理中'
+}
+
+const toolEventDetail = (event) => {
+  if (typeof event?.detail === 'string' && event.detail.trim()) return event.detail.trim()
+  const data = event?.data || {}
+  if (data?.state && typeof data.state === 'object') {
+    const output = data.state.output || data.state.error || data.state.raw
+    if (typeof output === 'string' && output.trim()) return output.trim()
+  }
+  return ''
+}
+
+const toolEventActions = (event) => {
+  if (!event || event.replied || shouldShowQuestionPanel(event)) return []
+  return Array.isArray(event.actions) ? event.actions : []
+}
+
+const toolEventActionKey = (action) => `${action?.reply || ''}:${action?.label || ''}`
+
+const questionPanelStateKey = (event) => {
+  const requestId = event?.request_id || event?.data?.id || event?.data?.requestID
+  return requestId ? String(requestId) : ''
+}
+
+const getQuestionEventQuestions = (event) => {
+  if (Array.isArray(event?.questions) && event.questions.length > 0) return event.questions
+  if (Array.isArray(event?.data?.questions) && event.data.questions.length > 0) return event.data.questions
+  const question = String(event?.question || event?.summary || 'OpenCode 正在等待你的选择').trim()
+  const options = Array.isArray(event?.data?.options) ? event.data.options : []
+  return [{ question, multiple: Boolean(event?.multiple), custom: event?.allow_custom !== false, options }]
+}
+
+const ensureQuestionPanelState = (event) => {
+  const key = questionPanelStateKey(event)
+  const questions = getQuestionEventQuestions(event)
+  if (!key || questions.length === 0) return null
+  const existing = questionPanelState.value[key]
+  if (existing && existing.answers.length === questions.length) return existing
+  const next = {
+    tab: 0,
+    answers: questions.map(() => []),
+    custom: questions.map(() => ''),
+    customOn: questions.map(() => false),
+    sending: false,
+  }
+  questionPanelState.value = { ...questionPanelState.value, [key]: next }
+  return next
+}
+
+const updateQuestionPanelState = (event, updater) => {
+  const key = questionPanelStateKey(event)
+  const current = ensureQuestionPanelState(event)
+  if (!key || !current) return null
+  const next = typeof updater === 'function' ? updater(current) : updater
+  questionPanelState.value = { ...questionPanelState.value, [key]: next }
+  return next
+}
+
+const clearQuestionPanelState = (event) => {
+  const key = questionPanelStateKey(event)
+  if (!key || !questionPanelState.value[key]) return
+  const next = { ...questionPanelState.value }
+  delete next[key]
+  questionPanelState.value = next
+}
+
+const shouldShowQuestionPanel = (event) => {
+  if (!event || event.replied || event.event_type !== 'question.asked') return false
+  return getQuestionEventQuestions(event).length > 0
+}
+
+const getQuestionPanelTab = (event) => ensureQuestionPanelState(event)?.tab ?? 0
+
+const setQuestionPanelTab = (event, tab) => {
+  const questions = getQuestionEventQuestions(event)
+  const nextTab = Math.max(0, Math.min(questions.length - 1, Number(tab) || 0))
+  updateQuestionPanelState(event, (current) => ({ ...current, tab: nextTab }))
+}
+
+const currentQuestionPanelQuestion = (event) => {
+  const questions = getQuestionEventQuestions(event)
+  return questions[getQuestionPanelTab(event)] || questions[0] || null
+}
+
+const currentQuestionPanelAnswers = (event) => {
+  const state = ensureQuestionPanelState(event)
+  return state?.answers[getQuestionPanelTab(event)] || []
+}
+
+const currentQuestionCustomValue = (event) => {
+  const state = ensureQuestionPanelState(event)
+  return state?.custom[getQuestionPanelTab(event)] || ''
+}
+
+const isQuestionCustomEnabled = (event) => {
+  const state = ensureQuestionPanelState(event)
+  return Boolean(state?.customOn[getQuestionPanelTab(event)])
+}
+
+const isQuestionOptionPicked = (event, label) => currentQuestionPanelAnswers(event).includes(label)
+
+const isQuestionPanelSending = (event) => Boolean(ensureQuestionPanelState(event)?.sending)
+
+const questionPanelProgress = (event) => {
+  const questions = getQuestionEventQuestions(event)
+  return `问题 ${Math.min(getQuestionPanelTab(event) + 1, questions.length)} / ${questions.length}`
+}
+
+const isQuestionPanelAnswered = (event, index) => {
+  const state = ensureQuestionPanelState(event)
+  if (!state) return false
+  const answers = state.answers[index] || []
+  if (answers.length > 0) return true
+  return Boolean(state.customOn[index] && String(state.custom[index] || '').trim())
+}
+
+const updateQuestionAnswerBucket = (event, index, nextAnswers) => {
+  updateQuestionPanelState(event, (current) => ({
+    ...current,
+    answers: current.answers.map((item, itemIndex) => itemIndex === index ? nextAnswers : item)
+  }))
+}
+
+const updateQuestionCustomValue = (event, value) => {
+  const index = getQuestionPanelTab(event)
+  const question = currentQuestionPanelQuestion(event)
+  const text = String(value || '')
+  updateQuestionPanelState(event, (current) => {
+    const prevCustom = String(current.custom[index] || '').trim()
+    const nextCustom = text.trim()
+    const answers = current.answers.map((item) => [...item])
+    const bucket = answers[index] || []
+    if (question?.multiple) {
+      const removed = prevCustom ? bucket.filter((item) => item !== prevCustom) : bucket.slice()
+      answers[index] = current.customOn[index] && nextCustom
+        ? (removed.includes(nextCustom) ? removed : [...removed, nextCustom])
+        : removed
+    } else if (current.customOn[index]) {
+      answers[index] = nextCustom ? [nextCustom] : []
+    }
+    return {
+      ...current,
+      answers,
+      custom: current.custom.map((item, itemIndex) => itemIndex === index ? text : item)
+    }
+  })
+}
+
+const toggleQuestionCustom = (event) => {
+  const index = getQuestionPanelTab(event)
+  const question = currentQuestionPanelQuestion(event)
+  updateQuestionPanelState(event, (current) => {
+    const enabled = !current.customOn[index]
+    const custom = String(current.custom[index] || '').trim()
+    const answers = current.answers.map((item) => [...item])
+    if (question?.multiple) {
+      const bucket = answers[index] || []
+      answers[index] = enabled
+        ? (custom && !bucket.includes(custom) ? [...bucket, custom] : bucket)
+        : (custom ? bucket.filter((item) => item !== custom) : bucket)
+    } else {
+      answers[index] = enabled ? (custom ? [custom] : []) : []
+    }
+    return {
+      ...current,
+      answers,
+      customOn: current.customOn.map((item, itemIndex) => itemIndex === index ? enabled : item)
+    }
+  })
+}
+
+const toggleQuestionOption = (event, label) => {
+  const index = getQuestionPanelTab(event)
+  const question = currentQuestionPanelQuestion(event)
+  updateQuestionPanelState(event, (current) => {
+    const answers = current.answers.map((item) => [...item])
+    const bucket = answers[index] || []
+    if (question?.multiple) {
+      answers[index] = bucket.includes(label)
+        ? bucket.filter((item) => item !== label)
+        : [...bucket, label]
+      return { ...current, answers }
+    }
+    return {
+      ...current,
+      answers: current.answers.map((item, itemIndex) => itemIndex === index ? [label] : item),
+      customOn: current.customOn.map((item, itemIndex) => itemIndex === index ? false : item)
+    }
+  })
+}
+
+const submitQuestionPanel = async (event) => {
+  const state = ensureQuestionPanelState(event)
+  if (!state) return false
+  updateQuestionPanelState(event, (current) => ({ ...current, sending: true }))
+  try {
+    const replied = await replyQuestion(event, { reply: 'question_answer', answers: state.answers.map((group) => Array.isArray(group) ? [...group] : []) })
+    if (replied) clearQuestionPanelState(event)
+    return replied
+  } finally {
+    if (!event?.replied) {
+      updateQuestionPanelState(event, (current) => ({ ...current, sending: false }))
+    }
+  }
+}
+
+const cancelQuestionPanel = async (event) => {
+  const state = ensureQuestionPanelState(event)
+  if (!state) return false
+  updateQuestionPanelState(event, (current) => ({ ...current, sending: true }))
+  try {
+    const replied = await replyQuestion(event, { reply: 'question_reject' })
+    if (replied) clearQuestionPanelState(event)
+    return replied
+  } finally {
+    if (!event?.replied) {
+      updateQuestionPanelState(event, (current) => ({ ...current, sending: false }))
+    }
+  }
+}
+
+const permissionReplyLabel = (reply) => {
+  const map = {
+    once: '允许一次',
+    always: '总是允许',
+    reject: '拒绝',
+    question_reject: '取消/先不回答'
+  }
+  return map[reply] || reply
+}
+
+const replyQuestion = async (event, actionOrReply) => {
+  const action = typeof actionOrReply === 'string' ? { reply: actionOrReply } : (actionOrReply || {})
+  const requestId = event?.request_id || event?.data?.id || event?.data?.requestID
+  if (!requestId) {
+    ElMessage.error('缺少 OpenCode 问题请求 ID')
+    return false
+  }
+  let payload = {
+    request_id: requestId,
+    conversation_id: currentConversationId.value,
+    project_dir: currentProjectDir.value || null,
+  }
+  if (action.reply === 'question_reject') {
+    payload.reject = true
+  } else if (action.custom) {
+    try {
+      const result = await ElMessageBox.prompt(event?.question || event?.summary || '请输入回答', '回复 OpenCode', {
+        confirmButtonText: '发送',
+        cancelButtonText: '取消',
+        inputType: 'textarea',
+        inputPlaceholder: '输入你的回答'
+      })
+      const answer = String(result?.value || '').trim()
+      if (!answer) {
+        ElMessage.warning('回答不能为空')
+        return
+      }
+      payload.answer = answer
+    } catch {
+      return false
+    }
+  } else if (Array.isArray(action.answers)) {
+    payload.answers = action.answers
+  } else if (action.label) {
+    payload.answers = [[action.label]]
+  } else {
+    ElMessage.error('缺少问题回答')
+    return false
+  }
+
+  event.replying = toolEventActionKey(action)
+  try {
+    await axios.post('/api/chat/question/reply', payload)
+    event.replied = true
+    event.summary = payload.reject ? '你已取消/先不回答' : `你已选择：${payload.answer || (payload.answers || []).map((group) => (group || []).join(', ')).join('；')}`
+    event.actions = []
+    clearQuestionPanelState(event)
+    ElMessage.success('已回复 OpenCode')
+    return true
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || '回复 OpenCode 问题失败')
+    return false
+  } finally {
+    event.replying = ''
+  }
+}
+
+const replyPermission = async (event, actionOrReply) => {
+  const action = typeof actionOrReply === 'string' ? { reply: actionOrReply } : (actionOrReply || {})
+  const reply = action.reply
+  const requestId = event?.request_id || event?.data?.id || event?.data?.requestID || event?.data?.permissionID
+  if (!requestId) {
+    ElMessage.error('缺少 OpenCode 权限请求 ID')
+    return
+  }
+  event.replying = toolEventActionKey(action)
+  try {
+    await axios.post('/api/chat/permission/reply', {
+      request_id: requestId,
+      reply,
+      message: action.message || null,
+      session_id: event?.data?.sessionID || null,
+      conversation_id: currentConversationId.value,
+      project_dir: currentProjectDir.value || null,
+    })
+    event.replied = reply
+    event.summary = `你已选择：${permissionReplyLabel(reply)}`
+    event.actions = []
+    ElMessage.success('已回复 OpenCode')
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || '回复 OpenCode 失败')
+  } finally {
+    event.replying = ''
+  }
+}
+
+const replyToolAction = async (event, action) => {
+  const reply = action?.reply || ''
+  if (reply.startsWith('question_') || event?.event_type?.startsWith('question.')) {
+    await replyQuestion(event, action)
+    return
+  }
+  await replyPermission(event, action)
+}
+
+const findPendingQuestionEvent = () => {
+  if (!currentConversationId.value || !isConversationLoading(currentConversationId.value)) return null
+  for (let i = messages.value.length - 1; i >= 0; i -= 1) {
+    const msg = messages.value[i]
+    const event = msg?.pendingActionEvent || msg?.event
+    if (event?.requires_user_action && event?.event_type === 'question.asked' && !event.replied) {
+      return event
+    }
+  }
+  return null
+}
+
+const clearPendingQuestionEvent = (event) => {
+  if (!event) return
+  event.replied = true
+  event.requires_user_action = false
+  event.actions = []
+   clearQuestionPanelState(event)
+  event.summary = event.summary || '问题请求已失效'
+  for (const msg of messages.value) {
+    if (msg?.pendingActionEvent === event) msg.pendingActionEvent = null
+  }
 }
 
 let streamScrollScheduled = false
@@ -1790,6 +2472,24 @@ const sendMessage = async () => {
   const content = inputMessage.value
   const filesToSend = [...attachedFiles.value]
   const isLoading = isConversationLoading(conversationId)
+  const pendingQuestionEvent = filesToSend.length === 0 ? findPendingQuestionEvent() : null
+
+  if (pendingQuestionEvent && content.trim()) {
+    if (shouldShowQuestionPanel(pendingQuestionEvent)) {
+      ElMessage.warning('请先在问题面板中完成选择后再提交')
+      return
+    }
+    const replied = await replyQuestion(pendingQuestionEvent, { reply: 'question_answer', answers: [[content.trim()]], label: content.trim() })
+    if (replied) {
+      inputMessage.value = ''
+      memoryHints.value = []
+      showCommandPanel.value = false
+      showAtPanel.value = false
+      return
+    }
+    clearPendingQuestionEvent(pendingQuestionEvent)
+    ElMessage.warning('上一个 OpenCode 问题已失效，已按普通消息发送')
+  }
 
   inputMessage.value = ''
   attachedFiles.value = []
@@ -1870,6 +2570,7 @@ const sendMessage = async () => {
         mode: agentMode.value || null,
         attached_files: filesToSend.length > 0 ? filesToSend : null,
         project_dir: currentProjectDir.value || null,
+        user_already_saved: true,
       })
       if (response.data?.data?.queued) {
         queuedCount.value += 1
@@ -1908,6 +2609,8 @@ const sendMessage = async () => {
       content: '',
       rawContent: '',
       tool_events: [],
+      cli_display: opencodeCliDisplay.value,
+      pendingActionEvent: null,
       streaming: true,
       created_at: new Date().toISOString()
     }
@@ -1923,7 +2626,7 @@ const sendMessage = async () => {
       // 整体清洗确保跨 delta 的标签（如 <think> 开始在一个 delta，结束在另一个）能被正确处理
       const raw = `${assistantMessage.rawContent || ''}${pendingDelta}`
       assistantMessage.rawContent = raw
-      assistantMessage.content = sanitizeStreamContent(raw, content)
+      assistantMessage.content = assistantMessage.cli_display ? raw : sanitizeStreamContent(raw, content)
       pendingDelta = ''
     }
 
@@ -1946,6 +2649,7 @@ const sendMessage = async () => {
         mode: agentMode.value || null,
         attached_files: filesToSend.length > 0 ? filesToSend : null,
         project_dir: currentProjectDir.value || null,
+        user_already_saved: true,
       }, async (event) => {
         if (event?.type === 'queued') {
           queuedCount.value += 1
@@ -1956,6 +2660,7 @@ const sendMessage = async () => {
           return
         }
         if (event?.type === 'content_delta') {
+          if (event?.cli_display) assistantMessage.cli_display = true
           const delta = event.delta || ''
           if (delta) {
             pendingDelta += delta
@@ -1964,23 +2669,27 @@ const sendMessage = async () => {
           return
         }
         if (event?.type === 'tool_event' || event?.type === 'meta_event') {
+          resolvePendingActionEvents(conversationId, event)
+          if (event?.cli_inline || assistantMessage.cli_display || opencodeCliDisplay.value) {
+            attachCliActionEvent(assistantMessage, event)
+            scheduleStreamScroll()
+            return
+          }
+          if (!shouldShowStructuredEvent(event)) {
+            notifyActionRequiredEvent(event)
+            return
+          }
           if (currentConversationId.value === conversationId) {
             const idx = messages.value.findIndex((m) => m.id === assistantMessage.id)
-            const eventMsg = {
-              id: Date.now() + Math.random(),
-              role: 'event',
-              event: event,
-              created_at: new Date().toISOString()
-            }
+            const eventMsg = createStructuredEventMessage(conversationId, event)
             if (idx >= 0) {
               messages.value.splice(idx, 0, eventMsg)
             } else {
               messages.value.push(eventMsg)
             }
             // 同步缓存到 perConversationEventMessages，确保切换对话后可以恢复
-            const convEvents = perConversationEventMessages.value[conversationId] || []
-            convEvents.push(eventMsg)
-            perConversationEventMessages.value = { ...perConversationEventMessages.value, [conversationId]: convEvents }
+            cacheStructuredEventMessage(conversationId, eventMsg)
+            notifyActionRequiredEvent(event)
             scheduleStreamScroll()
           }
           return
@@ -1988,14 +2697,17 @@ const sendMessage = async () => {
         if (event?.type === 'done') {
           flushPendingDelta()
           // 优先使用后端返回的已清洗内容，否则使用前端实时清洗后的内容
+          if (event?.cli_display) assistantMessage.cli_display = true
           const finalContent = event.content || assistantMessage.content
-          assistantMessage.content = sanitizeStreamContent(finalContent, content)
+          assistantMessage.content = assistantMessage.cli_display
+            ? finalContent
+            : sanitizeStreamContent(finalContent, content)
           assistantMessage.streaming = false
           if (currentConversationId.value === conversationId) scheduleStreamScroll()
           return
         }
         if (event?.type === 'error') {
-          throw new Error(event.message || '流式回复失败')
+          throw new Error(event.message || event.error || '流式回复失败')
         }
       })
     } finally {
@@ -2013,7 +2725,8 @@ const sendMessage = async () => {
     scheduleConversationTitleRefresh(conversationId, 20, 1500)
 
   } catch (error) {
-    ElMessage.error('发送消息失败')
+    const msg = error?.message || '发送消息失败'
+    ElMessage.error(msg === '发送消息失败' ? msg : `发送消息失败：${msg}`)
   } finally {
     decrementLoading(conversationId)
     if (currentConversationId.value === conversationId) {
@@ -2287,6 +3000,12 @@ const loadLinkOpenMode = async () => {
       if (json?.success && json?.data?.link_open_mode) {
         linkOpenMode.value = json.data.link_open_mode
       }
+      if (json?.success && typeof json?.data?.opencode_cli_display === 'boolean') {
+        opencodeCliDisplay.value = json.data.opencode_cli_display !== false
+      }
+      if (json?.success && typeof json?.data?.compact_mode === 'boolean') {
+        compactMode.value = Boolean(json.data.compact_mode)
+      }
       if (json?.success && typeof json?.data?.chat_default_model === 'string') {
         const backendModel = json.data.chat_default_model
         if (backendModel && !selectedModel.value) {
@@ -2543,10 +3262,19 @@ onUnmounted(() => {
   padding: 20px;
 }
 
+.compact-mode .message-list {
+  padding: 10px;
+}
+
 .message {
   display: flex;
   gap: 12px;
   margin-bottom: 20px;
+}
+
+.compact-mode .message {
+  gap: 8px;
+  margin-bottom: 8px;
 }
 
 .message.user {
@@ -2555,6 +3283,14 @@ onUnmounted(() => {
 
 .message-content {
   max-width: 70%;
+}
+
+.compact-mode .message-avatar {
+  display: none;
+}
+
+.compact-mode .message-content {
+  max-width: 86%;
 }
 
 .message.user .message-content {
@@ -2570,9 +3306,208 @@ onUnmounted(() => {
   border-radius: 12px 12px 12px 0;
 }
 
+.compact-mode .message.user .message-content,
+.compact-mode .message.assistant .message-content {
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+
+.message.assistant.cli-message .message-content {
+  width: min(980px, calc(100% - 52px));
+  max-width: min(980px, calc(100% - 52px));
+  background: #0f1115;
+  color: #8f949d;
+  border-radius: 8px;
+  padding: 16px 18px;
+}
+
+.compact-mode .message.assistant.cli-message .message-content {
+  width: min(980px, calc(100% - 20px));
+  max-width: min(980px, calc(100% - 20px));
+  padding: 10px 12px;
+}
+
 .message-text {
   word-break: break-word;
   white-space: pre-wrap;
+}
+
+.cli-output {
+  color: #8f949d;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.45;
+  letter-spacing: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.cli-action-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.question-panel-host {
+  margin-top: 12px;
+}
+
+.question-panel {
+  background: #111318;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  color: #f3f5f7;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.question-panel-header,
+.question-panel-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.question-panel-title {
+  font-size: 12px;
+  color: #9aa4b2;
+  font-weight: 600;
+}
+
+.question-panel-progress {
+  display: flex;
+  gap: 6px;
+}
+
+.question-progress-dot {
+  width: 34px;
+  height: 6px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+}
+
+.question-progress-dot.active {
+  background: #409eff;
+}
+
+.question-progress-dot.answered {
+  box-shadow: inset 0 0 0 1px rgba(64, 158, 255, 0.4);
+}
+
+.question-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.question-panel-question {
+  font-size: 15px;
+  font-weight: 600;
+  color: #f3f5f7;
+}
+
+.question-panel-hint {
+  font-size: 12px;
+  color: #9aa4b2;
+}
+
+.question-panel-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.question-option {
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  color: inherit;
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.question-option:hover,
+.question-option.picked {
+  border-color: rgba(64, 158, 255, 0.55);
+  background: rgba(64, 158, 255, 0.12);
+}
+
+.question-option-mark {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid #6b7280;
+  margin-top: 1px;
+  flex: 0 0 auto;
+  position: relative;
+}
+
+.question-option-mark.multi {
+  border-radius: 6px;
+}
+
+.question-option-mark.picked {
+  border-color: #409eff;
+  background: #409eff;
+}
+
+.question-option-mark.picked::after {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border-radius: inherit;
+  background: #fff;
+}
+
+.question-option-main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.question-option-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: #f3f5f7;
+}
+
+.question-option-description {
+  font-size: 12px;
+  color: #9aa4b2;
+  line-height: 1.5;
+}
+
+.question-panel-footer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.question-panel :deep(.el-textarea__inner) {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.1);
+  color: #f3f5f7;
+}
+
+.question-panel :deep(.el-button:not(.el-button--primary)) {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.1);
+  color: #f3f5f7;
 }
 
 .tool-events {
@@ -2583,10 +3518,15 @@ onUnmounted(() => {
   padding: 2px 16px 2px 52px;
 }
 
+.compact-mode .event-message {
+  padding: 1px 10px;
+}
+
 .tool-event-item {
   display: inline-flex;
-  gap: 8px;
-  align-items: center;
+  flex-direction: column;
+  gap: 6px;
+  align-items: stretch;
   font-size: 12px;
   color: #606266;
   background: #f5f7fa;
@@ -2595,6 +3535,19 @@ onUnmounted(() => {
   padding: 4px 10px;
   max-width: 100%;
 }
+
+.compact-mode .tool-event-item {
+  padding: 3px 8px;
+}
+
+.tool-event-header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  cursor: pointer;
+}
+
 .tool-event-type {
   color: #409eff;
   font-weight: 600;
@@ -2602,9 +3555,32 @@ onUnmounted(() => {
 }
 
 .tool-event-summary {
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.tool-event-toggle {
+  color: #909399;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.tool-event-detail {
+  color: #303133;
+  max-width: min(820px, 100%);
+  max-height: 360px;
+  overflow: auto;
+  padding-top: 4px;
+  border-top: 1px solid #ebeef5;
+}
+
+.tool-event-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 2px;
 }
 
 /* Markdown Styles */

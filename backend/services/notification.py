@@ -101,6 +101,26 @@ class NotificationService:
             for item in results:
                 if isinstance(item, Exception):
                     logger.error(f"通知发送异常: {item}")
+
+    async def send_action_required_notification(
+        self,
+        title: str,
+        message: str,
+        task_id: str = None,
+        notif_type: str = "warning",
+        force_desktop: bool = True,
+    ):
+        """发送需要用户立即处理的通知。"""
+        tasks = []
+        if self.config.app_enabled:
+            tasks.append(self._send_app_notification(title, message, task_id, notif_type))
+        if force_desktop or self.config.desktop_enabled:
+            tasks.append(self._send_desktop_notification(title, message))
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for item in results:
+                if isinstance(item, Exception):
+                    logger.error(f"操作提醒发送异常: {item}")
     
     async def _send_app_notification(
         self,

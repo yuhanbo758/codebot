@@ -26,6 +26,8 @@ class LoadConfigFromPathRequest(BaseModel):
 
 class GeneralConfigUpdateRequest(BaseModel):
     language: Optional[str] = None
+    compact_mode: Optional[bool] = None
+    opencode_cli_display: Optional[bool] = None
     link_open_mode: Optional[str] = None
     file_storage_path: Optional[str] = None
     file_search_dirs: Optional[List[str]] = None

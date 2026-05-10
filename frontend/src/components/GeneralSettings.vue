@@ -15,6 +15,15 @@
       </el-form-item>
       <el-form-item label="紧凑模式">
         <el-switch v-model="form.compact_mode" />
+        <div class="form-item-tip">开启后聊天页减少头像、气泡内边距和消息间距，适合高密度查看长任务输出。</div>
+      </el-form-item>
+      <el-form-item label="OpenCode 显示">
+        <el-switch
+          v-model="form.opencode_cli_display"
+          active-text="CLI 原样"
+          inactive-text="结构化"
+        />
+        <div class="form-item-tip">开启后聊天回复按 OpenCode CLI / 桌面端风格展示完整运行过程。</div>
       </el-form-item>
       <el-form-item>
         <el-button type="primary" @click="save">保存设置</el-button>
@@ -177,6 +186,7 @@ import { Loading, CopyDocument, Folder, Delete, Plus } from '@element-plus/icons
 const form = ref({
   app_name: 'Codebot',
   language: 'zh-CN',
+  opencode_cli_display: true,
   auto_start: false,
   compact_mode: false
 })
@@ -200,7 +210,11 @@ const save = async () => {
     const res = await fetch('/api/config/general', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ language: form.value.language || 'zh-CN' })
+      body: JSON.stringify({
+        language: form.value.language || 'zh-CN',
+        compact_mode: Boolean(form.value.compact_mode),
+        opencode_cli_display: Boolean(form.value.opencode_cli_display)
+      })
     })
     const json = await res.json()
     if (!res.ok || !json?.success) {
@@ -219,6 +233,8 @@ const loadGeneralConfig = async () => {
     const json = await res.json()
     if (json?.success && json?.data) {
       form.value.language = json.data.language || 'zh-CN'
+      form.value.compact_mode = Boolean(json.data.compact_mode)
+      form.value.opencode_cli_display = json.data.opencode_cli_display !== false
       generalForm.value.link_open_mode = json.data.link_open_mode || 'system'
       generalForm.value.file_storage_path = json.data.file_storage_path || ''
       generalForm.value.file_search_dirs = json.data.file_search_dirs || []

@@ -67,6 +67,10 @@ class GeneralConfig(BaseModel):
     """通用配置"""
     # 聊天回复语言，默认中文。前端“设置 -> 通用设置 -> 语言”会写入该字段。
     language: str = "zh-CN"
+    # 聊天界面紧凑显示，减少头像、气泡、间距占用。
+    compact_mode: bool = False
+    # 打开后聊天窗口按 OpenCode CLI 风格显示完整运行过程。
+    opencode_cli_display: bool = True
     # 浏览器设置: "system" = 系统默认浏览器, "builtin" = 内置浏览器
     link_open_mode: str = "system"
     # AI 生成文件的默认存储路径（为空则使用系统默认位置）

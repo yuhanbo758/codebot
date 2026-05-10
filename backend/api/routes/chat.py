@@ -98,6 +98,7 @@ _task_queues: dict = {}
 _queue_runners: dict = {}  # key=conversation_id -> asyncio.Task
 _runtime_stream_state: Dict[str, Dict[str, Any]] = {}
 _multi_agent_dispatch_state: Dict[str, Dict[str, Any]] = {}
+_opencode_action_notification_keys: set[str] = set()
 
 
 def _configured_reply_language() -> str:
@@ -238,7 +239,26 @@ class SendMessageRequest(BaseModel):
     model: Optional[str] = None
     mode: Optional[str] = None  # agent mode: "plan", "build", or "agent"
     attached_files: Optional[List[AttachedFile]] = None
+    user_already_saved: bool = False
     project_dir: Optional[str] = None  # 用户选择的项目文件夹路径
+
+
+class PermissionReplyRequest(BaseModel):
+    request_id: str
+    reply: str
+    message: Optional[str] = None
+    session_id: Optional[str] = None
+    conversation_id: Optional[int] = None
+    project_dir: Optional[str] = None
+
+
+class QuestionReplyRequest(BaseModel):
+    request_id: str
+    answers: Optional[List[List[str]]] = None
+    answer: Optional[str] = None
+    reject: bool = False
+    conversation_id: Optional[int] = None
+    project_dir: Optional[str] = None
 
 class UpdateTitleRequest(BaseModel):
     title: str
@@ -673,8 +693,8 @@ def _runtime_append_event(conv_id: str, event: dict):
     payload["created_at"] = datetime.utcnow().isoformat() + "Z"
     events = state.get("events", [])
     events.append(payload)
-    if len(events) > 200:
-        events = events[-200:]
+    if len(events) > 1000:
+        events = events[-1000:]
     state["events"] = events
     state["updated_at"] = datetime.now()
 
@@ -3433,22 +3453,22 @@ async def send_to_opencode(request: SendMessageRequest):
             full_message = f"{files_context}\n\n【用户消息】{request.message}" if request.message.strip() else files_context
 
     # 如果该对话已有队列，把任务入队并立刻返回"已排队"
-    if conv_id in _task_queues and not _task_queues[conv_id].empty():
+    if conv_id not in _task_queues:
+        _task_queues[conv_id] = asyncio.Queue()
+
+    if is_conversation_running(conv_id) or not _task_queues[conv_id].empty():
         await _task_queues[conv_id].put({
             "message": full_message,
             "model": request.model,
             "mode": request.mode,
             "project_dir": request.project_dir,
+            "user_already_saved": request.user_already_saved,
         })
         return {
             "success": True,
             "data": {"content": None, "queued": True},
             "message": "任务已排队，将在当前任务完成后执行"
         }
-
-    # 初始化队列并启动 runner
-    if conv_id not in _task_queues:
-        _task_queues[conv_id] = asyncio.Queue()
 
     try:
         conversations_db.connect()
@@ -3506,23 +3526,683 @@ def _chunk_text(text: str, chunk_size: int = 24) -> List[str]:
     return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 
+def _json_for_display(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        return str(value)
+
+
+def _tool_state_text(state: dict, key: str) -> str:
+    value = state.get(key) if isinstance(state, dict) else None
+    return value if isinstance(value, str) and value.strip() else ""
+
+
+def _format_tool_part_detail(part: dict) -> str:
+    state = part.get("state") if isinstance(part.get("state"), dict) else {}
+    lines = [
+        f"工具：{part.get('tool') or 'unknown'}",
+        f"状态：{state.get('status') or 'unknown'}",
+    ]
+    title = _tool_state_text(state, "title")
+    if title:
+        lines.append(f"标题：{title}")
+    raw = _tool_state_text(state, "raw")
+    if raw:
+        lines.extend(["", "原始调用：", raw])
+    input_value = state.get("input")
+    if input_value:
+        lines.extend(["", "输入：", f"```json\n{_json_for_display(input_value)}\n```"])
+    output = _tool_state_text(state, "output")
+    if output:
+        lines.extend(["", "输出：", output])
+    error = _tool_state_text(state, "error")
+    if error:
+        lines.extend(["", "错误：", error])
+    metadata = state.get("metadata")
+    if metadata:
+        lines.extend(["", "元数据：", f"```json\n{_json_for_display(metadata)}\n```"])
+    attachments = state.get("attachments")
+    if attachments:
+        lines.extend(["", "附件：", f"```json\n{_json_for_display(attachments)}\n```"])
+    return "\n".join(lines).strip()
+
+
+def _format_part_detail(part: dict) -> str:
+    part_type = part.get("type")
+    if part_type == "tool":
+        return _format_tool_part_detail(part)
+    if part_type == "reasoning":
+        return str(part.get("text") or "").strip()
+    if part_type == "step-start":
+        snapshot = str(part.get("snapshot") or "").strip()
+        return f"快照：{snapshot}" if snapshot else ""
+    if part_type == "step-finish":
+        lines = [f"原因：{part.get('reason') or 'completed'}"]
+        tokens = part.get("tokens")
+        if tokens:
+            lines.extend(["", "Token：", f"```json\n{_json_for_display(tokens)}\n```"])
+        if part.get("cost") is not None:
+            lines.append(f"费用：{part.get('cost')}")
+        return "\n".join(lines)
+    if part_type == "patch":
+        return f"```json\n{_json_for_display(part.get('files') or part)}\n```"
+    if part_type == "snapshot":
+        return str(part.get("snapshot") or "").strip()
+    if part_type == "agent":
+        return f"Agent：{part.get('name') or ''}".strip()
+    if part_type == "retry":
+        return f"第 {part.get('attempt')} 次重试\n\n```json\n{_json_for_display(part.get('error') or part)}\n```"
+    if part_type == "compaction":
+        return "上下文已自动压缩" if part.get("auto") else "上下文已压缩"
+    return f"```json\n{_json_for_display(part)}\n```"
+
+
 def _part_to_stream_event(part: dict) -> Optional[dict]:
     if not isinstance(part, dict):
         return None
     part_type = part.get("type")
     if part_type == "text":
         return None
-    if part_type in ["step-start", "step-finish", "tool-call", "tool-result", "reasoning", "plan"]:
-        return {
-            "type": "tool_event",
-            "event_type": part_type,
-            "data": part
-        }
+    event_type = part_type or "unknown"
+    event_kind = "tool_event" if part_type in {
+        "tool",
+        "step-start",
+        "step-finish",
+        "reasoning",
+        "subtask",
+        "patch",
+        "snapshot",
+        "agent",
+        "retry",
+        "compaction",
+        "file",
+    } else "meta_event"
+    summary = ""
+    if part_type == "tool":
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        summary = (
+            _tool_state_text(state, "title")
+            or f"{part.get('tool') or 'tool'} · {state.get('status') or 'unknown'}"
+        )
+    elif part_type == "reasoning":
+        reasoning_text = str(part.get("text") or "").strip()
+        first_line = next((line.strip() for line in reasoning_text.splitlines() if line.strip()), "")
+        summary = first_line[:120] or "推理"
+    elif part_type == "step-finish":
+        summary = str(part.get("reason") or "步骤完成")
+    elif part_type == "agent":
+        summary = str(part.get("name") or "Agent")
+    elif part_type == "subtask":
+        summary = str(part.get("description") or part.get("agent") or "子任务")
+    else:
+        summary = event_type
+    return {
+        "type": event_kind,
+        "event_type": event_type,
+        "data": part,
+        "summary": summary,
+        "detail": _format_part_detail(part),
+    }
+
+
+def _permission_event_to_stream_event(event_type: str, properties: dict) -> dict:
+    request_id = properties.get("id") or properties.get("requestID") or properties.get("permissionID")
+    permission_name = properties.get("permission") or properties.get("type") or "permission"
+    metadata = properties.get("metadata") if isinstance(properties.get("metadata"), dict) else {}
+    title = str(properties.get("title") or metadata.get("title") or "").strip()
+    patterns = properties.get("patterns") or properties.get("pattern") or []
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    summary = title or f"OpenCode 请求确认：{permission_name}"
+    lines = ["OpenCode 正在等待你的选择，任务会在回复前暂停。", f"请求：{permission_name}"]
+    if title:
+        lines.append(f"标题：{title}")
+    if patterns:
+        lines.extend(["匹配规则：", *[f"- {item}" for item in patterns]])
+    if metadata:
+        lines.extend(["", "详细信息：", f"```json\n{_json_for_display(metadata)}\n```"])
+    tool = properties.get("tool")
+    if isinstance(tool, dict) and tool:
+        lines.extend(["", "关联工具调用：", f"```json\n{_json_for_display(tool)}\n```"])
+    actions = []
+    requires_action = event_type in {"permission.asked", "permission.updated"} and bool(request_id)
+    if requires_action:
+        options = metadata.get("options") or properties.get("options") or []
+        if isinstance(options, list) and options:
+            actions = [
+                {"label": str(option), "reply": "once", "message": str(option), "type": "primary"}
+                for option in options
+                if str(option).strip()
+            ]
+            actions.append({"label": "拒绝", "reply": "reject", "type": "danger"})
+        else:
+            actions = [
+                {"label": "允许一次", "reply": "once", "type": "primary"},
+                {"label": "总是允许", "reply": "always", "type": "success"},
+                {"label": "拒绝", "reply": "reject", "type": "danger"},
+            ]
+    if event_type == "permission.replied":
+        reply = properties.get("reply") or properties.get("response")
+        summary = f"权限请求已回复：{reply or '已处理'}"
     return {
         "type": "meta_event",
-        "event_type": part_type or "unknown",
-        "data": part
+        "event_type": event_type,
+        "data": properties,
+        "summary": summary,
+        "detail": "\n".join(lines).strip(),
+        "requires_user_action": requires_action,
+        "actions": actions,
+        "request_id": request_id,
     }
+
+
+def _question_event_to_stream_event(event_type: str, properties: dict) -> dict:
+    request_id = properties.get("id") or properties.get("requestID")
+    raw_questions = properties.get("questions") if isinstance(properties.get("questions"), list) else []
+    questions = []
+    for item in raw_questions:
+        if not isinstance(item, dict):
+            continue
+        raw_options = item.get("options") if isinstance(item.get("options"), list) else []
+        options = []
+        for option in raw_options:
+            if not isinstance(option, dict):
+                continue
+            label = str(option.get("label") or "").strip()
+            if not label:
+                continue
+            options.append({
+                "label": label,
+                "description": str(option.get("description") or "").strip(),
+            })
+        questions.append({
+            "header": str(item.get("header") or "Question").strip(),
+            "question": str(item.get("question") or "OpenCode 正在等待你的选择").strip(),
+            "multiple": bool(item.get("multiple")),
+            "custom": item.get("custom") is not False,
+            "options": options,
+        })
+    first = questions[0] if questions else {}
+    question_text = str(first.get("question") or "OpenCode 正在等待你的选择").strip()
+    header = str(first.get("header") or "Question").strip()
+    multiple = bool(first.get("multiple"))
+    allow_custom = first.get("custom") is not False
+    options = first.get("options") if isinstance(first.get("options"), list) else []
+    actions = []
+    for idx, option in enumerate(options):
+        if not isinstance(option, dict):
+            continue
+        label = str(option.get("label") or "").strip()
+        if not label:
+            continue
+        actions.append({
+            "label": label,
+            "reply": "question_answer",
+            "answers": [[label]],
+            "type": "primary" if idx == 0 else "default",
+        })
+    if allow_custom:
+        actions.append({"label": "自定义回答", "reply": "question_custom", "type": "info", "custom": True})
+    actions.append({"label": "取消/先不回答", "reply": "question_reject", "type": "danger"})
+
+    detail_lines = [question_text]
+    if options:
+        detail_lines.extend(["", "选项："])
+        for idx, option in enumerate(options, start=1):
+            if not isinstance(option, dict):
+                continue
+            label = str(option.get("label") or "").strip()
+            desc = str(option.get("description") or "").strip()
+            if label:
+                detail_lines.append(f"{idx}. {label}")
+                if desc:
+                    detail_lines.append(f"   {desc}")
+    if len(questions) > 1:
+        detail_lines.append("")
+        detail_lines.append(f"还有 {len(questions) - 1} 个问题会在回复后继续处理。")
+
+    return {
+        "type": "meta_event",
+        "event_type": event_type,
+        "data": properties,
+        "summary": f"{header}: {question_text}" if header else question_text,
+        "detail": "\n".join(detail_lines).strip(),
+        "requires_user_action": event_type == "question.asked" and bool(request_id),
+        "actions": actions if event_type == "question.asked" and bool(request_id) else [],
+        "request_id": request_id,
+        "question": question_text,
+        "questions": questions,
+        "multiple": multiple,
+        "allow_custom": allow_custom,
+    }
+
+
+def _opencode_event_to_stream_event(stream_event: dict) -> Optional[dict]:
+    event_type = str(stream_event.get("event_type") or "unknown")
+    properties = stream_event.get("properties") if isinstance(stream_event.get("properties"), dict) else {}
+    if event_type in {"permission.asked", "permission.updated", "permission.replied"}:
+        return _permission_event_to_stream_event(event_type, properties)
+    if event_type in {"question.asked", "question.replied", "question.rejected"}:
+        return _question_event_to_stream_event(event_type, properties)
+
+    summary = ""
+    detail = ""
+    if event_type == "todo.updated":
+        todos = properties.get("todos") if isinstance(properties.get("todos"), list) else []
+        summary = f"待办更新：{len(todos)} 项"
+        detail = "\n".join(
+            f"- [{item.get('status') or 'pending'}] {item.get('content') or ''}"
+            for item in todos if isinstance(item, dict)
+        )
+    elif event_type == "session.status":
+        status = properties.get("status")
+        status_type = status.get("type") if isinstance(status, dict) else status
+        summary = f"会话状态：{status_type or 'updated'}"
+        detail = f"```json\n{_json_for_display(status or properties)}\n```"
+    elif event_type == "session.idle":
+        summary = "会话状态：idle"
+    elif event_type == "session.error":
+        summary = "OpenCode 会话错误"
+        detail = f"```json\n{_json_for_display(properties.get('error') or properties)}\n```"
+    elif event_type == "message.updated":
+        info = properties.get("info") if isinstance(properties.get("info"), dict) else {}
+        if info.get("role") != "assistant":
+            return None
+        finish = info.get("finish")
+        error = info.get("error")
+        summary = "助手消息更新"
+        if finish:
+            summary = f"助手消息完成：{finish}"
+        if error:
+            summary = "助手消息错误"
+        visible = {
+            key: info.get(key)
+            for key in ["id", "role", "mode", "finish", "cost", "tokens", "error"]
+            if info.get(key) is not None
+        }
+        detail = f"```json\n{_json_for_display(visible)}\n```" if visible else ""
+    elif event_type == "message.part.updated":
+        part = properties.get("part") if isinstance(properties.get("part"), dict) else {}
+        part_type = part.get("type") or "part"
+        summary = f"消息片段更新：{part_type}"
+        if part_type == "text":
+            text = str(part.get("text") or "").strip()
+            detail = text or f"```json\n{_json_for_display(part)}\n```"
+        else:
+            detail = f"```json\n{_json_for_display(part or properties)}\n```"
+    elif event_type == "file.edited":
+        summary = f"文件已编辑：{properties.get('file') or ''}".strip()
+    elif event_type == "command.executed":
+        summary = f"命令已执行：{properties.get('name') or ''}".strip()
+        detail = f"```json\n{_json_for_display(properties)}\n```"
+    elif event_type.startswith("pty."):
+        info = properties.get("info") if isinstance(properties.get("info"), dict) else properties
+        summary = f"终端事件：{event_type}"
+        detail = f"```json\n{_json_for_display(info)}\n```"
+    elif event_type.startswith("tui."):
+        summary = str(properties.get("message") or properties.get("title") or event_type)
+        detail = f"```json\n{_json_for_display(properties)}\n```"
+    else:
+        summary = event_type
+        detail = f"```json\n{_json_for_display(properties)}\n```" if properties else ""
+
+    return {
+        "type": "meta_event",
+        "event_type": event_type,
+        "data": properties,
+        "summary": summary,
+        "detail": detail,
+    }
+
+
+async def _notify_opencode_action_required(conversation_id: int, event: dict):
+    if not event.get("requires_user_action"):
+        return
+    request_id = str(event.get("request_id") or "")
+    key = request_id or hashlib.sha1(_json_for_display(event).encode("utf-8", errors="ignore")).hexdigest()
+    if key in _opencode_action_notification_keys:
+        return
+    _opencode_action_notification_keys.add(key)
+    if len(_opencode_action_notification_keys) > 500:
+        _opencode_action_notification_keys.clear()
+        _opencode_action_notification_keys.add(key)
+
+    title = "OpenCode 等待你的选择"
+    summary = str(event.get("summary") or "有一个 OpenCode 操作需要确认")
+    message = f"{summary}\n\n对话ID: {conversation_id}\n请回到 Codebot 聊天窗口处理。"
+    try:
+        from api.routes import notifications as notifications_router
+        service = getattr(notifications_router, "notification_service", None)
+        if service is None:
+            return
+        asyncio.create_task(
+            service.send_action_required_notification(
+                title=title,
+                message=message,
+                task_id=f"chat:{conversation_id}",
+                notif_type="warning",
+                force_desktop=True,
+            )
+        )
+    except Exception as exc:
+        logger.debug(f"OpenCode 操作提醒发送失败（跳过）: {exc}")
+
+
+def _opencode_cli_display_enabled() -> bool:
+    return bool(getattr(app_config.general, "opencode_cli_display", True))
+
+
+def _cli_tool_symbol(tool_name: str, title: str = "") -> str:
+    name = (tool_name or title or "").lower()
+    if "webfetch" in name or "web_fetch" in name:
+        return "%"
+    if "glob" in name:
+        return "*"
+    if "bash" in name or "shell" in name:
+        return "$"
+    if any(token in name for token in ["edit", "write", "patch"]):
+        return "✎"
+    if "task" in name:
+        return "◌"
+    return "→"
+
+
+def _cli_todo_marker(status: str) -> str:
+    normalized = (status or "").lower()
+    if normalized in {"completed", "done", "success"}:
+        return "[✓]"
+    if normalized in {"in_progress", "running", "active"}:
+        return "[•]"
+    if normalized in {"cancelled", "canceled", "error", "failed"}:
+        return "[-]"
+    return "[ ]"
+
+
+def _cli_append_block(current: str, block: str) -> Tuple[str, str]:
+    text = (block or "").strip("\n")
+    if not text:
+        return current, ""
+    prefix = "\n\n" if current and not current.endswith("\n\n") else ""
+    delta = f"{prefix}{text}\n"
+    return f"{current}{delta}", delta
+
+
+def _tool_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _tool_path(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    raw = value.strip()
+    try:
+        path_obj = Path(raw)
+        if path_obj.is_absolute():
+            try:
+                rel = path_obj.relative_to(Path.cwd())
+                return str(rel).replace("\\", "/") or "."
+            except ValueError:
+                return str(path_obj).replace("\\", "/")
+    except Exception:
+        pass
+    return raw.replace("\\", "/")
+
+
+def _cli_info(data: Dict[str, Any], skip: Optional[set[str]] = None) -> str:
+    skip = skip or set()
+    items = []
+    for key, val in data.items():
+        if key in skip:
+            continue
+        if isinstance(val, (str, int, float, bool)) and str(val).strip():
+            items.append(f"{key}={val}")
+    return f"[{', '.join(items)}]" if items else ""
+
+
+def _cli_count(value: Any, label: str) -> str:
+    try:
+        count_value = int(value)
+    except Exception:
+        return ""
+    return f"{count_value} {label}{'' if count_value == 1 else 'es'}"
+
+
+def _format_cli_tool_title(tool: str, state: Dict[str, Any], input_value: Dict[str, Any], metadata: Dict[str, Any]) -> Tuple[str, str, bool]:
+    name = (tool or "").lower()
+    explicit_title = _tool_state_text(state, "title")
+    if name in {"read", "view"}:
+        file_path = _tool_path(input_value.get("filePath") or input_value.get("file_path") or input_value.get("path"))
+        extra = _cli_info(input_value, {"filePath", "file_path", "path"})
+        base = f"Read {file_path}" if file_path else (explicit_title if explicit_title.lower().startswith("read") else f"Read {explicit_title}".strip())
+        return "→", f"{base}{f' {extra}' if extra else ''}".strip(), False
+    if name == "skill":
+        skill_name = str(input_value.get("name") or "").strip()
+        base = f"Skill \"{skill_name}\"" if skill_name else (explicit_title if explicit_title.lower().startswith("skill") else f"Skill \"{explicit_title}\"")
+        return "→", base.strip(), False
+    if name == "webfetch":
+        url = str(input_value.get("url") or "").strip()
+        return "%", f"WebFetch {url}".strip() or "WebFetch", False
+    if name == "websearch":
+        query = str(input_value.get("query") or "").strip()
+        return "◈", f"WebSearch \"{query}\"" if query else "WebSearch", False
+    if name == "glob":
+        pattern = str(input_value.get("pattern") or "").strip()
+        root = _tool_path(input_value.get("path"))
+        matches = _cli_count(metadata.get("count"), "match")
+        desc = f" in {root}" if root else ""
+        desc = f"{desc} · {matches}" if matches and desc else (f" · {matches}" if matches else desc)
+        return "✱", f"Glob \"{pattern}\"{desc}".strip(), False
+    if name == "grep":
+        pattern = str(input_value.get("pattern") or "").strip()
+        root = _tool_path(input_value.get("path"))
+        matches = _cli_count(metadata.get("matches"), "match")
+        desc = f" in {root}" if root else ""
+        desc = f"{desc} · {matches}" if matches and desc else (f" · {matches}" if matches else desc)
+        return "✱", f"Grep \"{pattern}\"{desc}".strip(), False
+    if name == "list":
+        root = _tool_path(input_value.get("path"))
+        return "→", f"List {root}".strip(), False
+    if name == "lsp":
+        op = input_value.get("operation") or "request"
+        file_path = _tool_path(input_value.get("filePath") or input_value.get("file_path"))
+        line = input_value.get("line")
+        char = input_value.get("character")
+        pos = f":{line}:{char}" if isinstance(line, int) and isinstance(char, int) else ""
+        return "→", f"LSP {op} {file_path}{pos}".strip(), False
+    if name == "todowrite":
+        return "#", "Todos", False
+    if name == "question":
+        total = len(input_value.get("questions") or []) if isinstance(input_value.get("questions"), list) else 0
+        return "→", f"Asked {total} question{'' if total == 1 else 's'}", False
+    if name == "task":
+        kind = str(input_value.get("subagent_type") or "general").title()
+        desc = str(input_value.get("description") or explicit_title or "").strip()
+        status = str(state.get("status") or "").lower()
+        icon = "✗" if status == "error" else ("•" if status == "running" else "✓")
+        return icon, desc or f"{kind} Task", False
+    if name in {"edit", "write"}:
+        file_path = _tool_path(input_value.get("filePath") or input_value.get("file_path") or input_value.get("path"))
+        return "←", f"{name.title()} {file_path}".strip(), True
+    if name == "apply_patch":
+        files = metadata.get("files")
+        count_value = len(files) if isinstance(files, list) else 0
+        title = "Patch" if count_value == 0 else f"Patch {count_value} file{'' if count_value == 1 else 's'}"
+        return "%", title, False
+    if name in {"bash", "shell"}:
+        command = str(input_value.get("command") or explicit_title or "").strip()
+        return "$", command or "Bash", True
+    return _cli_tool_symbol(tool, explicit_title), explicit_title or tool or "Tool", False
+
+
+def _format_todo_body_from_input(input_value: Dict[str, Any]) -> str:
+    todos = input_value.get("todos")
+    if not isinstance(todos, list):
+        return ""
+    rows = []
+    for item in todos:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "").strip()
+        if content:
+            rows.append(f"{_cli_todo_marker(str(item.get('status') or ''))} {content}")
+    return "\n".join(rows)
+
+
+def _format_cli_tool_part(part: dict, seen: set[str]) -> str:
+    state = _tool_dict(part.get("state"))
+    input_value = _tool_dict(state.get("input"))
+    metadata = _tool_dict(state.get("metadata"))
+    part_id = str(part.get("id") or part.get("callID") or "")
+    tool = str(part.get("tool") or "")
+    icon, title, allow_body = _format_cli_tool_title(tool, state, input_value, metadata)
+    status = str(state.get("status") or "").lower()
+    error = _tool_state_text(state, "error")
+    if status == "error" and error:
+        title = f"{title} failed: {error}"
+        icon = "✗"
+
+    lines: List[str] = []
+    title_key = f"tool-title:{part_id or tool}:{icon}:{title}"
+    if title and title_key not in seen:
+        seen.add(title_key)
+        lines.append(f"{icon} {title}".strip())
+
+    body = ""
+    name = (tool or "").lower()
+    if name == "todowrite":
+        body = _format_todo_body_from_input(input_value)
+    elif allow_body:
+        if name == "edit":
+            body = str(metadata.get("diff") or "").strip()
+        else:
+            body = _tool_state_text(state, "output").strip()
+    if body:
+        body_key = f"tool-body:{part_id}:{hashlib.sha1(body.encode('utf-8', errors='ignore')).hexdigest()}"
+        if body_key not in seen:
+            seen.add(body_key)
+            if lines:
+                lines.append("")
+            lines.append(body.rstrip())
+
+    return "\n".join(lines).strip()
+
+
+def _format_cli_part(part: dict, seen: set[str]) -> str:
+    if not isinstance(part, dict):
+        return ""
+    part_type = part.get("type")
+    if part_type == "tool":
+        return _format_cli_tool_part(part, seen)
+    if part_type == "reasoning":
+        return ""
+    if part_type == "agent":
+        return ""
+    if part_type == "patch":
+        files = part.get("files") if isinstance(part.get("files"), list) else []
+        if not files:
+            return ""
+        key = f"patch:{part.get('id')}:{len(files)}"
+        if key in seen:
+            return ""
+        seen.add(key)
+        return "\n".join(f"✎ {item}" for item in files)
+    return ""
+
+
+def _format_cli_opencode_event(stream_event: dict, seen: set[str]) -> str:
+    event_type = str(stream_event.get("event_type") or "")
+    properties = stream_event.get("properties") if isinstance(stream_event.get("properties"), dict) else {}
+
+    if event_type == "todo.updated":
+        todos = properties.get("todos") if isinstance(properties.get("todos"), list) else []
+        lines = ["# Todos", ""]
+        for item in todos:
+            if not isinstance(item, dict):
+                continue
+            lines.append(f"{_cli_todo_marker(str(item.get('status') or ''))} {item.get('content') or ''}".rstrip())
+        block = "\n".join(lines).strip()
+        key = f"todo:{hashlib.sha1(block.encode('utf-8', errors='ignore')).hexdigest()}"
+        if key in seen:
+            return ""
+        seen.add(key)
+        return block
+
+    if event_type in {"permission.asked", "permission.updated"}:
+        converted = _permission_event_to_stream_event(event_type, properties)
+        request_id = str(converted.get("request_id") or "")
+        key = f"permission:{request_id}"
+        if key in seen:
+            return ""
+        seen.add(key)
+        detail = str(converted.get("summary") or "OpenCode 正在等待你的选择").strip()
+        actions = converted.get("actions") if isinstance(converted.get("actions"), list) else []
+        action_text = " / ".join(str(action.get("label") or "") for action in actions if isinstance(action, dict))
+        return f"! {detail}\n{action_text}".strip()
+
+    if event_type == "question.asked":
+        converted = _question_event_to_stream_event(event_type, properties)
+        request_id = str(converted.get("request_id") or "")
+        key = f"question:{request_id}"
+        if key in seen:
+            return ""
+        seen.add(key)
+        lines = [f"! {converted.get('question') or converted.get('summary') or 'OpenCode 正在等待你的选择'}"]
+        question_items = properties.get("questions") if isinstance(properties.get("questions"), list) else []
+        first_question = question_items[0] if question_items and isinstance(question_items[0], dict) else {}
+        options = first_question.get("options") if isinstance(first_question.get("options"), list) else []
+        if isinstance(options, list):
+            for idx, option in enumerate(options, start=1):
+                if isinstance(option, dict) and option.get("label"):
+                    lines.append(f"{idx}. {option.get('label')}")
+        lines.append("请在聊天窗口中选择。")
+        return "\n".join(lines).strip()
+
+    if event_type in {"question.replied", "question.rejected"}:
+        key = f"{event_type}:{properties.get('requestID') or properties.get('id')}"
+        if key in seen:
+            return ""
+        seen.add(key)
+        if event_type == "question.rejected":
+            return "✓ Question dismissed"
+        answers = properties.get("answers")
+        return f"✓ Question answered {answers or ''}".strip()
+
+    if event_type == "permission.replied":
+        reply = properties.get("reply") or properties.get("response")
+        key = f"permission-replied:{properties.get('requestID') or properties.get('permissionID')}:{reply}"
+        if key in seen:
+            return ""
+        seen.add(key)
+        return f"✓ Permission {reply or 'replied'}"
+
+    if event_type == "session.error":
+        block = f"! OpenCode error\n{_json_for_display(properties.get('error') or properties)}"
+        key = f"session-error:{hashlib.sha1(block.encode('utf-8', errors='ignore')).hexdigest()}"
+        if key in seen:
+            return ""
+        seen.add(key)
+        return block
+
+    if event_type == "file.edited":
+        file_path = str(properties.get("file") or "").strip()
+        key = f"file-edited:{file_path}"
+        if not file_path or key in seen:
+            return ""
+        seen.add(key)
+        return f"✎ {file_path}"
+
+    if event_type == "command.executed":
+        name = str(properties.get("name") or "").strip()
+        args = str(properties.get("arguments") or "").strip()
+        block = f"> {name} {args}".strip()
+        key = f"command:{hashlib.sha1(block.encode('utf-8', errors='ignore')).hexdigest()}"
+        if not name or key in seen:
+            return ""
+        seen.add(key)
+        return block
+
+    return ""
 
 
 @router.post("/send_stream")
@@ -3534,7 +4214,18 @@ async def send_to_opencode_stream(request: SendMessageRequest):
         if files_context:
             full_message = f"{files_context}\n\n【用户消息】{request.message}" if request.message.strip() else files_context
 
-    if conv_id in _task_queues and not _task_queues[conv_id].empty():
+    if conv_id not in _task_queues:
+        _task_queues[conv_id] = asyncio.Queue()
+
+    if is_conversation_running(conv_id) or not _task_queues[conv_id].empty():
+        await _task_queues[conv_id].put({
+            "message": full_message,
+            "model": request.model,
+            "mode": request.mode,
+            "project_dir": request.project_dir,
+            "user_already_saved": request.user_already_saved,
+        })
+
         async def queued_stream():
             event = {"type": "queued", "message": "任务已排队，将在当前任务完成后执行"}
             yield json.dumps(event, ensure_ascii=False) + "\n"
@@ -3548,9 +4239,6 @@ async def send_to_opencode_stream(request: SendMessageRequest):
             }
         )
 
-    if conv_id not in _task_queues:
-        _task_queues[conv_id] = asyncio.Queue()
-
     async def _run_stream_worker(event_queue: asyncio.Queue):
         _runtime_start(conv_id)
         try:
@@ -3563,6 +4251,9 @@ async def send_to_opencode_stream(request: SendMessageRequest):
             parts: List[dict] = []
             internal_prompt: str = ""
             tool_events_log: List[dict] = []
+            cli_display = _opencode_cli_display_enabled()
+            cli_seen: set[str] = set()
+            cli_text_started = False
             async for stream_event in _stream_execute_opencode_with_meta(
                 full_message,
                 model=request.model,
@@ -3575,7 +4266,25 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                     internal_prompt = stream_event.get("prompt") or ""
                     continue
                 if event_type == "content_delta":
-                    raw_content = stream_event.get("content") or f"{raw_content}{stream_event.get('delta', '')}"
+                    delta_text = stream_event.get("delta") or ""
+                    raw_content = stream_event.get("content") or f"{raw_content}{delta_text}"
+                    if cli_display:
+                        if not delta_text:
+                            continue
+                        prefix = ""
+                        if not cli_text_started and content and not content.endswith("\n\n"):
+                            prefix = "\n\n"
+                        cli_text_started = True
+                        delta = f"{prefix}{delta_text}" if prefix else delta_text
+                        content = f"{content}{delta}"
+                        _runtime_set_content(conv_id, content)
+                        await event_queue.put({
+                            "type": "content_delta",
+                            "delta": delta,
+                            "content": content,
+                            "cli_display": True,
+                        })
+                        continue
                     next_content = _sanitize_assistant_output(raw_content, user_message=request.message)
                     if next_content == content:
                         continue
@@ -3593,20 +4302,74 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                     if isinstance(part, dict):
                         parts.append(part)
                         tool_events_log.append(part)
+                        if cli_display:
+                            block = _format_cli_part(part, cli_seen)
+                            content, delta = _cli_append_block(content, block)
+                            if delta:
+                                _runtime_set_content(conv_id, content)
+                                await event_queue.put({
+                                    "type": "content_delta",
+                                    "delta": delta,
+                                    "content": content,
+                                    "cli_display": True,
+                                })
+                            continue
                         converted = _part_to_stream_event(part)
                         if converted is not None:
                             _runtime_append_event(conv_id, converted)
                             await event_queue.put(converted)
+                            await _notify_opencode_action_required(request.conversation_id, converted)
+                    continue
+                if event_type == "opencode_event":
+                    converted = _opencode_event_to_stream_event(stream_event)
+                    if cli_display:
+                        block = _format_cli_opencode_event(stream_event, cli_seen)
+                        content, delta = _cli_append_block(content, block)
+                        if delta:
+                            _runtime_set_content(conv_id, content)
+                            await event_queue.put({
+                                "type": "content_delta",
+                                "delta": delta,
+                                "content": content,
+                                "cli_display": True,
+                            })
+                        if converted is not None:
+                            tool_events_log.append(converted)
+                            if converted.get("requires_user_action"):
+                                inline_event = {**converted, "cli_inline": True}
+                                _runtime_append_event(conv_id, inline_event)
+                                await event_queue.put(inline_event)
+                                await _notify_opencode_action_required(request.conversation_id, inline_event)
+                        continue
+                    if converted is not None:
+                        tool_events_log.append(converted)
+                        _runtime_append_event(conv_id, converted)
+                        await event_queue.put(converted)
+                        await _notify_opencode_action_required(request.conversation_id, converted)
                     continue
                 if event_type == "done":
                     raw_content = stream_event.get("content") or raw_content
-                    content = _sanitize_assistant_output(raw_content, user_message=request.message) or content
+                    if cli_display:
+                        content = content or raw_content
+                    else:
+                        content = _sanitize_assistant_output(raw_content, user_message=request.message) or content
                     _runtime_set_content(conv_id, content)
                     stream_parts = stream_event.get("parts")
                     if isinstance(stream_parts, list):
                         for p in stream_parts:
                             if isinstance(p, dict):
                                 parts.append(p)
+                                if cli_display:
+                                    block = _format_cli_part(p, cli_seen)
+                                    content, delta = _cli_append_block(content, block)
+                                    if delta:
+                                        _runtime_set_content(conv_id, content)
+                                        await event_queue.put({
+                                            "type": "content_delta",
+                                            "delta": delta,
+                                            "content": content,
+                                            "cli_display": True,
+                                        })
                     continue
                 if event_type == "error":
                     raise RuntimeError(stream_event.get("error") or "OpenCode 流式调用失败")
@@ -3655,8 +4418,8 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                 logger.warning(f"聊天日志保存失败（跳过）: {_log_err}")
 
             asyncio.create_task(_drain_queue(conv_id, request.conversation_id))
-            _runtime_append_event(conv_id, {"type": "done", "content": content or ""})
-            await event_queue.put({"type": "done", "content": content or ""})
+            _runtime_append_event(conv_id, {"type": "done", "content": content or "", "cli_display": cli_display})
+            await event_queue.put({"type": "done", "content": content or "", "cli_display": cli_display})
         except Exception as e:
             _runtime_append_event(conv_id, {"type": "error", "message": str(e)})
             await event_queue.put({"type": "error", "message": str(e)})
@@ -3694,6 +4457,92 @@ async def send_to_opencode_stream(request: SendMessageRequest):
     )
 
 
+@router.post("/permission/reply")
+async def reply_opencode_permission(request: PermissionReplyRequest):
+    request_id = (request.request_id or "").strip()
+    reply = (request.reply or "").strip()
+    if not request_id:
+        raise HTTPException(status_code=400, detail="缺少权限请求 ID")
+    if reply not in {"once", "always", "reject"}:
+        raise HTTPException(status_code=400, detail="无效的权限回复")
+
+    client = opencode_ws or OpenCodeClient(app_config.opencode.server_url)
+    ok = await _ensure_opencode_client_connected(client)
+    if not ok:
+        raise HTTPException(status_code=503, detail="OpenCode 未连接")
+
+    success = await client.reply_permission(
+        request_id=request_id,
+        reply=reply,
+        message=request.message,
+        session_id=request.session_id,
+        workspace=request.project_dir,
+    )
+    if not success:
+        raise HTTPException(status_code=502, detail="OpenCode 权限回复失败")
+
+    if request.conversation_id:
+        _runtime_append_event(str(request.conversation_id), {
+            "type": "meta_event",
+            "event_type": "permission.local_reply",
+            "summary": f"你已选择：{reply}",
+            "detail": "",
+            "data": {"request_id": request_id, "reply": reply},
+        })
+    return {"success": True, "message": "已回复 OpenCode 权限请求"}
+
+
+@router.post("/question/reply")
+async def reply_opencode_question(request: QuestionReplyRequest):
+    request_id = (request.request_id or "").strip()
+    if not request_id:
+        raise HTTPException(status_code=400, detail="缺少 question 请求 ID")
+
+    client = opencode_ws or OpenCodeClient(app_config.opencode.server_url)
+    ok = await _ensure_opencode_client_connected(client)
+    if not ok:
+        raise HTTPException(status_code=503, detail="OpenCode 未连接")
+
+    if request.reject:
+        success = await client.reject_question(request_id=request_id, workspace=request.project_dir)
+        if not success:
+            raise HTTPException(status_code=502, detail="拒绝 OpenCode 问题失败")
+        reply_text = "已取消/先不回答"
+    else:
+        answers = request.answers
+        if answers is None:
+            answer = (request.answer or "").strip()
+            if not answer:
+                raise HTTPException(status_code=400, detail="缺少问题回答")
+            answers = [[answer]]
+        cleaned_answers = []
+        for answer_group in answers:
+            if isinstance(answer_group, list):
+                cleaned_answers.append([str(item).strip() for item in answer_group if str(item).strip()])
+            else:
+                cleaned_answers.append([])
+        if not any(cleaned_answers):
+            raise HTTPException(status_code=400, detail="缺少有效问题回答")
+        success = await client.reply_question(
+            request_id=request_id,
+            answers=cleaned_answers,
+            workspace=request.project_dir,
+        )
+        if not success:
+            raise HTTPException(status_code=502, detail="回复 OpenCode 问题失败")
+        reply_text = "；".join(", ".join(group) for group in cleaned_answers)
+
+    if request.conversation_id:
+        _runtime_append_event(str(request.conversation_id), {
+            "type": "meta_event",
+            "event_type": "question.local_reply",
+            "summary": f"你已回复：{reply_text}",
+            "detail": "",
+            "data": {"request_id": request_id, "reply": reply_text, "rejected": request.reject},
+        })
+    return {"success": True, "message": "已回复 OpenCode 问题"}
+
+
 async def _drain_queue(conv_id: str, conversation_id: int):
     """处理队列中排队的任务"""
     if conv_id not in _task_queues:
@@ -3708,12 +4557,13 @@ async def _drain_queue(conv_id: str, conversation_id: int):
             conversations_db.connect()
             memory_manager = MemoryManager()
 
-            # 先保存用户消息
-            await memory_manager.save_message(
-                conversation_id=conversation_id,
-                role="user",
-                content=task["message"]
-            )
+            # 前端已保存的排队消息不重复入库；直连 API 入队的消息仍在这里保存。
+            if not task.get("user_already_saved"):
+                await memory_manager.save_message(
+                    conversation_id=conversation_id,
+                    role="user",
+                    content=task["message"]
+                )
 
             content = await _execute_opencode(
                 task["message"],
