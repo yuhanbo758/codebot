@@ -23,8 +23,8 @@ from config import settings, app_config
 from database.init_db import conversations_db
 from core.memory_manager import MemoryManager
 from core.opencode_ws import OpenCodeClient, _conversation_current_session, is_conversation_running, mark_conversation_running, unmark_conversation_running
-from core.memory_extractor import extract_and_save_background
-from core.growth import record_chat_growth_candidates
+from core.memory_extractor import extract_and_save_background, extract_candidates
+from core.growth import add_candidate, record_chat_growth_candidates
 from core.skill_generator import generate_skill_body_from_chat
 from core.skill_registry import (
     AUTO_GENERATED,
@@ -104,6 +104,10 @@ _opencode_action_notification_keys: set[str] = set()
 def _configured_reply_language() -> str:
     language = (getattr(app_config.general, "language", "") or "zh-CN").strip()
     return language if language in {"zh-CN", "en-US"} else "zh-CN"
+
+
+def _growth_candidate_decision_enabled() -> bool:
+    return bool(getattr(app_config.general, "growth_candidate_decision", False))
 
 
 def _reply_language_instruction() -> str:
@@ -436,22 +440,45 @@ async def _run_chat_post_processing(
 ) -> None:
     skill_creation_intent = _looks_like_skill_creation_intent(user_message)
     migrated_skills: List[Dict[str, Any]] = []
+    candidate_decision_enabled = _growth_candidate_decision_enabled()
     try:
-        await extract_and_save_background(
-            user_message=user_message,
-            assistant_response=assistant_response,
-            memory_manager=_get_chat_memory_manager(),
-            opencode_ws=opencode_ws,
-        )
+        if candidate_decision_enabled:
+            existing_contents: List[str] = []
+            try:
+                recent = await _get_chat_memory_manager().get_memories(limit=50)
+                existing_contents = [str(item.get("content") or "") for item in recent if item.get("content")]
+            except Exception:
+                existing_contents = []
+            candidates = await extract_candidates(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                existing_contents=existing_contents,
+                memory_manager=_get_chat_memory_manager(),
+                opencode_ws=opencode_ws,
+            )
+            for content, category in candidates:
+                stage_memory_growth_candidate(
+                    content=content,
+                    category=category,
+                    conversation_id=conversation_id,
+                    evidence=user_message,
+                )
+        else:
+            await extract_and_save_background(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                memory_manager=_get_chat_memory_manager(),
+                opencode_ws=opencode_ws,
+            )
     except Exception as exc:
         logger.debug(f"后台记忆提取失败: {exc}")
 
     try:
-        await _try_create_scheduled_task(user_message)
+        await _stage_or_create_schedule_from_message(user_message, conversation_id=conversation_id)
     except Exception as exc:
         logger.debug(f"后台定时任务沉淀失败: {exc}")
 
-    if skill_creation_intent:
+    if skill_creation_intent and not candidate_decision_enabled:
         try:
             migrated_skills.extend(_migrate_opencode_skill_refs_from_reply(assistant_response))
             if not migrated_skills:
@@ -469,7 +496,7 @@ async def _run_chat_post_processing(
 
     try:
         if not (skill_creation_intent and migrated_skills):
-            await _materialize_reusable_skill(
+            await _stage_or_materialize_skill(
                 user_message=user_message,
                 assistant_response=assistant_response,
                 conversation_id=conversation_id,
@@ -478,12 +505,13 @@ async def _run_chat_post_processing(
         logger.debug(f"后台技能沉淀失败: {exc}")
 
     try:
-        candidates = record_chat_growth_candidates(
-            user_message=user_message,
-            assistant_response=assistant_response,
-            conversation_id=conversation_id,
-        )
-        await _auto_apply_growth_candidates(candidates, user_message, assistant_response, conversation_id)
+        if not candidate_decision_enabled:
+            candidates = record_chat_growth_candidates(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                conversation_id=conversation_id,
+            )
+            await _auto_apply_growth_candidates(candidates, user_message, assistant_response, conversation_id)
     except Exception as exc:
         logger.debug(f"成长候选记录失败: {exc}")
 
@@ -524,20 +552,14 @@ async def _auto_apply_growth_candidates(
                     or assistant_response
                     or ""
                 )
-                skill_body = await generate_skill_body_from_chat(
-                    user_message=source_user_message,
-                    assistant_response=_sanitize_assistant_output(source_assistant_response),
-                    title=candidate.get("title") or generate_conversation_title(user_message or "自动技能"),
-                    description=(candidate.get("evidence") or user_message or "")[:180],
-                    opencode_client=opencode_ws if opencode_ws and getattr(opencode_ws, "connected", False) else None,
-                )
-                item = get_skill_registry().create_auto_skill(
+                item = await _materialize_skill_content(
                     name=candidate.get("title") or generate_conversation_title(user_message or "自动技能"),
                     description=(candidate.get("evidence") or user_message or "")[:180],
-                    body=skill_body,
                     user_message=source_user_message,
+                    assistant_response=source_assistant_response,
                 )
-                logger.info(f"[growth] 自动沉淀技能: {item.get('slug')}")
+                if item:
+                    logger.info(f"[growth] 自动沉淀技能: {item.get('slug') or item.get('id')}")
                 from core.growth import ACCEPTED, mark_candidate
                 mark_candidate(candidate_id, ACCEPTED)
             elif kind == "task" and hit_count >= 2:
@@ -547,6 +569,189 @@ async def _auto_apply_growth_candidates(
                     mark_candidate(candidate_id, ACCEPTED)
         except Exception as exc:
             logger.debug(f"成长候选自动落地失败: {exc}")
+
+
+def stage_memory_growth_candidate(content: str, category: str = "note", conversation_id: Optional[int] = None, evidence: str = "") -> Optional[Dict[str, Any]]:
+    content = str(content or "").strip()
+    category = str(category or "note").strip() or "note"
+    if not content:
+        return None
+    return add_candidate(
+        kind="memory",
+        title="待确认记忆",
+        content=content,
+        confidence=0.8,
+        payload={"category": category, "conversation_id": conversation_id},
+        evidence=str(evidence or content)[:1000],
+    )
+
+
+def stage_task_growth_candidate(
+    title: str,
+    content: str,
+    *,
+    conversation_id: Optional[int] = None,
+    cron_expression: str = "",
+    run_once: bool = False,
+    notify_channels: Optional[List[str]] = None,
+    evidence: str = "",
+) -> Optional[Dict[str, Any]]:
+    title = str(title or "").strip()
+    content = str(content or "").strip()
+    if not title or not content:
+        return None
+    channels = notify_channels if isinstance(notify_channels, list) and notify_channels else ["app"]
+    return add_candidate(
+        kind="task",
+        title=title,
+        content=content,
+        confidence=0.85 if cron_expression else 0.6,
+        payload={
+            "name": title,
+            "task_prompt": content,
+            "cron_expression": str(cron_expression or "").strip(),
+            "notify_channels": channels,
+            "run_once": bool(run_once),
+            "conversation_id": conversation_id,
+        },
+        evidence=str(evidence or content)[:1000],
+    )
+
+
+def stage_skill_growth_candidate(
+    title: str,
+    content: str,
+    *,
+    user_message: str,
+    conversation_id: Optional[int] = None,
+    evidence: str = "",
+) -> Optional[Dict[str, Any]]:
+    title = str(title or "").strip()
+    content = _sanitize_assistant_output(content or "", user_message=user_message)
+    if not title or not content:
+        return None
+    return add_candidate(
+        kind="skill",
+        title=title,
+        content=content[:3000],
+        confidence=0.8,
+        payload={
+            "user_message": user_message,
+            "assistant_response": content[:6000],
+            "conversation_id": conversation_id,
+        },
+        evidence=str(evidence or user_message or title)[:1000],
+    )
+
+
+async def _stage_or_create_schedule_from_message(message: str, conversation_id: Optional[int] = None) -> Optional[str]:
+    if _growth_candidate_decision_enabled():
+        if not _looks_like_schedule_message(message):
+            return None
+        staged = stage_task_growth_candidate(
+            title="待确认定时任务",
+            content=message,
+            conversation_id=conversation_id,
+            evidence=message,
+        )
+        if not staged:
+            return None
+        return "已生成定时任务候选，可在“成长候选”中编辑后决定是否加入。"
+    return await _try_create_scheduled_task(message)
+
+
+async def _stage_or_materialize_skill(user_message: str, assistant_response: str, conversation_id: Optional[int] = None) -> bool:
+    if _growth_candidate_decision_enabled():
+        if not _should_materialize_skill(user_message, assistant_response, conversation_id=conversation_id):
+            return False
+        staged = stage_skill_growth_candidate(
+            title=generate_conversation_title(user_message or "自动技能"),
+            content=assistant_response,
+            user_message=user_message,
+            conversation_id=conversation_id,
+            evidence=user_message,
+        )
+        return bool(staged)
+    return await _materialize_reusable_skill(
+        user_message=user_message,
+        assistant_response=assistant_response,
+        conversation_id=conversation_id,
+    )
+
+
+async def _materialize_skill_content(
+    *,
+    name: str,
+    description: str,
+    user_message: str,
+    assistant_response: str,
+    slug_hint: str = "",
+) -> Optional[Dict[str, Any]]:
+    cleaned_response = _sanitize_assistant_output(assistant_response or "", user_message=user_message)
+    if _skill_content_is_noise(cleaned_response):
+        return None
+
+    new_name = str(name or "").strip() or f"自动技能-{generate_conversation_title(user_message or '自动技能')}"
+    desc = str(description or "").strip() or cleaned_response.strip().replace("\n", " ")
+    if _skill_content_is_noise(desc):
+        return None
+    if len(desc) > 180:
+        desc = f"{desc[:180]}..."
+
+    try:
+        all_skills = get_skill_registry().list_skills()
+    except Exception:
+        all_skills = []
+
+    similar_skill = None
+    for skill in all_skills:
+        existing_name = skill.get("name", "")
+        existing_desc = skill.get("description", "")
+        if _skill_name_similar(existing_name, new_name) or _skill_name_similar(existing_desc, desc):
+            similar_skill = skill
+            break
+
+    if similar_skill:
+        skill_id = similar_skill.get("id", "")
+        if similar_skill.get("source") == AUTO_GENERATED or skill_id.startswith("auto:"):
+            slug = skill_id.split(":", 1)[1].strip()
+            skill_md = settings.SKILLS_DIR / slug / "SKILL.md"
+            if skill_md.exists():
+                skill_body = await generate_skill_body_from_chat(
+                    user_message=user_message,
+                    assistant_response=cleaned_response,
+                    title=new_name,
+                    description=desc,
+                    opencode_client=opencode_ws if opencode_ws and getattr(opencode_ws, "connected", False) else None,
+                )
+                _write_auto_skill_md(skill_md, new_name, desc, user_message, skill_body)
+                logger.info(f"升级已有自动技能: {slug}")
+                return get_skill_registry().find(f"auto:{slug}") or similar_skill
+        logger.info(
+            f"[skill] 跳过技能生成：已有相似技能 '{similar_skill.get('name')}' "
+            f"(id={skill_id})"
+        )
+        return similar_skill
+
+    digest = hashlib.sha1(f"{user_message}\n{cleaned_response[:300]}".encode("utf-8")).hexdigest()[:8]
+    slug_base = re.sub(r"[^a-z0-9_]", "_", (slug_hint or new_name)[:20].lower().replace(" ", "_"))
+    slug_base = re.sub(r"_+", "_", slug_base).strip("_") or "auto"
+    skill_body = await generate_skill_body_from_chat(
+        user_message=user_message,
+        assistant_response=cleaned_response,
+        title=new_name,
+        description=desc,
+        opencode_client=opencode_ws if opencode_ws and getattr(opencode_ws, "connected", False) else None,
+    )
+    item = get_skill_registry().create_auto_skill(
+        name=new_name,
+        description=desc,
+        body=skill_body,
+        user_message=user_message,
+        slug_hint=f"{slug_base}_{digest}",
+    )
+    logger.info(f"生成新自动技能（本地）: {item.get('slug')}")
+    return item
 
 
 def _sanitize_assistant_output(content: str, user_message: str = "") -> str:
@@ -2424,71 +2629,14 @@ async def _materialize_reusable_skill(user_message: str, assistant_response: str
     if not _should_materialize_skill(user_message, cleaned_response, conversation_id=conversation_id):
         return False
     title = generate_conversation_title(user_message or "自动技能")
-    desc = cleaned_response.strip().replace("\n", " ")
-    if _skill_content_is_noise(desc):
-        return False
-    if len(desc) > 180:
-        desc = f"{desc[:180]}..."
-    new_name = f"自动技能-{title}"
-
-    # ── 查询所有已有技能，按照 Codebot 优先级避免重复生成 ──
-    try:
-        all_skills = get_skill_registry().list_skills()
-    except Exception:
-        all_skills = []
-
-    # 检查是否存在相似技能
-    similar_skill = None
-    for skill in all_skills:
-        existing_name = skill.get("name", "")
-        existing_desc = skill.get("description", "")
-        if _skill_name_similar(existing_name, new_name) or _skill_name_similar(existing_desc, desc):
-            similar_skill = skill
-            break
-
-    if similar_skill:
-        skill_id = similar_skill.get("id", "")
-        # 对于 auto_generated 类型的技能，直接更新 SKILL.md
-        if similar_skill.get("source") == AUTO_GENERATED or skill_id.startswith("auto:"):
-            slug = skill_id.split(":", 1)[1].strip()
-            skill_md = settings.SKILLS_DIR / slug / "SKILL.md"
-            if skill_md.exists():
-                skill_body = await generate_skill_body_from_chat(
-                    user_message=user_message,
-                    assistant_response=cleaned_response,
-                    title=new_name,
-                    description=desc,
-                    opencode_client=opencode_ws if opencode_ws and getattr(opencode_ws, "connected", False) else None,
-                )
-                _write_auto_skill_md(skill_md, new_name, desc, user_message, skill_body)
-                logger.info(f"升级已有自动技能: {slug}")
-                return True
-        # 对于其他类型（builtin/opencode/custom），不覆盖，仅跳过
-        logger.info(
-            f"[skill] 跳过技能生成：已有相似技能 '{similar_skill.get('name')}' "
-            f"(id={skill_id})"
-        )
-        return False
-
-    digest = hashlib.sha1(f"{user_message}\n{cleaned_response[:300]}".encode("utf-8")).hexdigest()[:8]
-    slug_base = re.sub(r"[^a-z0-9_]", "_", title[:20].lower().replace(" ", "_"))
-    slug_base = re.sub(r"_+", "_", slug_base).strip("_") or "auto"
-    skill_body = await generate_skill_body_from_chat(
+    item = await _materialize_skill_content(
+        name=f"自动技能-{title}",
+        description=cleaned_response.strip().replace("\n", " "),
         user_message=user_message,
         assistant_response=cleaned_response,
-        title=new_name,
-        description=desc,
-        opencode_client=opencode_ws if opencode_ws and getattr(opencode_ws, "connected", False) else None,
+        slug_hint=title,
     )
-    item = get_skill_registry().create_auto_skill(
-        name=new_name,
-        description=desc,
-        body=skill_body,
-        user_message=user_message,
-        slug_hint=f"{slug_base}_{digest}",
-    )
-    logger.info(f"生成新自动技能（本地）: {item.get('slug')}")
-    return True
+    return bool(item)
 
 
 async def _async_create_skill_via_opencode(session_id: str, prompt: str) -> None:

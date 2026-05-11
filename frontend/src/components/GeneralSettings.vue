@@ -25,6 +25,10 @@
         />
         <div class="form-item-tip">开启后聊天回复按 OpenCode CLI / 桌面端风格展示完整运行过程。</div>
       </el-form-item>
+      <el-form-item label="成长候选决策">
+        <el-switch v-model="form.growth_candidate_decision" />
+        <div class="form-item-tip">开启后，聊天对话或自动整理生成的记忆、定时任务和技能会先进入“成长候选”，由你编辑后决定是否加入。</div>
+      </el-form-item>
       <el-form-item>
         <el-button type="primary" @click="save">保存设置</el-button>
       </el-form-item>
@@ -187,6 +191,7 @@ const form = ref({
   app_name: 'Codebot',
   language: 'zh-CN',
   opencode_cli_display: true,
+  growth_candidate_decision: false,
   auto_start: false,
   compact_mode: false
 })
@@ -213,7 +218,8 @@ const save = async () => {
       body: JSON.stringify({
         language: form.value.language || 'zh-CN',
         compact_mode: Boolean(form.value.compact_mode),
-        opencode_cli_display: Boolean(form.value.opencode_cli_display)
+        opencode_cli_display: Boolean(form.value.opencode_cli_display),
+        growth_candidate_decision: Boolean(form.value.growth_candidate_decision)
       })
     })
     const json = await res.json()
@@ -235,6 +241,7 @@ const loadGeneralConfig = async () => {
       form.value.language = json.data.language || 'zh-CN'
       form.value.compact_mode = Boolean(json.data.compact_mode)
       form.value.opencode_cli_display = json.data.opencode_cli_display !== false
+      form.value.growth_candidate_decision = Boolean(json.data.growth_candidate_decision)
       generalForm.value.link_open_mode = json.data.link_open_mode || 'system'
       generalForm.value.file_storage_path = json.data.file_storage_path || ''
       generalForm.value.file_search_dirs = json.data.file_search_dirs || []

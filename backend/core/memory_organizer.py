@@ -22,7 +22,7 @@ import re
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from loguru import logger
-from core.memory_extractor import extract_and_save
+from core.memory_extractor import extract_and_save, extract_candidates
 
 
 MAX_BATCH_SIZE = 30   # 每批最多处理的记忆条数
@@ -354,6 +354,13 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
         logger.warning(f"[memory_organizer] 无法导入 chat 路由，跳过聊天整理: {exc}")
         return stats
 
+    candidate_decision_enabled = False
+    try:
+        from config import app_config
+        candidate_decision_enabled = bool(getattr(app_config.general, "growth_candidate_decision", False))
+    except Exception:
+        candidate_decision_enabled = False
+
     # ── 计算时间窗口 ──
     now = datetime.now()
     window_start = now - timedelta(hours=24)  # 默认：24h 前
@@ -432,35 +439,77 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
 
         # ── 记忆提取（已内置语义去重） ──
         try:
-            saved = await extract_and_save(
-                user_message=user_text,
-                assistant_response=assistant_text,
-                memory_manager=memory_manager,
-                opencode_ws=opencode_ws,
-            )
-            stats["saved_memories"] += int(saved or 0)
+            if candidate_decision_enabled:
+                candidates = await extract_candidates(
+                    user_message=user_text,
+                    assistant_response=assistant_text,
+                    existing_contents=None,
+                    memory_manager=memory_manager,
+                    opencode_ws=opencode_ws,
+                )
+                for content, category in candidates:
+                    staged = chat_router.stage_memory_growth_candidate(
+                        content=content,
+                        category=category,
+                        conversation_id=conv_id,
+                        evidence=user_text,
+                    )
+                    if staged:
+                        stats["saved_memories"] += 1
+            else:
+                saved = await extract_and_save(
+                    user_message=user_text,
+                    assistant_response=assistant_text,
+                    memory_manager=memory_manager,
+                    opencode_ws=opencode_ws,
+                    save=True,
+                )
+                stats["saved_memories"] += int(saved or 0)
         except Exception:
             pass
 
         # ── 定时任务创建（带去重） ──
         try:
-            created = await chat_router._try_create_scheduled_task(user_text)
-            if created:
-                stats["tasks_created"] += 1
+            if candidate_decision_enabled:
+                if chat_router._looks_like_schedule_message(user_text):
+                    staged = chat_router.stage_task_growth_candidate(
+                        title="待确认定时任务",
+                        content=user_text,
+                        conversation_id=conv_id,
+                        evidence=user_text,
+                    )
+                    if staged:
+                        stats["tasks_created"] += 1
+            else:
+                created = await chat_router._try_create_scheduled_task(user_text)
+                if created:
+                    stats["tasks_created"] += 1
         except Exception:
             pass
 
         # ── 技能自动生成（已内置全量技能去重 + skill-creator 调用） ──
         try:
-            # _materialize_reusable_skill 内部已做 _should_materialize_skill 判断
-            # 以及全量技能查重（包含 opencode/builtin/custom），无需额外检查
-            materialized = await chat_router._materialize_reusable_skill(
-                user_message=user_text,
-                assistant_response=assistant_text,
-                conversation_id=conv_id,
-            )
-            if materialized:
-                stats["skills_materialized"] += 1
+            if candidate_decision_enabled:
+                if chat_router._should_materialize_skill(user_text, assistant_text, conversation_id=conv_id):
+                    staged = chat_router.stage_skill_growth_candidate(
+                        title=chat_router.generate_conversation_title(user_text or "自动技能"),
+                        content=assistant_text,
+                        user_message=user_text,
+                        conversation_id=conv_id,
+                        evidence=user_text,
+                    )
+                    if staged:
+                        stats["skills_materialized"] += 1
+            else:
+                # _materialize_reusable_skill 内部已做 _should_materialize_skill 判断
+                # 以及全量技能查重（包含 opencode/builtin/custom），无需额外检查
+                materialized = await chat_router._materialize_reusable_skill(
+                    user_message=user_text,
+                    assistant_response=assistant_text,
+                    conversation_id=conv_id,
+                )
+                if materialized:
+                    stats["skills_materialized"] += 1
         except Exception:
             pass
 

@@ -20,6 +20,12 @@ class MemoryCreateRequest(BaseModel):
     metadata: Dict = Field(default_factory=dict)
 
 
+class MemoryUpdateRequest(BaseModel):
+    content: str
+    category: Optional[str] = None
+    metadata: Optional[Dict] = None
+
+
 class MemoryConfigRequest(BaseModel):
     """记忆配置请求"""
     auto_cleanup_enabled: bool
@@ -211,6 +217,64 @@ async def delete_memory(memory_id: int):
             "success": True,
             "message": "记忆已删除"
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/memories/{memory_id}")
+async def update_memory(memory_id: int, request: MemoryUpdateRequest):
+    """编辑活跃记忆"""
+    try:
+        manager = _get_memory_manager()
+        memory = await manager.get_memory(memory_id)
+        if not memory:
+            raise HTTPException(status_code=404, detail="记忆不存在")
+        if bool(memory.get("is_archived")):
+            raise HTTPException(status_code=400, detail="归档记忆不能在此处编辑")
+
+        content = str(request.content or "").strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="记忆内容不能为空")
+
+        category = request.category if request.category is not None else memory.get("category")
+        metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+        if request.metadata is not None:
+            metadata = request.metadata if isinstance(request.metadata, dict) else {}
+        metadata = {**metadata, "edited_at": datetime.now().isoformat(), "edited_source": "memory_api"}
+
+        await manager.update_long_term_memory(
+            memory_id=memory_id,
+            content=content,
+            category=category,
+            metadata=metadata,
+        )
+
+        fact_key = str(metadata.get("fact_key") or metadata.get("memory_key") or "").strip()
+        if fact_key:
+            fact_value = content
+            if "：" in content:
+                fact_value = content.split("：", 1)[1].strip()
+            elif ":" in content:
+                fact_value = content.split(":", 1)[1].strip()
+            if fact_value:
+                await manager.upsert_fact(
+                    key=fact_key,
+                    value=fact_value,
+                    metadata={
+                        **metadata,
+                        "category": category,
+                        "source": metadata.get("source") or "memory_api",
+                    },
+                )
+
+        updated = await manager.get_memory(memory_id)
+        return {
+            "success": True,
+            "data": updated,
+            "message": "记忆已更新"
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

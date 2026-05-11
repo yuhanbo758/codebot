@@ -79,6 +79,8 @@ class GeneralConfig(BaseModel):
     file_search_dirs: List[str] = []
     # 聊天页面默认模型，供聊天页与网关复用
     chat_default_model: str = ""
+    # 开启后，AI 生成的记忆/定时任务/技能先进入成长候选，由用户决定是否接受。
+    growth_candidate_decision: bool = False
 
 
 

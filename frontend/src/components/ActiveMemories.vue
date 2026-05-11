@@ -59,6 +59,7 @@
       <el-table-column prop="created_at" label="创建时间" width="180" />
       <el-table-column label="操作" width="200">
         <template #default="{ row }">
+          <el-button size="small" type="primary" @click="openEditDialog(row)">编辑</el-button>
           <el-button size="small" @click="archiveMemory(row.id)">归档</el-button>
           <el-button size="small" type="danger" @click="deleteMemory(row.id)">删除</el-button>
         </template>
@@ -115,6 +116,27 @@
         <el-button type="primary" @click="showSelfCheckDialog = false">关闭</el-button>
       </template>
     </el-dialog>
+    <el-dialog v-model="showEditDialog" title="编辑记忆" width="520px">
+      <el-form label-width="80px">
+        <el-form-item label="类别">
+          <el-select v-model="editMemory.category" placeholder="选择类别" style="width: 100%;">
+            <el-option
+              v-for="cat in CATEGORIES"
+              :key="cat.value"
+              :label="cat.label"
+              :value="cat.value"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="内容">
+          <el-input v-model="editMemory.content" type="textarea" :rows="5" placeholder="请输入记忆内容" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showEditDialog = false">取消</el-button>
+        <el-button type="primary" @click="saveEditMemory" :loading="savingEdit">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -153,6 +175,13 @@ const organizeStatus = ref('')
 const storageStatus = ref('')
 const selfChecking = ref(false)
 const showSelfCheckDialog = ref(false)
+const showEditDialog = ref(false)
+const savingEdit = ref(false)
+const editMemory = ref({
+  id: null,
+  category: 'habit',
+  content: ''
+})
 const selfCheckResult = ref({
   statusText: '未检查',
   statusType: 'info',
@@ -210,6 +239,36 @@ const deleteMemory = async (id) => {
     loadMemories()
   } catch (error) {
     ElMessage.error('删除失败')
+  }
+}
+
+const openEditDialog = (row) => {
+  editMemory.value = {
+    id: row.id,
+    category: row.category || 'note',
+    content: row.content || ''
+  }
+  showEditDialog.value = true
+}
+
+const saveEditMemory = async () => {
+  if (!String(editMemory.value.content || '').trim()) {
+    ElMessage.warning('请输入记忆内容')
+    return
+  }
+  savingEdit.value = true
+  try {
+    await axios.patch(`/api/memory/memories/${editMemory.value.id}`, {
+      category: editMemory.value.category || 'note',
+      content: editMemory.value.content
+    })
+    ElMessage.success('记忆已更新')
+    showEditDialog.value = false
+    await loadMemories()
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || '更新记忆失败')
+  } finally {
+    savingEdit.value = false
   }
 }
 

@@ -153,8 +153,9 @@
         <el-table-column prop="kind" label="类型" width="90" />
         <el-table-column prop="title" label="标题" width="180" />
         <el-table-column prop="content" label="内容" min-width="260" show-overflow-tooltip />
-        <el-table-column label="操作" width="150">
+        <el-table-column label="操作" width="190">
           <template #default="{ row }">
+            <el-button size="small" link @click="editGrowth(row)">编辑</el-button>
             <el-button size="small" type="primary" link @click="acceptGrowth(row)">接受</el-button>
             <el-button size="small" type="danger" link @click="rejectGrowth(row)">拒绝</el-button>
           </template>
@@ -163,6 +164,49 @@
       <template #footer>
         <el-button @click="loadGrowthCandidates" :loading="growthLoading">刷新</el-button>
         <el-button @click="growthDialogVisible = false">关闭</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="growthEditVisible" title="编辑成长候选" width="620px">
+      <el-form label-width="90px">
+        <el-form-item v-if="growthEditForm.kind !== 'task'" label="标题">
+          <el-input v-model="growthEditForm.title" />
+        </el-form-item>
+        <template v-if="growthEditForm.kind === 'task'">
+          <el-form-item label="任务名称">
+            <el-input v-model="growthEditForm.task.name" />
+          </el-form-item>
+          <el-form-item label="自然语言时间">
+            <el-input v-model="growthEditForm.task.schedule_text" placeholder="例如：每天早上 9 点、每周一 10 点" />
+          </el-form-item>
+          <el-form-item label="Cron 表达式">
+            <el-input v-model="growthEditForm.task.cron_expression" placeholder="0 9 * * *" />
+          </el-form-item>
+          <el-form-item label="执行内容">
+            <el-input v-model="growthEditForm.task.task_prompt" type="textarea" :rows="5" />
+          </el-form-item>
+          <el-form-item label="通知渠道">
+            <el-checkbox-group v-model="growthEditForm.task.notify_channels">
+              <el-checkbox label="app">应用内</el-checkbox>
+              <el-checkbox label="desktop">系统桌面</el-checkbox>
+              <el-checkbox label="lark">飞书</el-checkbox>
+              <el-checkbox label="email">邮箱</el-checkbox>
+            </el-checkbox-group>
+          </el-form-item>
+          <el-form-item label="一次性任务">
+            <el-switch v-model="growthEditForm.task.run_once" />
+          </el-form-item>
+        </template>
+        <el-form-item v-else label="内容">
+          <el-input v-model="growthEditForm.content" type="textarea" :rows="6" />
+        </el-form-item>
+        <el-form-item label="补充说明">
+          <el-input v-model="growthEditForm.evidence" type="textarea" :rows="3" placeholder="可选" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="growthEditVisible = false">取消</el-button>
+        <el-button type="primary" @click="saveGrowthEdit" :loading="growthEditLoading">保存</el-button>
       </template>
     </el-dialog>
   </div>
@@ -195,6 +239,24 @@ const updateState = ref({
 const growthDialogVisible = ref(false)
 const growthLoading = ref(false)
 const growthCandidates = ref([])
+const growthEditVisible = ref(false)
+const growthEditLoading = ref(false)
+const growthEditForm = ref({
+  id: '',
+  kind: '',
+  title: '',
+  content: '',
+  evidence: '',
+  payload: {},
+  task: {
+    name: '',
+    cron_expression: '',
+    schedule_text: '',
+    task_prompt: '',
+    run_once: false,
+    notify_channels: ['app']
+  }
+})
 let removeUpdateListener = null
 let removeAccountChangedListener = null
 let removeSkillDownloadListener = null
@@ -377,6 +439,68 @@ const acceptGrowth = async (row) => {
     await loadGrowthCandidates()
   } catch (err) {
     ElMessage.error(err?.response?.data?.detail || '接受失败')
+  }
+}
+
+const editGrowth = (row) => {
+  const payload = row.payload || {}
+  growthEditForm.value = {
+    id: row.id,
+    kind: row.kind || '',
+    title: row.title || '',
+    content: row.content || '',
+    evidence: row.evidence || '',
+    payload,
+    task: {
+      name: payload.name || row.title || '',
+      cron_expression: payload.cron_expression || payload.cron || '',
+      schedule_text: payload.schedule_text || '',
+      task_prompt: payload.task_prompt || row.content || '',
+      run_once: Boolean(payload.run_once),
+      notify_channels: Array.isArray(payload.notify_channels) && payload.notify_channels.length ? payload.notify_channels : ['app']
+    }
+  }
+  growthEditVisible.value = true
+}
+
+const saveGrowthEdit = async () => {
+  growthEditLoading.value = true
+  try {
+    if (growthEditForm.value.kind === 'task') {
+      if (!String(growthEditForm.value.task.name || '').trim() || !String(growthEditForm.value.task.task_prompt || '').trim()) {
+        ElMessage.warning('任务名称和执行内容不能为空')
+        return
+      }
+      await axios.patch(`/api/growth/candidates/${growthEditForm.value.id}`, {
+        evidence: growthEditForm.value.evidence,
+        task: {
+          name: growthEditForm.value.task.name,
+          cron_expression: growthEditForm.value.task.cron_expression,
+          schedule_text: growthEditForm.value.task.schedule_text,
+          task_prompt: growthEditForm.value.task.task_prompt,
+          run_once: Boolean(growthEditForm.value.task.run_once),
+          notify_channels: growthEditForm.value.task.notify_channels
+        }
+      })
+    } else {
+      if (!String(growthEditForm.value.title || '').trim() || !String(growthEditForm.value.content || '').trim()) {
+        ElMessage.warning('标题和内容不能为空')
+        return
+      }
+      await axios.patch(`/api/growth/candidates/${growthEditForm.value.id}`, {
+        title: growthEditForm.value.title,
+        content: growthEditForm.value.content,
+        evidence: growthEditForm.value.evidence,
+        payload: growthEditForm.value.payload
+      })
+    }
+    ElMessage.success('候选已更新')
+    growthEditVisible.value = false
+    await loadGrowthCandidates()
+  } catch (err) {
+    ElMessage.error(err?.response?.data?.detail || '更新候选失败')
+  } finally {
+    growthEditLoading.value = false
   }
 }
 

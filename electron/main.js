@@ -376,9 +376,13 @@ function isInternalAppUrl(url) {
 }
 
 // 显式隔离 Electron 的会话数据目录，避免开发态和打包态混用缓存数据。
-const codebotUserDataDir = path.join(app.getPath('appData'), 'codebot');
+const codebotProfileName = app.isPackaged ? 'codebot' : 'codebot-dev';
+const codebotUserDataDir = path.join(app.getPath('appData'), codebotProfileName);
+const codebotSessionDataDir = path.join(codebotUserDataDir, 'session');
+fs.mkdirSync(codebotUserDataDir, { recursive: true });
+fs.mkdirSync(codebotSessionDataDir, { recursive: true });
 app.setPath('userData', codebotUserDataDir);
-app.setPath('sessionData', path.join(codebotUserDataDir, 'session'));
+app.setPath('sessionData', codebotSessionDataDir);
 
 let mainWindow;
 let backendProcess;
@@ -706,6 +710,46 @@ function normalizeAssetName(value) {
     .replace(/[^a-z0-9]+/g, '');
 }
 
+function parseVersionParts(version) {
+  return String(version || '')
+    .trim()
+    .replace(/^v/i, '')
+    .split('.')
+    .map((item) => Number.parseInt(item, 10))
+    .map((item) => (Number.isFinite(item) ? item : 0));
+}
+
+function isVersionGreater(nextVersion, currentVersion) {
+  const next = parseVersionParts(nextVersion);
+  const current = parseVersionParts(currentVersion);
+  const maxLength = Math.max(next.length, current.length, 3);
+  for (let index = 0; index < maxLength; index += 1) {
+    const left = next[index] || 0;
+    const right = current[index] || 0;
+    if (left > right) return true;
+    if (left < right) return false;
+  }
+  return false;
+}
+
+async function fetchLatestGithubRelease() {
+  const fetchImpl = global.fetch;
+  if (typeof fetchImpl !== 'function') {
+    throw new Error('当前 Electron 运行时不支持 GitHub Release 查询');
+  }
+  const response = await fetchImpl(`${CODEBOT_GITHUB_RELEASES_API}/latest`, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'Codebot-Updater',
+    },
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.message || `查询 GitHub 最新 Release 失败: ${response.status}`);
+  }
+  return payload;
+}
+
 async function fetchGithubReleaseByVersion(version) {
   const fetchImpl = global.fetch;
   if (typeof fetchImpl !== 'function') {
@@ -875,15 +919,78 @@ async function checkForCodebotUpdates() {
   const token = readAccountToken();
   const access = await fetchCodebotAccess();
   const preferredSource = access.authenticated && access.canDownloadUpdates ? 'object-storage' : 'github';
-  configureAutoUpdater(preferredSource, token);
-  const result = await autoUpdater.checkForUpdates();
-  lastCheckedUpdateInfo = toSerializable(result?.updateInfo || null);
-  pendingManualUpdate = null;
+  const currentVersion = app.getVersion();
+
+  const runCheck = async (source) => {
+    configureAutoUpdater(source, token);
+    sendUpdateEvent('checking', { source: lastUpdateSource });
+    const result = await autoUpdater.checkForUpdates();
+    lastCheckedUpdateInfo = toSerializable(result?.updateInfo || null);
+    pendingManualUpdate = null;
+    return {
+      source: lastUpdateSource,
+      updateInfo: lastCheckedUpdateInfo,
+      hasUpdate: isVersionGreater(lastCheckedUpdateInfo?.version, currentVersion),
+    };
+  };
+
+  if (preferredSource === 'object-storage') {
+    try {
+      const objectStorageResult = await runCheck('object-storage');
+      if (objectStorageResult.hasUpdate) {
+        return {
+          success: true,
+          source: objectStorageResult.source,
+          canDownloadUpdates: Boolean(access.canDownloadUpdates),
+          updateInfo: objectStorageResult.updateInfo,
+        };
+      }
+
+      const githubRelease = await fetchLatestGithubRelease();
+      const githubVersion = String(githubRelease?.tag_name || githubRelease?.name || '').replace(/^v/i, '').trim();
+      if (isVersionGreater(githubVersion, currentVersion)) {
+        lastUpdateSource = 'github';
+        lastCheckedUpdateInfo = toSerializable({
+          version: githubVersion,
+          releaseName: githubRelease?.name || '',
+          releaseNotes: githubRelease?.body || '',
+          publishedAt: githubRelease?.published_at || '',
+        });
+        pendingManualUpdate = null;
+        sendUpdateEvent('available', { info: lastCheckedUpdateInfo, source: 'github' });
+        return {
+          success: true,
+          source: 'github',
+          canDownloadUpdates: Boolean(access.canDownloadUpdates),
+          updateInfo: lastCheckedUpdateInfo,
+        };
+      }
+
+      sendUpdateEvent('not-available', { info: objectStorageResult.updateInfo, source: objectStorageResult.source });
+      return {
+        success: true,
+        source: objectStorageResult.source,
+        canDownloadUpdates: Boolean(access.canDownloadUpdates),
+        updateInfo: objectStorageResult.updateInfo,
+      };
+    } catch (error) {
+      const fallbackResult = await runCheck('github');
+      return {
+        success: true,
+        source: fallbackResult.source,
+        canDownloadUpdates: Boolean(access.canDownloadUpdates),
+        updateInfo: fallbackResult.updateInfo,
+        fallbackReason: error.message || String(error),
+      };
+    }
+  }
+
+  const result = await runCheck('github');
   return {
     success: true,
-    source: lastUpdateSource,
+    source: result.source,
     canDownloadUpdates: Boolean(access.canDownloadUpdates),
-    updateInfo: lastCheckedUpdateInfo,
+    updateInfo: result.updateInfo,
   };
 }
 
@@ -1261,6 +1368,8 @@ function showAbout() {
 }
 
 app.whenReady().then(() => {
+  console.log(`[electron] userData: ${app.getPath('userData')}`);
+  console.log(`[electron] sessionData: ${app.getPath('sessionData')}`);
   bindBuiltinSessionEvents();
   bindAutoUpdaterEvents();
   createWindow();

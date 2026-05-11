@@ -32,6 +32,7 @@ class GeneralConfigUpdateRequest(BaseModel):
     file_storage_path: Optional[str] = None
     file_search_dirs: Optional[List[str]] = None
     chat_default_model: Optional[str] = None
+    growth_candidate_decision: Optional[bool] = None
 
 
 @router.get("/file-info")

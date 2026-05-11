@@ -1,12 +1,30 @@
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Optional, List
 
-from core.growth import ACCEPTED, REJECTED, get_candidate, list_candidates, mark_candidate
+from core.growth import ACCEPTED, REJECTED, get_candidate, list_candidates, mark_candidate, update_candidate
 from core.memory_manager import MemoryManager
-from core.skill_generator import generate_skill_body_from_chat
-from core.skill_registry import get_skill_registry
 from api.routes import scheduler as scheduler_router
+from api.routes import chat as chat_router
 
 router = APIRouter()
+
+
+class GrowthTaskPayloadUpdateRequest(BaseModel):
+    name: str
+    cron_expression: Optional[str] = None
+    schedule_text: Optional[str] = None
+    task_prompt: str
+    run_once: bool = False
+    notify_channels: Optional[List[str]] = None
+
+
+class GrowthCandidateStructuredUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    content: Optional[str] = None
+    evidence: Optional[str] = None
+    payload: Optional[dict] = None
+    task: Optional[GrowthTaskPayloadUpdateRequest] = None
 
 
 @router.get("/candidates")
@@ -41,20 +59,14 @@ async def accept_growth_candidate(candidate_id: str):
     elif kind == "skill":
         source_user_message = payload.get("user_message") or candidate.get("evidence") or ""
         source_assistant_response = payload.get("assistant_response") or candidate.get("content") or ""
-        description = (candidate.get("evidence") or candidate.get("content") or "")[:180]
-        body = await generate_skill_body_from_chat(
+        item = await chat_router._materialize_skill_content(
+            name=candidate.get("title") or "自动生成技能",
+            description=(candidate.get("evidence") or candidate.get("content") or "")[:180],
             user_message=source_user_message,
             assistant_response=source_assistant_response,
-            title=candidate.get("title") or "自动生成技能",
-            description=description,
+            slug_hint=candidate.get("title") or "auto_skill",
         )
-        item = get_skill_registry().create_auto_skill(
-            name=candidate.get("title") or "自动生成技能",
-            description=description,
-            body=body,
-            user_message=source_user_message,
-        )
-        created = {"kind": "skill", "skill": item}
+        created = {"kind": "skill", "skill": item} if item else {"kind": "skill"}
     elif kind == "task":
         cron_expression = str(payload.get("cron_expression") or payload.get("cron") or "").strip()
         task_prompt = str(payload.get("task_prompt") or candidate.get("content") or "").strip()
@@ -87,3 +99,87 @@ async def reject_growth_candidate(candidate_id: str):
     if not candidate:
         raise HTTPException(status_code=404, detail="候选不存在")
     return {"success": True, "data": candidate, "message": "候选已拒绝"}
+
+
+@router.patch("/candidates/{candidate_id}")
+async def edit_growth_candidate(candidate_id: str, request: GrowthCandidateStructuredUpdateRequest):
+    existing = get_candidate(candidate_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="候选不存在")
+    if existing.get("status") != "pending":
+        raise HTTPException(status_code=400, detail="仅可编辑待处理候选")
+
+    kind = str(existing.get("kind") or "")
+    payload = dict(existing.get("payload") or {})
+    evidence = str(request.evidence).strip() if request.evidence is not None else str(existing.get("evidence") or "")
+
+    if kind == "task" and request.task is not None:
+        title = str(request.task.name or "").strip()
+        task_prompt = str(request.task.task_prompt or "").strip()
+        if not title or not task_prompt:
+            raise HTTPException(status_code=400, detail="任务名称和执行内容不能为空")
+
+        cron_expression = str(request.task.cron_expression or "").strip()
+        schedule_text = str(request.task.schedule_text or "").strip()
+        if not cron_expression and schedule_text:
+            try:
+                cron_data = await scheduler_router.generate_cron_from_text(schedule_text)
+                cron_expression = str((cron_data or {}).get("cron") or "").strip()
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"无法解析任务时间：{exc}")
+        if not cron_expression:
+            raise HTTPException(status_code=400, detail="请填写 Cron 表达式或自然语言时间")
+
+        notify_channels = request.task.notify_channels if isinstance(request.task.notify_channels, list) and request.task.notify_channels else ["app"]
+        payload.update({
+            "name": title,
+            "task_prompt": task_prompt,
+            "cron_expression": cron_expression,
+            "notify_channels": notify_channels,
+            "run_once": bool(request.task.run_once),
+        })
+        if schedule_text:
+            payload["schedule_text"] = schedule_text
+        updated = update_candidate(candidate_id, {
+            "title": title,
+            "content": task_prompt,
+            "payload": payload,
+            "evidence": evidence,
+        })
+        if not updated:
+            raise HTTPException(status_code=500, detail="候选更新失败")
+        return {"success": True, "data": updated, "message": "候选已更新"}
+
+    title = str(request.title if request.title is not None else existing.get("title") or "").strip()
+    content = str(request.content if request.content is not None else existing.get("content") or "").strip()
+    if not title or not content:
+        raise HTTPException(status_code=400, detail="标题和内容不能为空")
+
+    if isinstance(request.payload, dict):
+        payload = request.payload
+
+    if kind == "task":
+        if not payload.get("cron_expression"):
+            try:
+                cron_data = await scheduler_router.generate_cron_from_text(content)
+                cron_expression = str((cron_data or {}).get("cron") or "").strip()
+                if cron_expression:
+                    payload["cron_expression"] = cron_expression
+            except Exception:
+                pass
+        payload["task_prompt"] = content
+        payload["name"] = title
+    elif kind == "skill":
+        payload["assistant_response"] = content
+    elif kind == "memory":
+        payload["category"] = str(payload.get("category") or "note").strip() or "note"
+
+    updated = update_candidate(candidate_id, {
+        "title": title,
+        "content": content,
+        "payload": payload,
+        "evidence": evidence,
+    })
+    if not updated:
+        raise HTTPException(status_code=500, detail="候选更新失败")
+    return {"success": True, "data": updated, "message": "候选已更新"}

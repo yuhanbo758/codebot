@@ -107,6 +107,35 @@ def _extract_candidates(message: str) -> List[Tuple[str, str]]:
     return results
 
 
+async def extract_candidates(
+    user_message: str,
+    assistant_response: str,
+    *,
+    existing_contents: Optional[List[str]] = None,
+    memory_manager=None,
+    opencode_ws=None,
+) -> List[Tuple[str, str]]:
+    if not user_message or not user_message.strip():
+        return []
+
+    candidates = _extract_candidates(user_message)
+    ai_candidates = await _extract_candidates_by_ai(user_message, assistant_response, opencode_ws)
+    for content, category in ai_candidates:
+        if (content, category) not in candidates:
+            candidates.append((content, category))
+
+    if existing_contents:
+        candidates = _dedup_with_existing(candidates, existing_contents)
+
+    if candidates and memory_manager is not None and hasattr(memory_manager, "memory_collection"):
+        try:
+            candidates = await _dedup_with_vector_search(candidates, memory_manager)
+        except Exception as vec_err:
+            logger.debug(f"[memory_extractor] 向量去重失败（继续）: {vec_err}")
+
+    return candidates
+
+
 def _dedup_with_existing(
     candidates: List[Tuple[str, str]],
     existing_contents: List[str]
@@ -175,6 +204,7 @@ async def extract_and_save(
     *,
     existing_contents: Optional[List[str]] = None,
     opencode_ws=None,
+    save: bool = True,
 ) -> int:
     """
     从一轮对话（用户消息 + AI 回复）中提取记忆并保存。
@@ -191,29 +221,21 @@ async def extract_and_save(
     if not user_message or not user_message.strip():
         return 0
 
-    candidates = _extract_candidates(user_message)
-    ai_candidates = await _extract_candidates_by_ai(user_message, assistant_response, opencode_ws)
-    for content, category in ai_candidates:
-        if (content, category) not in candidates:
-            candidates.append((content, category))
-    if not candidates:
-        return 0
-
-    if existing_contents:
-        candidates = _dedup_with_existing(candidates, existing_contents)
-
-    # 使用 ChromaDB 向量搜索做语义级去重（比字符串包含更精准）
-    if candidates and hasattr(memory_manager, "memory_collection"):
-        try:
-            candidates = await _dedup_with_vector_search(candidates, memory_manager)
-        except Exception as vec_err:
-            logger.debug(f"[memory_extractor] 向量去重失败（继续）: {vec_err}")
-
+    candidates = await extract_candidates(
+        user_message=user_message,
+        assistant_response=assistant_response,
+        existing_contents=existing_contents,
+        memory_manager=memory_manager,
+        opencode_ws=opencode_ws,
+    )
     if not candidates:
         return 0
 
     saved = 0
     for content, category in candidates:
+        if not save:
+            saved += 1
+            continue
         try:
             await memory_manager.save_long_term_memory(
                 content=content,

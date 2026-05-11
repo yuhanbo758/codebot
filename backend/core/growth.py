@@ -106,6 +106,32 @@ def mark_candidate(candidate_id: str, status: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def update_candidate(candidate_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(updates, dict):
+        return None
+    items = _load()
+    for item in items:
+        if item.get("id") != candidate_id:
+            continue
+        for key in ("title", "content", "payload", "evidence"):
+            if key not in updates:
+                continue
+            value = updates.get(key)
+            if key in {"title", "content", "evidence"}:
+                item[key] = str(value or "").strip()
+            elif key == "payload":
+                item[key] = value if isinstance(value, dict) else {}
+        item["updated_at"] = datetime.now().isoformat()
+        item["fingerprint"] = _fingerprint(
+            str(item.get("kind") or ""),
+            str(item.get("title") or ""),
+            str(item.get("content") or ""),
+        )
+        _save(items)
+        return item
+    return None
+
+
 def record_chat_growth_candidates(user_message: str, assistant_response: str, conversation_id: Optional[int] = None) -> List[Dict[str, Any]]:
     """Capture medium-confidence learning opportunities without auto-applying them."""
     created: List[Dict[str, Any]] = []
