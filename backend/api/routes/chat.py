@@ -237,6 +237,13 @@ class AttachedFile(BaseModel):
     is_text: bool = True
 
 
+def _attachment_summary(file: AttachedFile) -> str:
+    mime_type = str(file.type or "application/octet-stream")
+    if mime_type.startswith("image/"):
+        return f"【图片附件：{file.name}，类型：{mime_type}】"
+    return f"【附件：{file.name}（二进制文件，类型：{mime_type}）】"
+
+
 class SendMessageRequest(BaseModel):
     conversation_id: int
     message: str
@@ -794,6 +801,8 @@ def _sanitize_assistant_output(content: str, user_message: str = "") -> str:
     # ── 2. 清除附件注入的上下文块（【附件：...】...```）────────────────────
     text = re.sub(r"(?m)^【附件[：:][^】]*】\n```[\s\S]*?```\s*$", "", text, flags=re.MULTILINE)
     text = re.sub(r"(?m)^【附件[：:][^】]*（二进制文件，类型：[^）]*）】\s*$", "", text)
+    text = re.sub(r"(?m)^【图片附件[：:][^】]*】\n?data:image/[^\s]+;base64,[A-Za-z0-9+/=\r\n]+\s*$", "", text)
+    text = re.sub(r"(?m)^【图片附件[：:][^】]*】\s*$", "", text)
 
     # ── 3. 清除用户消息/输入包装标记行 ─────────────────────────────────────
     text = re.sub(r"(?m)^【用户(?:输入|消息|请求)】.*$", "", text)
@@ -3315,11 +3324,8 @@ def _build_files_context(attached_files: List[AttachedFile]) -> str:
                 content_preview = content_preview[:50000] + "\n... [内容已截断]"
             parts.append(f"【附件：{f.name}】\n```\n{content_preview}\n```")
         else:
-            # 图片等二进制文件暂以 data URL 注入。多模态模型可读取；普通文本模型也能看到附件存在。
-            if str(f.type or "").startswith("image/") and f.content:
-                parts.append(f"【图片附件：{f.name}，类型：{f.type}】\ndata:{f.type};base64,{f.content}")
-            else:
-                parts.append(f"【附件：{f.name}（二进制文件，类型：{f.type}）】")
+            # 二进制附件只注入元信息，避免把整段 base64 回显到聊天文本。
+            parts.append(_attachment_summary(f))
 
     return "\n\n".join(parts)
 
@@ -3674,9 +3680,23 @@ def _chunk_text(text: str, chunk_size: int = 24) -> List[str]:
     return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 
+def _redact_attachment_payload(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_redact_attachment_payload(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    redacted = {key: _redact_attachment_payload(val) for key, val in value.items()}
+    mime_type = str(redacted.get("type") or "")
+    content = redacted.get("content")
+    if mime_type.startswith("image/") and isinstance(content, str) and content:
+        redacted["content"] = f"[omitted image base64, {len(content)} chars]"
+    return redacted
+
+
 def _json_for_display(value: Any) -> str:
     try:
-        return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+        return json.dumps(_redact_attachment_payload(value), ensure_ascii=False, indent=2, default=str)
     except Exception:
         return str(value)
 

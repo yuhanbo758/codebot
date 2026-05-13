@@ -151,6 +151,97 @@
                   <el-collapse-transition>
                     <div v-if="msg.expanded && toolEventDetail(msg.event)" class="tool-event-detail markdown-body" v-html="renderMarkdown(toolEventDetail(msg.event))"></div>
                   </el-collapse-transition>
+                  <div v-if="shouldShowQuestionPanel(msg.event)" class="question-panel-host structured-question-panel-host">
+                    <div class="question-panel">
+                      <div class="question-panel-header">
+                        <div class="question-panel-title">{{ questionPanelProgress(msg.event) }}</div>
+                        <div class="question-panel-progress">
+                          <button
+                            v-for="(question, index) in getQuestionEventQuestions(msg.event)"
+                            :key="`${msg.event.request_id || 'question'}-${index}`"
+                            type="button"
+                            class="question-progress-dot"
+                            :class="{
+                              active: getQuestionPanelTab(msg.event) === index,
+                              answered: isQuestionPanelAnswered(msg.event, index)
+                            }"
+                            :disabled="isQuestionPanelSending(msg.event)"
+                            @click="setQuestionPanelTab(msg.event, index)"
+                          />
+                        </div>
+                      </div>
+                      <div class="question-panel-body">
+                        <div class="question-panel-question">{{ currentQuestionPanelQuestion(msg.event)?.question || msg.event?.question }}</div>
+                        <div class="question-panel-hint">
+                          {{ currentQuestionPanelQuestion(msg.event)?.multiple ? '可多选，完成后统一提交' : '单选，选择后可继续下一题或直接提交' }}
+                        </div>
+                        <div class="question-panel-options">
+                          <button
+                            v-for="option in currentQuestionPanelQuestion(msg.event)?.options || []"
+                            :key="option.label"
+                            type="button"
+                            class="question-option"
+                            :class="{ picked: isQuestionOptionPicked(msg.event, option.label) }"
+                            :disabled="isQuestionPanelSending(msg.event)"
+                            @click="toggleQuestionOption(msg.event, option.label)"
+                          >
+                            <span class="question-option-mark" :class="{ multi: currentQuestionPanelQuestion(msg.event)?.multiple, picked: isQuestionOptionPicked(msg.event, option.label) }"></span>
+                            <span class="question-option-main">
+                              <span class="question-option-label">{{ option.label }}</span>
+                              <span v-if="option.description" class="question-option-description">{{ option.description }}</span>
+                            </span>
+                          </button>
+                          <button
+                            v-if="currentQuestionPanelQuestion(msg.event)?.custom"
+                            type="button"
+                            class="question-option"
+                            :class="{ picked: isQuestionCustomEnabled(msg.event) }"
+                            :disabled="isQuestionPanelSending(msg.event)"
+                            @click="toggleQuestionCustom(msg.event)"
+                          >
+                            <span class="question-option-mark" :class="{ multi: currentQuestionPanelQuestion(msg.event)?.multiple, picked: isQuestionCustomEnabled(msg.event) }"></span>
+                            <span class="question-option-main">
+                              <span class="question-option-label">自定义回答</span>
+                              <span class="question-option-description">{{ currentQuestionCustomValue(msg.event) || '输入你自己的回答' }}</span>
+                            </span>
+                          </button>
+                          <el-input
+                            v-if="currentQuestionPanelQuestion(msg.event)?.custom && isQuestionCustomEnabled(msg.event)"
+                            :model-value="currentQuestionCustomValue(msg.event)"
+                            type="textarea"
+                            :rows="2"
+                            resize="none"
+                            placeholder="输入自定义回答"
+                            :disabled="isQuestionPanelSending(msg.event)"
+                            @update:model-value="updateQuestionCustomValue(msg.event, $event)"
+                          />
+                        </div>
+                      </div>
+                      <div class="question-panel-footer">
+                        <el-button size="small" :disabled="isQuestionPanelSending(msg.event)" @click="cancelQuestionPanel(msg.event)">取消</el-button>
+                        <div class="question-panel-footer-actions">
+                          <el-button
+                            v-if="getQuestionPanelTab(msg.event) > 0"
+                            size="small"
+                            :disabled="isQuestionPanelSending(msg.event)"
+                            @click="setQuestionPanelTab(msg.event, getQuestionPanelTab(msg.event) - 1)"
+                          >上一题</el-button>
+                          <el-button
+                            v-if="getQuestionPanelTab(msg.event) < getQuestionEventQuestions(msg.event).length - 1"
+                            size="small"
+                            :disabled="isQuestionPanelSending(msg.event)"
+                            @click="setQuestionPanelTab(msg.event, getQuestionPanelTab(msg.event) + 1)"
+                          >下一题</el-button>
+                          <el-button
+                            type="primary"
+                            size="small"
+                            :loading="isQuestionPanelSending(msg.event)"
+                            @click="submitQuestionPanel(msg.event)"
+                          >提交</el-button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                   <div v-if="toolEventActions(msg.event).length > 0" class="tool-event-actions">
                     <el-button
                       v-for="action in toolEventActions(msg.event)"
@@ -2092,12 +2183,63 @@ const questionPanelStateKey = (event) => {
   return requestId ? String(requestId) : ''
 }
 
+const normalizeQuestionPanelOptions = (options) => {
+  if (!Array.isArray(options)) return []
+  return options
+    .map((option) => {
+      if (typeof option === 'string') return { label: option.trim(), description: '' }
+      if (!option || typeof option !== 'object') return null
+      return {
+        label: String(option.label || '').trim(),
+        description: String(option.description || '').trim(),
+      }
+    })
+    .filter((option) => option?.label)
+}
+
+const parseQuestionOptionsFromDetail = (detail = '') => {
+  const lines = String(detail || '').split('\n')
+  const options = []
+  for (const line of lines) {
+    const match = line.match(/^\s*\d+[.)、]\s+(.+?)\s*$/)
+    if (!match) continue
+    const text = match[1].trim()
+    if (!text) continue
+    const separator = text.search(/[：:。]/)
+    const label = separator > 0 ? text.slice(0, separator).trim() : text
+    const description = separator > 0 ? text.slice(separator + 1).trim() : ''
+    options.push({ label, description })
+  }
+  return options
+}
+
+const normalizeQuestionPanelQuestion = (question, event) => {
+  const fallbackOptions = parseQuestionOptionsFromDetail(toolEventDetail(event))
+  const rawOptions = normalizeQuestionPanelOptions(question?.options)
+  return {
+    header: String(question?.header || 'Question').trim(),
+    question: String(question?.question || event?.question || event?.summary || 'OpenCode 正在等待你的选择').trim(),
+    multiple: Boolean(question?.multiple),
+    custom: question?.custom !== false,
+    options: rawOptions.length > 0 ? rawOptions : fallbackOptions,
+  }
+}
+
 const getQuestionEventQuestions = (event) => {
-  if (Array.isArray(event?.questions) && event.questions.length > 0) return event.questions
-  if (Array.isArray(event?.data?.questions) && event.data.questions.length > 0) return event.data.questions
+  if (Array.isArray(event?.questions) && event.questions.length > 0) {
+    return event.questions.map((question) => normalizeQuestionPanelQuestion(question, event))
+  }
+  if (Array.isArray(event?.data?.questions) && event.data.questions.length > 0) {
+    return event.data.questions.map((question) => normalizeQuestionPanelQuestion(question, event))
+  }
   const question = String(event?.question || event?.summary || 'OpenCode 正在等待你的选择').trim()
-  const options = Array.isArray(event?.data?.options) ? event.data.options : []
-  return [{ question, multiple: Boolean(event?.multiple), custom: event?.allow_custom !== false, options }]
+  const options = normalizeQuestionPanelOptions(event?.data?.options)
+  return [{
+    question,
+    multiple: Boolean(event?.multiple),
+    custom: event?.allow_custom !== false,
+    options: options.length > 0 ? options : parseQuestionOptionsFromDetail(toolEventDetail(event)),
+  }]
 }
 
 const ensureQuestionPanelState = (event) => {
@@ -3354,6 +3496,11 @@ onUnmounted(() => {
 
 .question-panel-host {
   margin-top: 12px;
+}
+
+.structured-question-panel-host {
+  width: min(760px, calc(100vw - 180px));
+  min-width: min(520px, calc(100vw - 180px));
 }
 
 .question-panel {
