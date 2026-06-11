@@ -117,7 +117,7 @@ class ModelConfig(BaseModel):
 class NetworkConfig(BaseModel):
     """网络配置"""
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 15682
 
 
 class IntegrationConfig(BaseModel):
@@ -263,7 +263,11 @@ def load_config() -> AppConfig:
     if config_path.exists():
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return AppConfig(**data)
+            config = AppConfig(**data)
+            if int(getattr(config.network, "port", 0) or 0) == 8080:
+                config.network.port = 15682
+                save_config(config)
+            return config
     else:
         # 创建默认配置
         config = AppConfig()

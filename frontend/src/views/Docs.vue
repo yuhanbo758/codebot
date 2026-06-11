@@ -48,7 +48,7 @@ md.renderer.rules.link_open = function (tokens, idx, options, env, self) {
 // Add referrerpolicy="no-referrer" to all images so that CDNs with anti-hotlink
 // (Referer-based) protection don't block images when the page is served from
 // http://127.0.0.1 (Electron). Without this, the browser sends
-// "Referer: http://127.0.0.1:8080/..." and the CDN rejects the request.
+// "Referer: http://127.0.0.1:<port>/..." and the CDN rejects the request.
 md.renderer.rules.image = function (tokens, idx, options, env, self) {
   const token = tokens[idx]
   // MarkdownIt stores the alt text as token children; render them as plain text

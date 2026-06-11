@@ -67,9 +67,44 @@ def _hermes_venv_python(install_dir: Path) -> Path:
     return venv_dir / "bin" / "python"
 
 
+def _is_codebot_backend_executable(value: str) -> bool:
+    if not value:
+        return False
+    name = Path(value).name.lower()
+    return getattr(sys, "frozen", False) and "codebot" in name and "backend" in name
+
+
+def _system_python_executable() -> str:
+    candidates: List[str] = []
+    explicit = (os.environ.get("HERMES_PYTHON") or os.environ.get("PYTHON") or "").strip()
+    if explicit:
+        candidates.append(explicit)
+    if not _is_codebot_backend_executable(sys.executable):
+        candidates.append(sys.executable)
+    command_names = ["python", "python3"]
+    if sys.platform.startswith("win"):
+        command_names.insert(0, "py")
+    for name in command_names:
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+    for candidate in candidates:
+        if candidate and not _is_codebot_backend_executable(candidate):
+            return candidate
+    return ""
+
+
 def _hermes_python() -> str:
     python = _hermes_venv_python(_default_install_dir())
-    return str(python) if python.exists() else sys.executable
+    if python.exists():
+        return str(python)
+    system_python = _system_python_executable()
+    if system_python:
+        return system_python
+    raise HTTPException(
+        status_code=500,
+        detail="无法启动 Hermes：未找到可用 Python 解释器。请安装 Python 3，或设置 HERMES_PYTHON 指向 python.exe。",
+    )
 
 
 def _lan_ip() -> str:
@@ -93,7 +128,7 @@ def _runtime_codebot_port() -> int:
                 return port
         except Exception:
             pass
-    return int(app_config.network.port or 8080)
+    return int(app_config.network.port or 15682)
 
 
 def _codebot_app_urls() -> dict:
@@ -447,7 +482,13 @@ async def _ensure_hermes_runtime_ready(install_dir: Path, force_install: bool = 
     _write_hermes_home_config()
     python = _hermes_venv_python(install_dir)
     if not python.exists():
-        result = await _run_command([sys.executable, "-m", "venv", str(_hermes_venv_dir(install_dir))], cwd=install_dir, timeout=300)
+        bootstrap_python = _system_python_executable()
+        if not bootstrap_python:
+            return {
+                "returncode": 1,
+                "output": "无法准备 Hermes 运行时：未找到可用 Python 解释器。请安装 Python 3，或设置 HERMES_PYTHON 指向 python.exe。",
+            }
+        result = await _run_command([bootstrap_python, "-m", "venv", str(_hermes_venv_dir(install_dir))], cwd=install_dir, timeout=300)
         outputs.append(result.get("output", ""))
         if result.get("returncode") != 0:
             return {"returncode": result.get("returncode", 1), "output": "\n".join(outputs) or "Failed to create Hermes virtual environment"}

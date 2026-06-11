@@ -470,8 +470,9 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
 
         # ── 定时任务创建（带去重） ──
         try:
+            schedule_creation_intent = await chat_router._classify_codebot_schedule_creation_request(user_text, model=model or None)
             if candidate_decision_enabled:
-                if chat_router._looks_like_schedule_message(user_text):
+                if schedule_creation_intent:
                     staged = chat_router.stage_task_growth_candidate(
                         title="待确认定时任务",
                         content=user_text,
@@ -483,9 +484,10 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
                         await chat_router.notify_task_growth_candidate(staged, conversation_id=conv_id)
                         stats["tasks_created"] += 1
             else:
-                created = await chat_router._try_create_scheduled_task(user_text, execution_model=model or "")
-                if created:
-                    stats["tasks_created"] += 1
+                if schedule_creation_intent:
+                    created = await chat_router._try_create_scheduled_task(user_text, execution_model=model or "")
+                    if created:
+                        stats["tasks_created"] += 1
         except Exception:
             pass
 

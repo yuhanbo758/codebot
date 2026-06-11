@@ -63,7 +63,7 @@
   },
   "network": {
     "host": "0.0.0.0",
-    "port": 8080
+    "port": 15682
   },
   "integration": {
     "modelscope_api_key": ""

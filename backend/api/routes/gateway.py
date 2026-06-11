@@ -9,7 +9,7 @@
 
 用法示例:
     from openai import OpenAI
-    client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="any")
+    client = OpenAI(base_url="http://127.0.0.1:15682/v1", api_key="any")
     resp = client.chat.completions.create(
         model="github-copilot/gpt-4.1",
         messages=[{"role": "user", "content": "Hello"}],

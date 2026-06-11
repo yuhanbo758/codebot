@@ -72,7 +72,7 @@ echo   1. 直接启动后端：venv\Scripts\activate ^&^& python backend\main.py
 echo   2. 使用 Electron: cd electron ^&^& npm start
 echo.
 echo 访问地址：
-echo   本地：http://127.0.0.1:8080
+echo   本地：http://127.0.0.1:15682
 echo.
 
 pause

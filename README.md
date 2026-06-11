@@ -143,8 +143,8 @@ Electron 会优先使用应用内置的 `opencode` 可执行文件（`electron/v
 
 ### 访问
 
-- **本地访问**: <http://127.0.0.1:8080>
-- **局域网访问**: http\://<你的 IP>:8080
+- **本地访问**: <http://127.0.0.1:15682>
+- **局域网访问**: http\://<你的 IP>:15682
 - **移动端**: 使用手机浏览器访问局域网地址
 
 OpenCode Server 默认地址：<http://127.0.0.1:11200>（由 `opencode serve` 提供 HTTP API）
@@ -165,7 +165,7 @@ Codebot 提供 OpenAI 兼容接口：
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://127.0.0.1:8080/v1",
+    base_url="http://127.0.0.1:15682/v1",
     api_key="codebot",
 )
 
@@ -328,7 +328,7 @@ codebot/
 
 #### 分享与归档
 
-- 点击左侧对话更多菜单里的“分享”后，系统会生成 `/share/{share_id}` 只读页面，并复制基于局域网地址的链接，例如 `http://192.168.1.10:8080/share/xxxx`。
+- 点击左侧对话更多菜单里的“分享”后，系统会生成 `/share/{share_id}` 只读页面，并复制基于局域网地址的链接，例如 `http://192.168.1.10:15682/share/xxxx`。
 - 分享页面只展示对话内容，不提供继续发送消息、删除或修改能力。
 - 点击“归档”后，对话仍保存在 `data/conversations.db` 中，`conversations.is_archived` 会被设置为 `1`，对应消息仍保存在 `messages` 表。
 - 归档后的对话不会显示在聊天页左侧普通对话列表中，可在“日志”页的“已归档对话”标签中查看、搜索和恢复。
@@ -386,7 +386,7 @@ codebot/
 - **执行日志**: 详细的任务执行记录
 - **执行器归属**: 定时任务会持久化 `executor` 字段。聊天中选择 Hermes 后沉淀的任务、成长候选接受后的任务和手动编辑为 Hermes 的任务，到点执行时会调用 Hermes CLI；选择 OpenCode 或未指定时走 OpenCode
 - **执行模型**: 聊天中创建定时任务时，会把当时选择的主模型保存为任务的 `execution_model`；任务执行前会检查该模型是否仍在当前可用模型列表中，如果模型过时或供应商不再提供，会自动回退到“记忆 → 自动整理 → 整理使用模型”。在“定时任务”编辑窗口中可以为任务重新选择可用模型
-- **调度边界**: 在聊天中创建定时任务时，Codebot 会拦截该请求并只写入 Codebot 内置定时任务系统或成长候选；不会让 OpenCode/Hermes 立即创建 PowerShell 后台作业、Windows `schtasks`、cron/systemd/launchd 等系统级定时器，也不会立即执行未来任务内容
+- **调度边界**: 聊天中的定时任务创建意图由 AI 结构化分类器判断；只有判断为“创建/添加/设置 Codebot 定时任务、提醒或闹钟”时，Codebot 才会写入内置定时任务系统或成长候选。普通排错、日志分析和文件处理会继续交给 OpenCode/Hermes CLI，不会被误创建为任务；Codebot 也不会让 CLI 立即创建 PowerShell 后台作业、Windows `schtasks`、cron/systemd/launchd 等系统级定时器
 - **提醒任务**: 带 `__REMINDER__` 标志的纯提醒任务不依赖 Hermes/OpenCode 也能按计划触发通知；AI 类任务（生成内容/写文件等）按任务执行器要求对应运行时可用
 - **像聊天一样执行**: 定时任务到达执行时间时，系统会按任务执行器像对应聊天入口一样处理任务内容，充分利用 AI 的代码生成与文件写入能力
 - **一次性任务**: 未强调重复性的任务（如"5分钟后"、"明天"）自动标记为一次性，执行完成后不再重复触发
@@ -448,7 +448,7 @@ codebot/
 
 ### 刷新页面后白屏或 404
 
-如果直接访问或刷新 `/memory/active`、`/skills` 等前端路由地址，请确保通过后端服务地址访问（如 `http://127.0.0.1:8080`）。
+如果直接访问或刷新 `/memory/active`、`/skills` 等前端路由地址，请确保通过后端服务地址访问（如 `http://127.0.0.1:15682`）。
 当前版本后端已支持 SPA History 路由回退，刷新不会再丢失页面。
 
 ### 启动时报 sqlite3.OperationalError: Cannot add a column with non-constant default
@@ -464,11 +464,11 @@ codebot/
 - 重新启动后端
 - 如仍失败，可手动将 `data/chroma` 重命名为 `data/chroma_backup_manual` 后再启动（向量索引会自动重建）
 
-### 启动时报 WinError 10048: 端口 8080 被占用
+### 启动时报 WinError 10048: 端口 15682 被占用
 
 这表示你在同一台机器上启动了多个 Codebot 后端实例（或其它程序占用了配置端口）。
 
-- 用 PowerShell 查找占用进程：`netstat -ano | findstr :8080`
+- 用 PowerShell 查找占用进程：`netstat -ano | findstr :15682`
 - 结束占用进程：`taskkill /PID <PID> /F`
 - 或修改 `data/config.json` 里的 `network.port`，换一个端口后再启动
 
@@ -604,11 +604,11 @@ npm run build
 
 补充说明：
 
-- Electron 启动时会先检查 `http://127.0.0.1:8080/api/health`，若后端已在运行则复用现有实例，不会重复拉起后端进程。
+- Electron 启动时会先检查 `http://127.0.0.1:15682/api/health`，若后端已在运行则复用现有实例，不会重复拉起后端进程。
 - 若检测到已有后端运行但 `opencode_connected=false`，Electron 会自动重启后端以重新拉起 `opencode serve`。
 - 开发模式下 `npm start` 始终使用 `venv\Scripts\python.exe backend\main.py` 启动后端，确保运行的是当前源码。
 - 开发模式若本机已启动 `frontend` 的 Vite dev server（默认 `http://127.0.0.1:3000`），Electron 会优先连接该前端开发服务；未启动时才会自动构建 `frontend/dist` 后再继续加载应用。
-- 开发模式若检测到 8080 端口为非源码后端（`runtime_source != source`），会先终止该进程再拉起源码后端，避免看不到最新流式改动。
+- 开发模式默认使用 `18080`，若检测到该端口为非源码后端（`runtime_source != source`），会先终止该进程再拉起源码后端，避免看不到最新流式改动。
 - 文档页 `/docs` 通过 `/api/docs/readme` 读取项目根目录 README；桌面端会显式传递 `CODEBOT_DOCS_SOURCE`，避免开发态或打包态下文档 404。
 - 桌面端打包默认读取 `backend/dist_build/codebot-backend` 作为后端资源目录。
 - Windows 下建议使用根目录 `build.bat` 执行完整打包流程（后端 PyInstaller + 前端构建 + Electron 安装包）。

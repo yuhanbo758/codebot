@@ -486,12 +486,13 @@ async def _run_chat_post_processing(
         logger.debug(f"后台记忆提取失败: {exc}")
 
     try:
-        await _stage_or_create_schedule_from_message(
-            user_message,
-            conversation_id=conversation_id,
-            target=target,
-            execution_model=execution_model,
-        )
+        if await _classify_codebot_schedule_creation_request(user_message, model=execution_model):
+            await _stage_or_create_schedule_from_message(
+                user_message,
+                conversation_id=conversation_id,
+                target=target,
+                execution_model=execution_model,
+            )
     except Exception as exc:
         logger.debug(f"后台定时任务沉淀失败: {exc}")
 
@@ -705,19 +706,57 @@ def _task_executor_label(executor: Optional[str]) -> str:
     return "Hermes CLI" if _task_executor_from_target(executor) == "hermes" else "OpenCode CLI"
 
 
-def _build_codebot_scheduler_boundary(executor: Optional[str] = None) -> str:
-    return (
-        "Codebot scheduler boundary:\n"
-        "- The user's request is to create or update a Codebot scheduled task.\n"
-        "- Do not create PowerShell background jobs, Windows schtasks, cron jobs, launchd jobs, systemd timers, or any other OS-level scheduler.\n"
-        "- Do not execute the future task content immediately.\n"
-        f"- Codebot will store the schedule in its own scheduler database; when it is due, Codebot will run it through {_task_executor_label(executor)} according to the task executor.\n"
-        "- Reply only with the Codebot scheduling result or a concise acknowledgement."
-    )
-
-
 def _looks_like_codebot_schedule_creation_request(message: str) -> bool:
-    return _looks_like_schedule_message(message or "")
+    """Conservative fallback used only when the AI intent classifier is unavailable."""
+    text = (message or "").strip()
+    if not text:
+        return False
+    return bool(re.search(
+        r"(创建|新建|添加|增加|设置|设定|安排|建立|加入|生成).{0,24}"
+        r"(定时任务|计划任务|自动任务|日程|提醒|闹钟)",
+        text,
+        flags=re.IGNORECASE,
+    )) or bool(re.search(
+        r"(提醒我|通知我|叫我|别忘了|记得).{0,80}"
+        r"(\d{1,2}\s*点|\d{1,2}\s*[:：]\s*\d{2}|"
+        r"\d+\s*(分钟|小时|天)\s*(后|之后|以后)|"
+        r"每天|每周|每月|明天|后天|今天)",
+        text,
+    ))
+
+
+async def _classify_codebot_schedule_creation_request(message: str, model: Optional[str] = None) -> bool:
+    text = (message or "").strip()
+    if not text:
+        return False
+
+    prompt = (
+        "你是 Codebot 的意图分类器，只判断用户本轮消息是否在请求“创建/添加/设置一个 Codebot 定时任务、提醒或闹钟”。\n"
+        "不要执行用户任务，不要创建文件，不要运行命令，不要调用工具，只输出 JSON。\n"
+        "判断标准：\n"
+        "- 只有当用户的主要意图是让 Codebot 在未来某个时间或周期自动执行某事时，才返回 create_schedule。\n"
+        "- 如果用户是在排查错误、分析日志、请求修复代码、解释问题、执行普通即时任务，即使文本里出现时间戳、日期、发送、失败等词，也返回 pass_through。\n"
+        "- 如果只是提到已有定时任务、询问为什么出错、要求修复定时任务功能，也返回 pass_through。\n"
+        "输出格式必须是：{\"intent\":\"create_schedule\"|\"pass_through\",\"confidence\":0.0,\"reason\":\"简短原因\"}\n"
+        f"用户消息：{text}"
+    )
+    result_content, available = await _execute_opencode_client(prompt, model=model, user_message="")
+    if result_content:
+        data = _extract_json_object(result_content)
+        if isinstance(data, dict):
+            intent = str(data.get("intent") or "").strip()
+            try:
+                confidence = float(data.get("confidence") or 0)
+            except Exception:
+                confidence = 0.0
+            if intent == "create_schedule" and confidence >= 0.65:
+                return True
+            if intent == "pass_through":
+                return False
+
+    if available:
+        return False
+    return _looks_like_codebot_schedule_creation_request(text)
 
 
 async def _handle_codebot_schedule_creation_request(
@@ -726,8 +765,9 @@ async def _handle_codebot_schedule_creation_request(
     target: Optional[str] = None,
     conversation_id: Optional[int] = None,
     execution_model: Optional[str] = None,
+    intent_confirmed: bool = False,
 ) -> Optional[str]:
-    if not _looks_like_codebot_schedule_creation_request(message):
+    if not intent_confirmed and not await _classify_codebot_schedule_creation_request(message, model=execution_model):
         return None
 
     executor = _task_executor_from_target(target)
@@ -1710,13 +1750,6 @@ async def _execute_hermes_proxy(
             if "obsidian" not in {name.lower() for name in hermes_skills}:
                 hermes_skills.append("obsidian")
 
-    if _looks_like_codebot_schedule_creation_request(hermes_message):
-        hermes_message = (
-            f"{_build_codebot_scheduler_boundary('hermes')}\n\n"
-            "User request:\n"
-            f"{hermes_message}"
-        )
-
     conv_id = str(conversation_id) if conversation_id is not None else ""
     if conv_id:
         mark_conversation_running(conv_id)
@@ -1850,7 +1883,8 @@ async def _stream_execute_opencode_with_meta(
     target: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
 ):
-    if _looks_like_codebot_schedule_creation_request(message):
+    schedule_intent = await _classify_codebot_schedule_creation_request(message, model=model)
+    if schedule_intent:
         executor = _task_executor_from_target(target)
         preparing = f"Codebot 正在创建定时任务（执行器：{_task_executor_label(executor)}）...\n\n"
         yield {
@@ -1864,6 +1898,7 @@ async def _stream_execute_opencode_with_meta(
             target=target,
             conversation_id=int(conversation_id) if str(conversation_id or "").isdigit() else None,
             execution_model=model,
+            intent_confirmed=True,
         )
         content = content or "Codebot 未能创建该定时任务，请补充明确时间后重试。"
         yield {
@@ -2827,8 +2862,6 @@ async def _build_opencode_prompt_parts(
     # ── 构建 system prompt（仅含系统指令，不含用户消息）─────────────────────
     system_lines: List[str] = ["你正在 OpenCode 中处理用户消息。"]
     system_lines.extend(policy_lines)
-    if _looks_like_codebot_schedule_creation_request(raw_message):
-        system_lines.append(_build_codebot_scheduler_boundary(target))
     if _looks_like_skill_creation_intent(raw_message):
         system_lines.append(
             "本轮消息来自 Codebot 聊天，且用户有创建、生成、保存或沉淀 skill 的意图。"
