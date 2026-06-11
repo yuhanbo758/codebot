@@ -22,6 +22,7 @@
 - 🖥️ **跨平台**: Electron 桌面应用 + Web 应用
 - 🛠️ **第三方技能系统**: `skills/` 中的 SKILL.md 会同步到 OpenCode 的技能目录，作为第三方技能直接被调用
 - 🔌 **第三方 MCP 支持**: Codebot 会聚合并代理外部 MCP 服务器（尤其是魔搭 ModelScope MCP），再通过自身 MCP SSE 入口统一暴露给 OpenCode 调用
+- 📚 **使用文档入口**: 设置页里的“文档”会直接读取本项目 `README.md`，作为 Codebot 的用户手册与上手入口
 - 🏖️ **沙箱执行**: 工作目录隔离执行环境，AI 生成的代码在独立 `sandbox_workspace/` 目录中运行，无需 QEMU/Docker，开箱即用
 
 ## 🚀 快速开始
@@ -342,6 +343,15 @@ codebot/
 - `backend/core/tool_dispatcher.py` 已收敛为桥接辅助模块，仅负责技能发现与 MCP 协议适配，不再承担聊天主链路上的工具调度
 - 前端聊天页只展示 OpenCode 的流式步骤与最终结果，并提示当前第三方桥接状态
 
+### 1.2 Hermes / Obsidian / 文档入口
+
+- **Hermes 模式**: 在聊天页点击 `Hermes` 后，当前消息会交给 Hermes Agent CLI 的 `hermes -z` 处理；Codebot 会立即显示 Hermes CLI 正在处理、把发送按钮切到“处理中”，并支持用终止按钮结束当前 Hermes CLI 进程；最终回复仍回到当前聊天气泡中展示。Hermes 模式会通过共享配置、聊天后处理和成长候选流程衔接 Codebot 的模型、记忆、定时任务与技能目录。Hermes 模式下沉淀或创建的定时任务会记录 `executor=hermes`，后续到点触发时继续由 Hermes CLI 执行；OpenCode 模式创建的任务则记录 `executor=opencode`
+- **Obsidian 模式**: 在设置页配置 Obsidian 库路径后，可在聊天页通过 `#` 选择多个知识库路径；Codebot 会把这些 Markdown 知识库当成普通文件夹直接检索和引用，不会把它们先转成向量库
+- **技能搜索**: 聊天输入框中的 `@` 会搜索全部技能来源，包括 Codebot 内置/自动生成、OpenCode、Hermes Agent 与 OpenClaw，支持描述、单词和多词搜索
+- **命令搜索**: 聊天输入框中的 `/` 会搜索 OpenCode CLI 命令，并支持按描述、单词和多词进行匹配
+- **文档入口**: 设置页里的“文档”会直接渲染本 README，文档右上角可刷新，适合在改动配置、功能或使用方式后重新查看
+- **使用顺序**: 建议先看“快速开始”和“访问”，再看这里的使用说明；真正上手时，优先用聊天页底部的 `项目`、`生成技能`、`Hermes`、`Obsidian` 按钮切换处理目标
+
 ### 2. 记忆系统
 
 - **上下文记忆**: 自动保存对话历史
@@ -372,9 +382,13 @@ codebot/
 - **生日提醒特例**: 对"记住我的生日，10月20日，我生日时提醒我"这类复合句，会同时保存生日记忆并创建每年生日提醒任务
 - **AI 辅助**: 自然语言生成 Cron 表达式（OpenCode 不可用时降级为本地规则解析）
 - **通知渠道**: 飞书/邮箱/应用内通知
+- **候选通知**: 定时任务页顶部的“开启通知”控制任务候选提醒；开启后，聊天或自动整理把定时任务加入“成长候选”时会发送应用内/桌面操作提醒，便于及时打开“成长候选”确认、编辑或接受
 - **执行日志**: 详细的任务执行记录
-- **提醒任务**: 带 `__REMINDER__` 标志的纯提醒任务不依赖 OpenCode 也能按计划触发通知；AI 类任务（生成内容/写文件等）需要 OpenCode 在线执行
-- **像聊天一样执行**: 定时任务到达执行时间时，系统会像聊天一样通过 OpenCode CLI 处理任务内容，充分利用 AI 的代码生成与文件写入能力
+- **执行器归属**: 定时任务会持久化 `executor` 字段。聊天中选择 Hermes 后沉淀的任务、成长候选接受后的任务和手动编辑为 Hermes 的任务，到点执行时会调用 Hermes CLI；选择 OpenCode 或未指定时走 OpenCode
+- **执行模型**: 聊天中创建定时任务时，会把当时选择的主模型保存为任务的 `execution_model`；任务执行前会检查该模型是否仍在当前可用模型列表中，如果模型过时或供应商不再提供，会自动回退到“记忆 → 自动整理 → 整理使用模型”。在“定时任务”编辑窗口中可以为任务重新选择可用模型
+- **调度边界**: 在聊天中创建定时任务时，Codebot 会拦截该请求并只写入 Codebot 内置定时任务系统或成长候选；不会让 OpenCode/Hermes 立即创建 PowerShell 后台作业、Windows `schtasks`、cron/systemd/launchd 等系统级定时器，也不会立即执行未来任务内容
+- **提醒任务**: 带 `__REMINDER__` 标志的纯提醒任务不依赖 Hermes/OpenCode 也能按计划触发通知；AI 类任务（生成内容/写文件等）按任务执行器要求对应运行时可用
+- **像聊天一样执行**: 定时任务到达执行时间时，系统会按任务执行器像对应聊天入口一样处理任务内容，充分利用 AI 的代码生成与文件写入能力
 - **一次性任务**: 未强调重复性的任务（如"5分钟后"、"明天"）自动标记为一次性，执行完成后不再重复触发
 
 示例：
@@ -646,7 +660,7 @@ npm run build
 ### 定时任务 API
 
 - `GET /api/scheduler/tasks` - 获取任务列表
-- `POST /api/scheduler/tasks` - 创建任务
+- `POST /api/scheduler/tasks` - 创建任务，支持 `executor` 为 `opencode` 或 `hermes`，支持 `execution_model` 指定任务优先执行模型
 - `GET /api/scheduler/tasks/archived` - 获取已归档任务
 - `GET /api/scheduler/tasks/{task_id}` - 获取任务详情
 - `PUT /api/scheduler/tasks/{id}` - 更新任务

@@ -30,6 +30,7 @@ from core.skill_registry import (
     AUTO_GENERATED,
     BUILTIN,
     EXTERNAL,
+    HERMES,
     OPENCLAW,
     OPENCODE,
     capture_opencode_skill_snapshot,
@@ -252,6 +253,8 @@ class SendMessageRequest(BaseModel):
     attached_files: Optional[List[AttachedFile]] = None
     user_already_saved: bool = False
     project_dir: Optional[str] = None  # 用户选择的项目文件夹路径
+    target: Optional[str] = None  # codebot | hermes | obsidian
+    knowledge_paths: Optional[List[str]] = None
 
 
 class PermissionReplyRequest(BaseModel):
@@ -444,6 +447,8 @@ async def _run_chat_post_processing(
     user_message: str,
     assistant_response: str,
     conversation_id: Optional[int] = None,
+    target: Optional[str] = None,
+    execution_model: Optional[str] = None,
 ) -> None:
     skill_creation_intent = _looks_like_skill_creation_intent(user_message)
     migrated_skills: List[Dict[str, Any]] = []
@@ -481,7 +486,12 @@ async def _run_chat_post_processing(
         logger.debug(f"后台记忆提取失败: {exc}")
 
     try:
-        await _stage_or_create_schedule_from_message(user_message, conversation_id=conversation_id)
+        await _stage_or_create_schedule_from_message(
+            user_message,
+            conversation_id=conversation_id,
+            target=target,
+            execution_model=execution_model,
+        )
     except Exception as exc:
         logger.debug(f"后台定时任务沉淀失败: {exc}")
 
@@ -518,7 +528,14 @@ async def _run_chat_post_processing(
                 assistant_response=assistant_response,
                 conversation_id=conversation_id,
             )
-            await _auto_apply_growth_candidates(candidates, user_message, assistant_response, conversation_id)
+            await _auto_apply_growth_candidates(
+                candidates,
+                user_message,
+                assistant_response,
+                conversation_id,
+                target=target,
+                execution_model=execution_model,
+            )
     except Exception as exc:
         logger.debug(f"成长候选记录失败: {exc}")
 
@@ -528,6 +545,8 @@ async def _auto_apply_growth_candidates(
     user_message: str,
     assistant_response: str,
     conversation_id: Optional[int] = None,
+    target: Optional[str] = None,
+    execution_model: Optional[str] = None,
 ) -> None:
     """Close the learning loop for high-confidence or repeated growth candidates."""
     for candidate in candidates or []:
@@ -570,7 +589,9 @@ async def _auto_apply_growth_candidates(
                 from core.growth import ACCEPTED, mark_candidate
                 mark_candidate(candidate_id, ACCEPTED)
             elif kind == "task" and hit_count >= 2:
-                created = await _try_create_scheduled_task(candidate.get("content") or user_message)
+                executor = str(payload.get("executor") or "").strip() or _task_executor_from_target(target)
+                model = str(payload.get("execution_model") or "").strip() or _task_execution_model_from_chat_model(execution_model)
+                created = await _try_create_scheduled_task(candidate.get("content") or user_message, executor=executor, execution_model=model)
                 if created:
                     from core.growth import ACCEPTED, mark_candidate
                     mark_candidate(candidate_id, ACCEPTED)
@@ -599,7 +620,10 @@ def stage_task_growth_candidate(
     *,
     conversation_id: Optional[int] = None,
     cron_expression: str = "",
+    schedule_text: str = "",
     run_once: bool = False,
+    executor: str = "opencode",
+    execution_model: str = "",
     notify_channels: Optional[List[str]] = None,
     evidence: str = "",
 ) -> Optional[Dict[str, Any]]:
@@ -617,12 +641,217 @@ def stage_task_growth_candidate(
             "name": title,
             "task_prompt": content,
             "cron_expression": str(cron_expression or "").strip(),
+            "schedule_text": str(schedule_text or "").strip(),
             "notify_channels": channels,
             "run_once": bool(run_once),
+            "executor": _task_executor_from_target(executor),
+            "execution_model": _task_execution_model_from_chat_model(execution_model),
             "conversation_id": conversation_id,
         },
         evidence=str(evidence or content)[:1000],
     )
+
+
+async def notify_task_growth_candidate(candidate: Optional[Dict[str, Any]], conversation_id: Optional[int] = None) -> None:
+    if not candidate:
+        return
+    if not bool(getattr(app_config.general, "task_candidate_notification_enabled", True)):
+        return
+    created_at = str(candidate.get("created_at") or "")
+    updated_at = str(candidate.get("updated_at") or "")
+    if created_at and updated_at and created_at != updated_at:
+        return
+    try:
+        from api.routes import notifications as notifications_router
+
+        service = getattr(notifications_router, "notification_service", None)
+        if service is None:
+            return
+        title = "定时任务已进入成长候选"
+        task_title = str(candidate.get("title") or "待确认定时任务")
+        message = (
+            f"{task_title}\n\n"
+            "请打开右上角“成长候选”进行查看、编辑或接受。"
+        )
+        if conversation_id:
+            message = f"{message}\n对话ID: {conversation_id}"
+        asyncio.create_task(
+            service.send_action_required_notification(
+                title=title,
+                message=message,
+                task_id=f"growth:{candidate.get('id') or ''}",
+                notif_type="warning",
+                force_desktop=True,
+            )
+        )
+    except Exception as exc:
+        logger.debug(f"定时任务成长候选通知发送失败（跳过）: {exc}")
+
+
+def _task_executor_from_target(target: Optional[str]) -> str:
+    return "hermes" if str(target or "").strip().lower() == "hermes" else "opencode"
+
+
+def _task_execution_model_from_chat_model(model: Optional[str]) -> str:
+    return (
+        str(model or "").strip()
+        or app_config.general.chat_default_model
+        or app_config.models.primary_model
+        or ""
+    ).strip()
+
+
+def _task_executor_label(executor: Optional[str]) -> str:
+    return "Hermes CLI" if _task_executor_from_target(executor) == "hermes" else "OpenCode CLI"
+
+
+def _build_codebot_scheduler_boundary(executor: Optional[str] = None) -> str:
+    return (
+        "Codebot scheduler boundary:\n"
+        "- The user's request is to create or update a Codebot scheduled task.\n"
+        "- Do not create PowerShell background jobs, Windows schtasks, cron jobs, launchd jobs, systemd timers, or any other OS-level scheduler.\n"
+        "- Do not execute the future task content immediately.\n"
+        f"- Codebot will store the schedule in its own scheduler database; when it is due, Codebot will run it through {_task_executor_label(executor)} according to the task executor.\n"
+        "- Reply only with the Codebot scheduling result or a concise acknowledgement."
+    )
+
+
+def _looks_like_codebot_schedule_creation_request(message: str) -> bool:
+    return _looks_like_schedule_message(message or "")
+
+
+async def _handle_codebot_schedule_creation_request(
+    message: str,
+    *,
+    target: Optional[str] = None,
+    conversation_id: Optional[int] = None,
+    execution_model: Optional[str] = None,
+) -> Optional[str]:
+    if not _looks_like_codebot_schedule_creation_request(message):
+        return None
+
+    executor = _task_executor_from_target(target)
+    model = _task_execution_model_from_chat_model(execution_model)
+    result = await _stage_or_create_schedule_from_message(
+        message,
+        conversation_id=conversation_id,
+        target=executor,
+        execution_model=model,
+    )
+    if not result:
+        result = (
+            "我识别到这是定时任务创建请求，但 Codebot 没能解析出明确的执行时间，"
+            "所以没有创建 PowerShell 后台作业、Windows 计划任务或其他系统级定时器。"
+            "请补充具体时间，或到“定时任务”页面手动创建。"
+        )
+    return (
+        f"{result}\n\n"
+        f"执行器：{_task_executor_label(executor)}\n"
+        f"执行模型：{model or '记忆整理备用模型'}\n"
+        "调度方式：仅使用 Codebot 内置定时任务系统；未创建 PowerShell 后台作业、Windows schtasks 或其他系统级定时器。"
+    )
+
+
+def _default_task_notify_channels() -> List[str]:
+    nc = app_config.notification
+    channels: List[str] = []
+    if nc.app_enabled:
+        channels.append("app")
+    if nc.desktop_enabled:
+        channels.append("desktop")
+    if nc.lark_enabled:
+        channels.append("lark")
+    if nc.email_enabled:
+        channels.append("email")
+    return channels or ["app"]
+
+
+def _schedule_run_once_from_message(message: str) -> bool:
+    text = message or ""
+    return (
+        any(key in text for key in ["今天", "明天", "后天", "一次", "只提醒一次", "仅提醒一次", "提醒一次"])
+        or bool(re.search(r"\d+\s*(分钟|小时|天)\s*(后|之后|以后)", text))
+        or bool(re.search(r"(半小时|一小时|一天)\s*(后|之后|以后)", text))
+    )
+
+
+async def _build_task_growth_candidate_payload(
+    message: str,
+    conversation_id: Optional[int] = None,
+    target: Optional[str] = None,
+    execution_model: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    raw_message = (message or "").strip()
+    if not raw_message or not _looks_like_schedule_message(raw_message):
+        return None
+
+    notify_channels = _default_task_notify_channels()
+    run_once = _schedule_run_once_from_message(raw_message)
+    cron_expression = ""
+    name = ""
+    task_prompt = ""
+
+    if _looks_like_birthday_reminder_message(raw_message):
+        birthday = _extract_birthday_value(raw_message)
+        if birthday:
+            md = re.search(r"(\d{1,2})月(\d{1,2})日", birthday)
+            if md:
+                month = int(md.group(1))
+                day = int(md.group(2))
+                hour, minute = _extract_time_for_reminder(raw_message)
+                subject = _extract_birthday_subject(raw_message) or "我"
+                if subject == "我":
+                    remind_text = "今天是你的生日，生日快乐！"
+                    name = f"生日提醒：每年{month}月{day}日"
+                else:
+                    remind_text = f"今天是{subject}的生日，记得送上祝福。"
+                    name = f"生日提醒：{subject}每年{month}月{day}日"
+                task_prompt = f"__REMINDER__\n{remind_text}"
+                cron_expression = f"{minute} {hour} {day} {month} *"
+
+    if not cron_expression:
+        try:
+            cron_data = await scheduler_router.generate_cron_from_text(raw_message)
+            cron_expression = str((cron_data or {}).get("cron") or "").strip()
+        except Exception as exc:
+            logger.debug(f"定时任务候选 cron 解析失败: {exc}")
+
+    if not task_prompt:
+        is_reminder = any(key in raw_message for key in ["提醒", "闹钟", "提示我", "叫我", "通知我", "别忘了", "记得"])
+        if is_reminder:
+            content = _extract_reminder_content(raw_message)
+            name = f"{'一次性' if run_once else ''}提醒：{content}" if content else ("一次性定时提醒" if run_once else "定时提醒")
+            task_payload = f"提醒：{content}" if content else raw_message
+            task_prompt = f"__REMINDER__\n{task_payload}"
+        else:
+            task_content = _extract_task_content(raw_message)
+            action_text = re.sub(r"[，。,.!！?？;；:：]", " ", task_content)
+            action_text = " ".join(action_text.split()) or raw_message
+            name = f"{'一次性' if run_once else ''}任务：{action_text}"
+            task_prompt = task_content
+            drive_match = re.search(r"保存到\s*([a-zA-Z])\s*盘", raw_message)
+            if drive_match:
+                drive = drive_match.group(1).upper()
+                output_dir = f"{drive}:\\codebot_tasks"
+                task_prompt = (
+                    f"{task_content}\n"
+                    f"请将产出保存为 Markdown 文件到 {output_dir} 目录（如不存在请创建），"
+                    f"文件名包含日期时间（例如 20260301_0800.md），并在完成后输出保存路径。"
+                )
+
+    if len(name) > 30:
+        name = f"{name[:30]}..."
+    return {
+        "title": name or "待确认定时任务",
+        "content": task_prompt or raw_message,
+        "cron_expression": cron_expression,
+        "schedule_text": raw_message,
+        "run_once": run_once,
+        "executor": _task_executor_from_target(target),
+        "execution_model": _task_execution_model_from_chat_model(execution_model),
+        "notify_channels": notify_channels,
+        "conversation_id": conversation_id,
+    }
 
 
 def stage_skill_growth_candidate(
@@ -651,20 +880,42 @@ def stage_skill_growth_candidate(
     )
 
 
-async def _stage_or_create_schedule_from_message(message: str, conversation_id: Optional[int] = None) -> Optional[str]:
+async def _stage_or_create_schedule_from_message(
+    message: str,
+    conversation_id: Optional[int] = None,
+    target: Optional[str] = None,
+    execution_model: Optional[str] = None,
+) -> Optional[str]:
     if _growth_candidate_decision_enabled():
-        if not _looks_like_schedule_message(message):
+        task_candidate = await _build_task_growth_candidate_payload(
+            message,
+            conversation_id=conversation_id,
+            target=target,
+            execution_model=execution_model,
+        )
+        if not task_candidate:
             return None
         staged = stage_task_growth_candidate(
-            title="待确认定时任务",
-            content=message,
+            title=task_candidate.get("title") or "待确认定时任务",
+            content=task_candidate.get("content") or message,
             conversation_id=conversation_id,
+            cron_expression=task_candidate.get("cron_expression") or "",
+            schedule_text=task_candidate.get("schedule_text") or message,
+            run_once=bool(task_candidate.get("run_once")),
+            executor=task_candidate.get("executor") or _task_executor_from_target(target),
+            execution_model=task_candidate.get("execution_model") or _task_execution_model_from_chat_model(execution_model),
+            notify_channels=task_candidate.get("notify_channels") if isinstance(task_candidate.get("notify_channels"), list) else None,
             evidence=message,
         )
         if not staged:
             return None
+        await notify_task_growth_candidate(staged, conversation_id=conversation_id)
         return "已生成定时任务候选，可在“成长候选”中编辑后决定是否加入。"
-    return await _try_create_scheduled_task(message)
+    return await _try_create_scheduled_task(
+        message,
+        executor=_task_executor_from_target(target),
+        execution_model=_task_execution_model_from_chat_model(execution_model),
+    )
 
 
 async def _stage_or_materialize_skill(user_message: str, assistant_response: str, conversation_id: Optional[int] = None) -> bool:
@@ -1427,7 +1678,85 @@ async def _sync_codebot_as_third_party():
     mcp_router.ensure_codebot_remote_mcp_in_opencode()
 
 
-async def _execute_opencode(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None, project_dir: Optional[str] = None) -> str:
+async def _execute_hermes_proxy(
+    message: str,
+    model: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    knowledge_paths: Optional[List[str]] = None,
+) -> str:
+    from api.routes import hermes as hermes_router
+
+    selected_skill = None
+    cleaned_message = message
+    hermes_skills: List[str] = []
+    try:
+        selected_skill, cleaned_message, _ = _extract_requested_skill(message)
+        if selected_skill:
+            skill_name = selected_skill.get("slug") or selected_skill.get("name") or ""
+            if skill_name:
+                hermes_skills.append(str(skill_name))
+    except Exception as exc:
+        logger.debug(f"[Hermes] skill marker parse failed: {exc}")
+
+    hermes_message = cleaned_message or message
+    if knowledge_paths:
+        obsidian_context = _build_obsidian_context(hermes_message, knowledge_paths)
+        if obsidian_context:
+            hermes_message = (
+                f"{hermes_message}\n\n"
+                "[Codebot selected Obsidian Markdown context]\n"
+                f"{obsidian_context}"
+            )
+            if "obsidian" not in {name.lower() for name in hermes_skills}:
+                hermes_skills.append("obsidian")
+
+    if _looks_like_codebot_schedule_creation_request(hermes_message):
+        hermes_message = (
+            f"{_build_codebot_scheduler_boundary('hermes')}\n\n"
+            "User request:\n"
+            f"{hermes_message}"
+        )
+
+    conv_id = str(conversation_id) if conversation_id is not None else ""
+    if conv_id:
+        mark_conversation_running(conv_id)
+    try:
+        response = await hermes_router.hermes_chat(
+            hermes_router.HermesChatRequest(
+                message=hermes_message,
+                model=model,
+                conversation_id=conversation_id,
+                skills=hermes_skills,
+            )
+        )
+        return ((response.get("data") or {}).get("content") or "").strip()
+    finally:
+        if conv_id:
+            unmark_conversation_running(conv_id)
+
+
+async def _execute_opencode(
+    message: str,
+    model: Optional[str] = None,
+    mode: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    project_dir: Optional[str] = None,
+    target: Optional[str] = None,
+    knowledge_paths: Optional[List[str]] = None,
+) -> str:
+    schedule_result = await _handle_codebot_schedule_creation_request(
+        message,
+        target=target,
+        conversation_id=int(conversation_id) if str(conversation_id or "").isdigit() else None,
+        execution_model=model,
+    )
+    if schedule_result:
+        return schedule_result
+
+    if (target or "").strip().lower() == "hermes":
+        content = await _execute_hermes_proxy(message, model=model, conversation_id=conversation_id, knowledge_paths=knowledge_paths)
+        return _sanitize_assistant_output(content or "", user_message=message)
+
     try:
         await _sync_codebot_as_third_party()
     except Exception as _sync_err:
@@ -1435,7 +1764,14 @@ async def _execute_opencode(message: str, model: Optional[str] = None, mode: Opt
 
     skill_watch = _begin_codebot_skill_creation_watch(message)
     # 系统指令通过独立 system 字段传递，用户消息保持纯净
-    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode, project_dir=project_dir)
+    system_prompt, user_message = await _build_opencode_prompt_parts(
+        message,
+        mode=mode,
+        project_dir=project_dir,
+        target=target,
+        knowledge_paths=knowledge_paths,
+        model=model,
+    )
     try:
         content, _ = await _execute_opencode_client(user_message, model=model, mode=mode, conversation_id=conversation_id, system=system_prompt, user_message=message)
         content = _sanitize_assistant_output(content or "", user_message=message)
@@ -1453,8 +1789,23 @@ async def _execute_opencode_with_meta(
     model: Optional[str] = None,
     mode: Optional[str] = None,
     conversation_id: Optional[str] = None,
-    project_dir: Optional[str] = None
+    project_dir: Optional[str] = None,
+    target: Optional[str] = None,
+    knowledge_paths: Optional[List[str]] = None,
 ) -> Tuple[str, List[dict]]:
+    schedule_result = await _handle_codebot_schedule_creation_request(
+        message,
+        target=target,
+        conversation_id=int(conversation_id) if str(conversation_id or "").isdigit() else None,
+        execution_model=model,
+    )
+    if schedule_result:
+        return schedule_result, []
+
+    if (target or "").strip().lower() == "hermes":
+        content = await _execute_hermes_proxy(message, model=model, conversation_id=conversation_id, knowledge_paths=knowledge_paths)
+        return _sanitize_assistant_output(content or "", user_message=message), []
+
     try:
         await _sync_codebot_as_third_party()
     except Exception as _sync_err:
@@ -1462,7 +1813,14 @@ async def _execute_opencode_with_meta(
 
     skill_watch = _begin_codebot_skill_creation_watch(message)
     # 系统指令通过独立 system 字段传递，用户消息保持纯净
-    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode, project_dir=project_dir)
+    system_prompt, user_message = await _build_opencode_prompt_parts(
+        message,
+        mode=mode,
+        project_dir=project_dir,
+        target=target,
+        knowledge_paths=knowledge_paths,
+        model=model,
+    )
     try:
         content, _, parts = await _execute_opencode_client_with_parts(
             user_message,
@@ -1488,8 +1846,59 @@ async def _stream_execute_opencode_with_meta(
     model: Optional[str] = None,
     mode: Optional[str] = None,
     conversation_id: Optional[str] = None,
-    project_dir: Optional[str] = None
+    project_dir: Optional[str] = None,
+    target: Optional[str] = None,
+    knowledge_paths: Optional[List[str]] = None,
 ):
+    if _looks_like_codebot_schedule_creation_request(message):
+        executor = _task_executor_from_target(target)
+        preparing = f"Codebot 正在创建定时任务（执行器：{_task_executor_label(executor)}）...\n\n"
+        yield {
+            "type": "content_delta",
+            "delta": preparing,
+            "content": preparing,
+            "source": "codebot_scheduler",
+        }
+        content = await _handle_codebot_schedule_creation_request(
+            message,
+            target=target,
+            conversation_id=int(conversation_id) if str(conversation_id or "").isdigit() else None,
+            execution_model=model,
+        )
+        content = content or "Codebot 未能创建该定时任务，请补充明确时间后重试。"
+        yield {
+            "type": "done",
+            "content": content,
+            "parts": [],
+            "source": "codebot_scheduler",
+            "agent": "Codebot Scheduler",
+        }
+        return
+
+    if (target or "").strip().lower() == "hermes":
+        model_text = f"（模型：{model}）" if model else ""
+        yield {
+            "type": "content_delta",
+            "delta": f"Hermes Agent CLI 正在处理{model_text}...\n\n",
+            "content": f"Hermes Agent CLI 正在处理{model_text}...\n\n",
+            "source": "hermes",
+        }
+        content = await _execute_hermes_proxy(message, model=model, conversation_id=conversation_id, knowledge_paths=knowledge_paths)
+        yield {
+            "type": "status",
+            "phase": "hermes_cli",
+            "source": "hermes",
+            "message": "Hermes Agent CLI completed",
+        }
+        yield {
+            "type": "done",
+            "content": _sanitize_assistant_output(content or "", user_message=message),
+            "parts": [],
+            "source": "hermes",
+            "agent": "Hermes Agent CLI",
+        }
+        return
+
     try:
         await _sync_codebot_as_third_party()
     except Exception as _sync_err:
@@ -1497,7 +1906,14 @@ async def _stream_execute_opencode_with_meta(
 
     skill_watch = _begin_codebot_skill_creation_watch(message)
     # 系统指令通过独立 system 字段传递，用户消息保持纯净
-    system_prompt, user_message = await _build_opencode_prompt_parts(message, mode=mode, project_dir=project_dir)
+    system_prompt, user_message = await _build_opencode_prompt_parts(
+        message,
+        mode=mode,
+        project_dir=project_dir,
+        target=target,
+        knowledge_paths=knowledge_paths,
+        model=model,
+    )
     # 首先 yield 内部提示词事件，供聊天日志记录
     yield {"type": "internal_prompt", "prompt": f"[system]\n{system_prompt}\n\n[user]\n{user_message}"}
 
@@ -1672,7 +2088,9 @@ async def _try_ai_route_action(message: str) -> Tuple[Optional[str], bool]:
             name=name,
             cron_expression=cron_expression,
             task_prompt=task_prompt,
-            notify_channels=notify_channels
+            notify_channels=notify_channels,
+            executor="opencode",
+            execution_model=_task_execution_model_from_chat_model(None),
         )
         next_run = task.next_run.isoformat() if task.next_run else "待计算"
         return f"已创建定时任务：{task.name}\nCron：{task.cron_expression}\n下次运行：{next_run}\n可在“定时任务”查看和管理。", opencode_available
@@ -1797,6 +2215,16 @@ def _extract_task_content(message: str) -> str:
     """
     text = message.strip()
 
+    # 0. 去掉"创建一个一次性定时任务："这类调度创建元指令，只保留未来要执行的正文。
+    text = re.sub(
+        r"^\s*(?:请|帮我|给我|麻烦你)?\s*"
+        r"(?:创建|新建|添加|增加|设置|设定|建立|安排|生成)\s*"
+        r"(?:一个|一条|1个)?\s*(?:一次性|单次|一次)?\s*"
+        r"(?:定时任务|计划任务|任务|日程|提醒)\s*[:：,，、\s]*",
+        "",
+        text
+    )
+
     # 1. 去掉句首的相对时间前缀（如"5分钟后，"、"半小时后 "）
     text = re.sub(
         r"^((\d+\s*(分钟|小时|天|周|个月|年)|半小时|一小时|一天|一周|一个月)\s*(后|之后|以后)[，,\s]*)+",
@@ -1838,7 +2266,7 @@ def _extract_task_content(message: str) -> str:
     return text if text else message.strip()
 
 
-def _find_duplicate_task(name: str, task_prompt: str) -> Optional[str]:
+def _find_duplicate_task(name: str, task_prompt: str, executor: str = "opencode") -> Optional[str]:
     """检查是否已存在相同或高度相似的定时任务。
     返回已有任务名称（如重复）或 None（不重复）。
 
@@ -1861,8 +2289,11 @@ def _find_duplicate_task(name: str, task_prompt: str) -> Optional[str]:
     existing_tasks = scheduler_router.scheduler.list_tasks()
     clean_prompt = _strip_markers(task_prompt)
     clean_name = name.strip()
+    normalized_executor = _task_executor_from_target(executor)
 
     for t in existing_tasks:
+        if _task_executor_from_target(getattr(t, "executor", "opencode")) != normalized_executor:
+            continue
         # 1. 名称完全匹配
         if t.name.strip() == clean_name:
             return t.name
@@ -1877,11 +2308,17 @@ def _find_duplicate_task(name: str, task_prompt: str) -> Optional[str]:
     return None
 
 
-async def _try_create_scheduled_task(message: str) -> Optional[str]:
+async def _try_create_scheduled_task(
+    message: str,
+    executor: str = "opencode",
+    execution_model: str = "",
+) -> Optional[str]:
     if not _looks_like_schedule_message(message):
         return None
     if not scheduler_router.scheduler:
         return None
+    executor = _task_executor_from_target(executor)
+    execution_model = _task_execution_model_from_chat_model(execution_model)
     # 从全局通知配置读取默认渠道
     _nc = app_config.notification
     _default_channels: list = []
@@ -1914,7 +2351,7 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
                     task_prompt = f"__REMINDER__\n{remind_text}"
                     cron_expression = f"{minute} {hour} {day} {month} *"
                     # ---- 去重检查 ----
-                    dup_name = _find_duplicate_task(name, task_prompt)
+                    dup_name = _find_duplicate_task(name, task_prompt, executor=executor)
                     if dup_name:
                         logger.info(f"跳过重复生日提醒任务：'{name}'（已有：'{dup_name}'）")
                         return None
@@ -1922,7 +2359,9 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
                         name=name,
                         cron_expression=cron_expression,
                         task_prompt=task_prompt,
-                        notify_channels=_default_channels
+                        notify_channels=_default_channels,
+                        executor=executor,
+                        execution_model=execution_model,
                     )
                     next_run = task.next_run.isoformat() if task.next_run else "待计算"
                     return (
@@ -1973,7 +2412,7 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
         if run_once:
             task_prompt = f"__RUN_ONCE__\n{task_prompt}"
         # ---- 去重检查 ----
-        dup_name = _find_duplicate_task(name, task_prompt)
+        dup_name = _find_duplicate_task(name, task_prompt, executor=executor)
         if dup_name:
             logger.info(f"跳过重复定时任务：'{name}'（已有：'{dup_name}'）")
             return None
@@ -1981,7 +2420,9 @@ async def _try_create_scheduled_task(message: str) -> Optional[str]:
             name=name,
             cron_expression=cron_expression,
             task_prompt=task_prompt,
-            notify_channels=_default_channels
+            notify_channels=_default_channels,
+            executor=executor,
+            execution_model=execution_model,
         )
         next_run = task.next_run.isoformat() if task.next_run else "待计算"
         return f"已创建定时任务：{task.name}\nCron：{task.cron_expression}\n下次运行：{next_run}\n可在“定时任务”查看和管理。"
@@ -2282,7 +2723,14 @@ def _build_skill_system_context(skill: dict) -> str:
     )
 
 
-async def _build_opencode_prompt_parts(message: str, mode: Optional[str] = None, project_dir: Optional[str] = None) -> Tuple[str, str]:
+async def _build_opencode_prompt_parts(
+    message: str,
+    mode: Optional[str] = None,
+    project_dir: Optional[str] = None,
+    target: Optional[str] = None,
+    knowledge_paths: Optional[List[str]] = None,
+    model: Optional[str] = None,
+) -> Tuple[str, str]:
     """
     构建 OpenCode 提示词，返回 (system_prompt, user_message) 元组。
 
@@ -2335,20 +2783,20 @@ async def _build_opencode_prompt_parts(message: str, mode: Optional[str] = None,
         pass
 
     # ── 专项分类检索（补充语义检索未命中的内容）──────────────────────────────
-    for cat, target in [
+    for cat, target_bucket in [
         ("habit", habit_context),
         ("preference", preference_context),
         ("profile", profile_context),
     ]:
-        if len(target) < 3:
+        if len(target_bucket) < 3:
             try:
                 extra = await manager.search_memories(
                     message_for_context, top_k=3, category=cat, include_archived=False
                 )
                 for item in extra:
                     content = str(item.get("content") or "").strip()
-                    if content and content not in target:
-                        target.append(content)
+                    if content and content not in target_bucket:
+                        target_bucket.append(content)
             except Exception:
                 pass
 
@@ -2379,6 +2827,8 @@ async def _build_opencode_prompt_parts(message: str, mode: Optional[str] = None,
     # ── 构建 system prompt（仅含系统指令，不含用户消息）─────────────────────
     system_lines: List[str] = ["你正在 OpenCode 中处理用户消息。"]
     system_lines.extend(policy_lines)
+    if _looks_like_codebot_schedule_creation_request(raw_message):
+        system_lines.append(_build_codebot_scheduler_boundary(target))
     if _looks_like_skill_creation_intent(raw_message):
         system_lines.append(
             "本轮消息来自 Codebot 聊天，且用户有创建、生成、保存或沉淀 skill 的意图。"
@@ -2389,8 +2839,21 @@ async def _build_opencode_prompt_parts(message: str, mode: Optional[str] = None,
         system_lines.append("以下是与当前问题相关的用户记忆，请在回答中参考；若与用户本轮消息冲突，以用户本轮消息为准。")
         system_lines.extend(memory_lines)
 
-    if selected_skill and selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, OPENCLAW}:
+    if selected_skill and selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, HERMES, OPENCLAW}:
         system_lines.append(_build_skill_system_context(selected_skill))
+
+    normalized_target = (target or "codebot").strip().lower()
+    if normalized_target == "hermes":
+        system_lines.append(_build_hermes_context(model=model))
+    elif normalized_target == "obsidian":
+        obsidian_context = _build_obsidian_context(cleaned_message or raw_message, knowledge_paths)
+        if obsidian_context:
+            system_lines.append(obsidian_context)
+        else:
+            system_lines.append(
+                "Obsidian mode is active, but no configured Obsidian vault or knowledge base was selected. "
+                "Ask the user to configure Obsidian Settings if Markdown vault access is required."
+            )
 
     # ── 注入文件存储/项目目录（项目目录优先）──────────────────────────────
     if project_dir and project_dir.strip():
@@ -3330,6 +3793,175 @@ def _build_files_context(attached_files: List[AttachedFile]) -> str:
     return "\n\n".join(parts)
 
 
+def _split_search_tokens(query: str) -> List[str]:
+    return [part.lower() for part in re.split(r"[\s\u3000]+", (query or "").strip()) if part.strip()]
+
+
+def _matches_tokens(query: str, *values: str) -> bool:
+    tokens = _split_search_tokens(query)
+    if not tokens:
+        return True
+    haystack = " ".join(str(value or "") for value in values).lower()
+    return all(token in haystack for token in tokens)
+
+
+def _configured_knowledge_bases() -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_item(name: str, path_value: str, description: str = "", enabled: bool = True, kb_id: str = ""):
+        raw = (path_value or "").strip()
+        if not raw:
+            return
+        try:
+            path = Path(raw).expanduser()
+            key = str(path.resolve()).lower()
+        except Exception:
+            path = Path(raw)
+            key = str(path).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        items.append({
+            "id": kb_id or key,
+            "name": name or path.name or raw,
+            "path": str(path),
+            "description": description or "",
+            "enabled": bool(enabled),
+        })
+
+    obsidian_cfg = getattr(app_config, "obsidian", None)
+    if obsidian_cfg:
+        add_item("Obsidian Vault", getattr(obsidian_cfg, "vault_path", ""), "Default Obsidian vault")
+        for kb in getattr(obsidian_cfg, "knowledge_bases", []) or []:
+            data = kb.model_dump() if hasattr(kb, "model_dump") else dict(kb)
+            add_item(
+                data.get("name") or "",
+                data.get("path") or "",
+                data.get("description") or "",
+                data.get("enabled", True),
+                data.get("id") or "",
+            )
+    return items
+
+
+def _resolve_knowledge_roots(knowledge_paths: Optional[List[str]]) -> List[Path]:
+    configured = _configured_knowledge_bases()
+    allowed_by_id = {str(item.get("id")): item for item in configured}
+    allowed_by_path = {}
+    for item in configured:
+        try:
+            allowed_by_path[str(Path(item["path"]).expanduser().resolve()).lower()] = item
+        except Exception:
+            pass
+
+    roots: List[Path] = []
+    requested = [str(item).strip() for item in (knowledge_paths or []) if str(item).strip()]
+    if not requested:
+        requested = [str(item.get("id") or item.get("path")) for item in configured if item.get("enabled", True)]
+
+    for raw in requested:
+        item = allowed_by_id.get(raw)
+        if not item:
+            try:
+                item = allowed_by_path.get(str(Path(raw).expanduser().resolve()).lower())
+            except Exception:
+                item = None
+        if not item or not item.get("enabled", True):
+            continue
+        path = Path(item["path"]).expanduser()
+        if path.exists() and path.is_dir():
+            roots.append(path.resolve())
+    return list(dict.fromkeys(roots))
+
+
+def _search_markdown_notes(query: str, knowledge_paths: Optional[List[str]], limit: int = 8) -> List[Dict[str, Any]]:
+    roots = _resolve_knowledge_roots(knowledge_paths)
+    results: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    skip_dirs = {".git", ".obsidian", "node_modules", "__pycache__", ".trash", ".venv", "venv"}
+    tokens = _split_search_tokens(query)
+    for root in roots:
+        if len(results) >= limit:
+            break
+        for path in root.glob("**/*.md"):
+            if len(results) >= limit:
+                break
+            if any(part in skip_dirs for part in path.parts):
+                continue
+            try:
+                key = str(path.resolve()).lower()
+                if key in seen:
+                    continue
+                rel = str(path.relative_to(root)).replace("\\", "/")
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            title_match = _matches_tokens(query, rel, path.stem)
+            content_match = _matches_tokens(query, text[:20000])
+            if tokens and not (title_match or content_match):
+                continue
+            seen.add(key)
+            snippet = ""
+            if tokens:
+                lower_text = text.lower()
+                positions = [lower_text.find(token) for token in tokens if lower_text.find(token) >= 0]
+                start = max(0, min(positions) - 240) if positions else 0
+            else:
+                start = 0
+            snippet = text[start:start + 1200].strip()
+            results.append({
+                "name": path.stem,
+                "path": str(path),
+                "relative_path": rel,
+                "root": str(root),
+                "snippet": snippet,
+            })
+    return results
+
+
+def _build_obsidian_context(message: str, knowledge_paths: Optional[List[str]]) -> str:
+    roots = _resolve_knowledge_roots(knowledge_paths)
+    if not roots:
+        return ""
+    notes = _search_markdown_notes(message, knowledge_paths, limit=6)
+    lines = [
+        "Obsidian mode is active. Treat configured Obsidian vaults and knowledge folders as plain Markdown sources.",
+        "Use obsidian-cli when available for Obsidian actions such as search, templates, note creation, moves, and wiki-link-safe operations.",
+        "Do not create a vector database for these knowledge bases; preserve and inspect Markdown files directly.",
+        "Selected knowledge roots:",
+    ]
+    lines.extend([f"- {root}" for root in roots])
+    if notes:
+        lines.append("Relevant Markdown notes from direct text search:")
+        for note in notes:
+            snippet = (note.get("snippet") or "")[:1200]
+            lines.append(f"\n## {note.get('relative_path')}\nPath: {note.get('path')}\n```markdown\n{snippet}\n```")
+    return "\n".join(lines)
+
+
+def _build_hermes_context(model: Optional[str] = None) -> str:
+    try:
+        from api.routes.hermes import write_bridge_config
+        bridge_path = write_bridge_config()
+    except Exception:
+        bridge_path = settings.DATA_DIR / "hermes" / "codebot_bridge.json"
+    background_model = app_config.memory.organize_model or app_config.general.chat_default_model or ""
+    active_model = model or app_config.general.chat_default_model or ""
+    return (
+        "Hermes mode is active. Process this turn as Hermes Agent, with Codebot acting only as the message relay UI.\n"
+        "Use Codebot shared resources instead of asking the user to configure separate models.\n"
+        f"OpenCode server URL: {app_config.opencode.server_url}\n"
+        f"Main chat model: {active_model}\n"
+        f"Background memory organization model: {background_model}\n"
+        f"Shared memory database: {settings.CONVERSATIONS_DB}\n"
+        f"Shared scheduler database: {settings.SCHEDULED_TASKS_DB}\n"
+        f"Shared Codebot skills directory: {settings.SKILLS_DIR}\n"
+        f"Hermes bridge config: {bridge_path}\n"
+        "Hermes skills, memory, scheduled automations, and model availability should be treated as shared with Codebot."
+    )
+
+
 @router.post("/upload_file")
 async def upload_file(file: UploadFile = File(...)):
     """
@@ -3447,6 +4079,87 @@ async def get_slash_commands():
             "skills": skill_commands,
         }
     }
+
+
+def _serialize_skill_for_search(skill: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": skill.get("id"),
+        "slug": skill.get("slug"),
+        "name": skill.get("name"),
+        "description": skill.get("description"),
+        "source": skill.get("source"),
+        "sourceLabel": skill.get("sourceLabel") or skill.get("source_label") or skill.get("source"),
+        "path": skill.get("path"),
+    }
+
+
+def _balanced_skill_results(skills: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    source_order = [AUTO_GENERATED, BUILTIN, HERMES, OPENCODE, OPENCLAW, EXTERNAL]
+    buckets: Dict[str, List[Dict[str, Any]]] = {source: [] for source in source_order}
+    buckets.setdefault("other", [])
+    for skill in skills:
+        source = str(skill.get("source") or "other")
+        buckets.setdefault(source, []).append(skill)
+
+    results: List[Dict[str, Any]] = []
+    while len(results) < limit:
+        added = False
+        for source in source_order + ["other"]:
+            bucket = buckets.get(source) or []
+            if not bucket:
+                continue
+            results.append(bucket.pop(0))
+            added = True
+            if len(results) >= limit:
+                break
+        if not added:
+            break
+    return results
+
+
+@router.get("/skills/search")
+async def search_chat_skills(query: str = "", limit: int = 50):
+    registry = get_skill_registry()
+    capped_limit = max(1, min(limit, 100))
+    skills = registry.list_skills()
+    if not (query or "").strip():
+        return {
+            "success": True,
+            "data": {
+                "skills": [_serialize_skill_for_search(skill) for skill in _balanced_skill_results(skills, capped_limit)]
+            },
+        }
+
+    items = []
+    for skill in skills:
+        if not _matches_tokens(
+            query,
+            skill.get("id", ""),
+            skill.get("slug", ""),
+            skill.get("name", ""),
+            skill.get("description", ""),
+            skill.get("sourceLabel", ""),
+            skill.get("source_label", ""),
+        ):
+            continue
+        items.append(_serialize_skill_for_search(skill))
+        if len(items) >= capped_limit:
+            break
+    return {"success": True, "data": {"skills": items}}
+
+
+@router.get("/knowledge/search")
+async def search_knowledge_bases(query: str = "", limit: int = 20):
+    bases = []
+    for item in _configured_knowledge_bases():
+        if not item.get("enabled", True):
+            continue
+        if not _matches_tokens(query, item.get("name", ""), item.get("path", ""), item.get("description", "")):
+            continue
+        bases.append(item)
+        if len(bases) >= max(1, min(limit, 50)):
+            break
+    return {"success": True, "data": {"items": bases}}
 
 
 @router.get("/files/search")
@@ -3616,6 +4329,8 @@ async def send_to_opencode(request: SendMessageRequest):
             "model": request.model,
             "mode": request.mode,
             "project_dir": request.project_dir,
+            "target": request.target,
+            "knowledge_paths": request.knowledge_paths,
             "user_already_saved": request.user_already_saved,
         })
         return {
@@ -3632,7 +4347,9 @@ async def send_to_opencode(request: SendMessageRequest):
             model=request.model,
             mode=request.mode,
             conversation_id=conv_id,
-            project_dir=request.project_dir
+            project_dir=request.project_dir,
+            target=request.target,
+            knowledge_paths=request.knowledge_paths,
         )
 
         if content:
@@ -3659,6 +4376,8 @@ async def send_to_opencode(request: SendMessageRequest):
                     user_message=request.message,
                     assistant_response=content,
                     conversation_id=request.conversation_id,
+                    target=request.target,
+                    execution_model=request.model,
                 )
             )
 
@@ -4391,6 +5110,8 @@ async def send_to_opencode_stream(request: SendMessageRequest):
             "model": request.model,
             "mode": request.mode,
             "project_dir": request.project_dir,
+            "target": request.target,
+            "knowledge_paths": request.knowledge_paths,
             "user_already_saved": request.user_already_saved,
         })
 
@@ -4427,7 +5148,9 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                 model=request.model,
                 mode=request.mode,
                 conversation_id=conv_id,
-                project_dir=request.project_dir
+                project_dir=request.project_dir,
+                target=request.target,
+                knowledge_paths=request.knowledge_paths,
             ):
                 event_type = stream_event.get("type")
                 if event_type == "internal_prompt":
@@ -4568,6 +5291,8 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                         user_message=request.message,
                         assistant_response=content,
                         conversation_id=request.conversation_id,
+                        target=request.target,
+                        execution_model=request.model,
                     )
                 )
 
@@ -4738,7 +5463,9 @@ async def _drain_queue(conv_id: str, conversation_id: int):
                 model=task.get("model"),
                 mode=task.get("mode"),
                 conversation_id=conv_id,
-                project_dir=task.get("project_dir")
+                project_dir=task.get("project_dir"),
+                target=task.get("target"),
+                knowledge_paths=task.get("knowledge_paths"),
             )
             if content:
                 await memory_manager.save_message(
@@ -4751,6 +5478,8 @@ async def _drain_queue(conv_id: str, conversation_id: int):
                         user_message=task["message"],
                         assistant_response=content,
                         conversation_id=conversation_id,
+                        target=task.get("target"),
+                        execution_model=task.get("model"),
                     )
                 )
         except Exception as e:
@@ -4796,9 +5525,19 @@ async def abort_task(request: AbortRequest):
 
     # 终止当前正在运行的 OpenCode session
     aborted_sessions = 0
+    aborted_hermes = 0
     for target_id in target_conv_ids:
+        try:
+            from api.routes import hermes as hermes_router
+            if await hermes_router.abort_hermes_conversation(target_id):
+                aborted_hermes += 1
+                logger.info(f"已终止对话 {target_id} 的 Hermes CLI 进程")
+        except Exception as e:
+            logger.warning(f"终止 Hermes CLI 出错: {e}")
+
         session_id = _conversation_current_session.get(target_id)
         if not session_id or not client:
+            unmark_conversation_running(target_id)
             continue
         try:
             ok = await client.abort_session(session_id)
@@ -4817,7 +5556,7 @@ async def abort_task(request: AbortRequest):
     return {
         "success": True,
         "message": "已发送终止信号",
-        "data": {"conversations": target_conv_ids, "aborted_sessions": aborted_sessions}
+        "data": {"conversations": target_conv_ids, "aborted_sessions": aborted_sessions, "aborted_hermes": aborted_hermes}
     }
 
 

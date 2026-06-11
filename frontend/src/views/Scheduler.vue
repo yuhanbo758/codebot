@@ -5,6 +5,15 @@
         <el-icon><Plus /></el-icon>
         新建定时任务
       </el-button>
+      <div class="candidate-notify-switch">
+        <span>开启通知</span>
+        <el-switch
+          v-model="candidateNotificationEnabled"
+          :loading="candidateNotificationSaving"
+          @change="saveCandidateNotificationSetting"
+        />
+        <span class="candidate-notify-hint">任务进入成长候选时提醒我</span>
+      </div>
     </el-header>
 
     <!-- 活跃任务列表 -->
@@ -14,6 +23,16 @@
           {{ row.name }}
           <el-tag v-if="row.run_once" size="small" type="warning" style="margin-left:4px">一次性</el-tag>
         </template>
+      </el-table-column>
+      <el-table-column label="执行器" width="100">
+        <template #default="{ row }">
+          <el-tag size="small" :type="row.executor === 'hermes' ? 'success' : 'info'">
+            {{ executorLabel(row.executor) }}
+          </el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="执行模型" width="190" show-overflow-tooltip>
+        <template #default="{ row }">{{ modelLabel(row.execution_model) }}</template>
       </el-table-column>
       <el-table-column prop="cron_expression" label="Cron 表达式" width="140" />
       <el-table-column prop="next_run" label="下次运行" width="170">
@@ -55,6 +74,16 @@
         <el-button size="small" @click="loadArchivedTasks" style="margin-bottom:8px">刷新</el-button>
         <el-table :data="archivedTasks" style="width: 100%">
           <el-table-column prop="name" label="任务名称" width="200" />
+          <el-table-column label="执行器" width="100">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.executor === 'hermes' ? 'success' : 'info'">
+                {{ executorLabel(row.executor) }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="执行模型" width="190" show-overflow-tooltip>
+            <template #default="{ row }">{{ modelLabel(row.execution_model) }}</template>
+          </el-table-column>
           <el-table-column prop="cron_expression" label="Cron 表达式" width="140" />
           <el-table-column prop="last_run" label="最后运行" width="170">
             <template #default="{ row }">{{ formatTime(row.last_run) }}</template>
@@ -102,6 +131,34 @@
             placeholder="描述任务要做什么..."
           />
         </el-form-item>
+        <el-form-item label="执行器">
+          <el-radio-group v-model="newTask.executor">
+            <el-radio-button label="opencode">OpenCode</el-radio-button>
+            <el-radio-button label="hermes">Hermes</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="执行模型">
+          <el-select
+            v-model="newTask.execution_model"
+            filterable
+            clearable
+            placeholder="使用记忆整理备用模型"
+            style="width: 100%"
+            :loading="modelsLoading"
+            @focus="loadModels"
+          >
+            <el-option label="使用记忆整理备用模型" value="" />
+            <el-option
+              v-for="model in availableModels"
+              :key="model.id"
+              :label="model.name || model.id"
+              :value="model.id"
+            />
+          </el-select>
+          <div style="color:#909399;font-size:12px;margin-top:4px">
+            聊天中创建的任务会自动记录当时选择的主模型；若该模型后续不可用，执行时会回退到记忆整理模型
+          </div>
+        </el-form-item>
         <el-form-item label="通知渠道">
           <el-checkbox-group v-model="newTask.notify_channels">
             <el-checkbox label="app">应用内</el-checkbox>
@@ -140,9 +197,15 @@ const newTask = ref({
   task_prompt: '',
   notify_channels: [],
   run_once: false,
+  executor: 'opencode',
+  execution_model: '',
 })
 const aiPrompt = ref('')
 const aiLoading = ref(false)
+const availableModels = ref([])
+const modelsLoading = ref(false)
+const candidateNotificationEnabled = ref(true)
+const candidateNotificationSaving = ref(false)
 
 const CHANNEL_LABELS = {
   app: '应用内',
@@ -152,6 +215,28 @@ const CHANNEL_LABELS = {
 }
 
 const channelLabel = (ch) => CHANNEL_LABELS[ch] || ch
+const executorLabel = (executor) => executor === 'hermes' ? 'Hermes' : 'OpenCode'
+const modelLabel = (modelId) => {
+  const id = String(modelId || '').trim()
+  if (!id) return '记忆整理备用模型'
+  const found = availableModels.value.find((model) => model.id === id)
+  return found?.name || id
+}
+
+const loadModels = async () => {
+  if (availableModels.value.length > 0 || modelsLoading.value) return
+  modelsLoading.value = true
+  try {
+    const response = await axios.get('/api/chat/models')
+    if (response.data?.success) {
+      availableModels.value = response.data.data?.models || []
+    }
+  } catch {
+    // 表格仍显示已保存的模型 ID，模型列表加载失败不阻断任务编辑
+  } finally {
+    modelsLoading.value = false
+  }
+}
 
 const formatTime = (iso) => {
   if (!iso) return '-'
@@ -183,6 +268,30 @@ const loadArchivedTasks = async () => {
   }
 }
 
+const loadCandidateNotificationSetting = async () => {
+  try {
+    const response = await axios.get('/api/config/general')
+    candidateNotificationEnabled.value = response.data?.data?.task_candidate_notification_enabled !== false
+  } catch {
+    candidateNotificationEnabled.value = true
+  }
+}
+
+const saveCandidateNotificationSetting = async () => {
+  candidateNotificationSaving.value = true
+  try {
+    await axios.patch('/api/config/general', {
+      task_candidate_notification_enabled: Boolean(candidateNotificationEnabled.value),
+    })
+    ElMessage.success(candidateNotificationEnabled.value ? '候选通知已开启' : '候选通知已关闭')
+  } catch {
+    candidateNotificationEnabled.value = !candidateNotificationEnabled.value
+    ElMessage.error('保存通知设置失败')
+  } finally {
+    candidateNotificationSaving.value = false
+  }
+}
+
 const openCreateDialog = () => {
   editMode.value = false
   newTask.value = {
@@ -191,6 +300,8 @@ const openCreateDialog = () => {
     task_prompt: '',
     notify_channels: [],
     run_once: false,
+    executor: 'opencode',
+    execution_model: '',
   }
   aiPrompt.value = ''
   showCreateDialog.value = true
@@ -223,6 +334,8 @@ const saveTask = async () => {
         enabled: newTask.value.enabled,
         notify_channels: newTask.value.notify_channels,
         run_once: newTask.value.run_once,
+        executor: newTask.value.executor || 'opencode',
+        execution_model: newTask.value.execution_model || '',
       })
       ElMessage.success('任务已更新')
     } else {
@@ -286,14 +399,22 @@ const deleteTask = async (task) => {
 
 const editTask = (task) => {
   editMode.value = true
-  newTask.value = { ...task, notify_channels: [...(task.notify_channels || [])] }
+  newTask.value = {
+    ...task,
+    executor: task.executor || 'opencode',
+    execution_model: task.execution_model || '',
+    notify_channels: [...(task.notify_channels || [])]
+  }
   aiPrompt.value = ''
   showCreateDialog.value = true
+  loadModels()
 }
 
 onMounted(() => {
   loadTasks()
   loadArchivedTasks()
+  loadModels()
+  loadCandidateNotificationSetting()
 })
 </script>
 
@@ -307,6 +428,24 @@ onMounted(() => {
   background: none;
   border-bottom: 1px solid #e4e7ed;
   margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.candidate-notify-switch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #606266;
+  font-size: 14px;
+}
+
+.candidate-notify-hint {
+  color: #909399;
+  font-size: 12px;
 }
 
 /* 操作列：强制单行，按钮紧凑排列 */

@@ -25,10 +25,16 @@ from loguru import logger
 
 from config import app_config, settings
 
+try:
+    import yaml
+except Exception:  # pragma: no cover - PyYAML is part of the runtime deps
+    yaml = None
+
 
 AUTO_GENERATED = "auto_generated"
 BUILTIN = "builtin"
 EXTERNAL = "external"
+HERMES = "hermes"
 OPENCLAW = "openclaw"
 OPENCODE = "opencode"
 
@@ -36,6 +42,7 @@ SOURCE_LABELS = {
     AUTO_GENERATED: "自动生成",
     BUILTIN: "内置",
     EXTERNAL: "外部兼容",
+    HERMES: "Hermes Agent",
     OPENCLAW: "OpenClaw",
     OPENCODE: "OpenCode",
 }
@@ -44,6 +51,7 @@ SOURCE_PRIORITY = {
     AUTO_GENERATED: 10,
     BUILTIN: 20,
     EXTERNAL: 30,
+    HERMES: 32,
     OPENCLAW: 35,
     OPENCODE: 40,
 }
@@ -130,6 +138,14 @@ def _parse_front_matter(content: str) -> Dict[str, Any]:
     if end == -1:
         return {}
     front = content[3:end].strip()
+    if yaml is not None:
+        try:
+            parsed = yaml.safe_load(front) or {}
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            logger.debug("[skills] YAML front matter parse failed; falling back to simple parser")
+
     data: Dict[str, Any] = {}
     current_key: Optional[str] = None
     for raw_line in front.splitlines():
@@ -271,6 +287,38 @@ def opencode_skill_dirs() -> List[Path]:
         raw = os.environ.get(env_name, "").strip()
         if raw:
             candidates.append(Path(raw))
+    return _distinct_existing_dirs(candidates)
+
+
+def hermes_skill_dirs() -> List[Path]:
+    candidates: List[Path] = []
+
+    hermes_cfg = getattr(app_config, "hermes", None)
+    if hermes_cfg:
+        for raw in getattr(hermes_cfg, "skill_dirs", []) or []:
+            if str(raw or "").strip():
+                candidates.append(Path(str(raw).strip()))
+
+        install_dir = str(getattr(hermes_cfg, "install_dir", "") or "").strip()
+        install_root = Path(install_dir).expanduser() if install_dir else settings.BASE_DIR / "hermes-agent"
+        candidates.extend([
+            install_root / "skills",
+            install_root / "optional-skills",
+        ])
+
+    hermes_home_env = os.environ.get("HERMES_HOME", "").strip()
+    if hermes_home_env:
+        candidates.append(Path(hermes_home_env) / "skills")
+
+    candidates.extend([
+        settings.DATA_DIR / "hermes" / "home" / "skills",
+        Path.home() / ".hermes" / "skills",
+    ])
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        candidates.append(Path(local_app_data) / "hermes" / "skills")
+
     return _distinct_existing_dirs(candidates)
 
 
@@ -437,6 +485,7 @@ class SkillRegistry:
         entries.extend(self._list_codebot_json_skills())
         entries.extend(self._list_codebot_dir_skills())
         entries.extend(self._list_external_skills())
+        entries.extend(self._list_hermes_skills())
         entries.extend(self._list_openclaw_skills())
         entries.extend(self._list_opencode_skills())
         entries = self._dedupe(entries)
@@ -615,10 +664,30 @@ class SkillRegistry:
         return entries
 
     def _list_external_skills(self) -> List[SkillEntry]:
+        custom_dirs = list(app_config.skills.custom_skill_dirs if hasattr(app_config, "skills") else [])
+        return self._list_readonly_dir_skills(
+            custom_dirs,
+            source=EXTERNAL,
+            default_compatibility=["codebot", "hermes-agent", "openclaw"],
+        )
+
+    def _list_hermes_skills(self) -> List[SkillEntry]:
+        return self._list_readonly_dir_skills(
+            hermes_skill_dirs(),
+            source=HERMES,
+            default_compatibility=["hermes-agent", "codebot"],
+        )
+
+    def _list_readonly_dir_skills(
+        self,
+        directories: Iterable[Path | str],
+        *,
+        source: str,
+        default_compatibility: List[str],
+    ) -> List[SkillEntry]:
         entries: List[SkillEntry] = []
-        custom_dirs = app_config.skills.custom_skill_dirs if hasattr(app_config, "skills") else []
-        for index, dir_path_str in enumerate(custom_dirs or []):
-            dir_path = Path(dir_path_str)
+        dir_paths = _distinct_existing_dirs(Path(str(item).strip()) for item in directories if str(item).strip())
+        for index, dir_path in enumerate(dir_paths):
             if not dir_path.exists() or not dir_path.is_dir():
                 continue
             for entry in _iter_skill_dirs(dir_path, recursive=True):
@@ -633,15 +702,15 @@ class SkillRegistry:
                         name=str(info.get("name") or rel_name),
                         description=str(info.get("description") or ""),
                         version=str(info.get("version") or "1.0.0"),
-                        source=EXTERNAL,
-                        source_label=SOURCE_LABELS[EXTERNAL],
-                        priority=SOURCE_PRIORITY[EXTERNAL],
+                        source=source,
+                        source_label=SOURCE_LABELS[source],
+                        priority=SOURCE_PRIORITY[source],
                         writable=False,
                         path=entry,
                         skill_md_path=skill_md,
                         source_dir=str(dir_path),
                         installed_at=_mtime_iso(skill_md),
-                        compatibility=info.get("compatibility") or ["codebot", "hermes-agent", "openclaw"],
+                        compatibility=info.get("compatibility") or default_compatibility,
                         metadata=info.get("metadata") or {},
                         skill_md_content=str(info.get("content") or ""),
                     )
@@ -680,38 +749,41 @@ class SkillRegistry:
 
     def _list_opencode_skills(self) -> List[SkillEntry]:
         entries: List[SkillEntry] = []
-        skills_dir = Path.home() / ".agents" / "skills"
-        for entry in _iter_skill_dirs(skills_dir):
-            skill_md = entry / "SKILL.md"
-            info = read_skill_markdown(skill_md) or {}
-            entries.append(
-                SkillEntry(
-                    id=f"opencode:{entry.name}",
-                    slug=entry.name,
-                    name=str(info.get("name") or entry.name),
-                    description=str(info.get("description") or ""),
-                    version=str(info.get("version") or "1.0.0"),
-                    source=OPENCODE,
-                    source_label=SOURCE_LABELS[OPENCODE],
-                    priority=SOURCE_PRIORITY[OPENCODE],
-                    writable=False,
-                    path=entry,
-                    skill_md_path=skill_md,
-                    installed_at=_mtime_iso(skill_md),
-                    compatibility=info.get("compatibility") or ["opencode", "codebot"],
-                    metadata=info.get("metadata") or {},
-                    skill_md_content=str(info.get("content") or ""),
+        for root_index, skills_dir in enumerate(opencode_skill_dirs()):
+            for entry in _iter_skill_dirs(skills_dir):
+                skill_md = entry / "SKILL.md"
+                info = read_skill_markdown(skill_md) or {}
+                skill_id = f"opencode:{entry.name}" if root_index == 0 else f"opencode:{root_index}:{entry.name}"
+                entries.append(
+                    SkillEntry(
+                        id=skill_id,
+                        slug=entry.name,
+                        name=str(info.get("name") or entry.name),
+                        description=str(info.get("description") or ""),
+                        version=str(info.get("version") or "1.0.0"),
+                        source=OPENCODE,
+                        source_label=SOURCE_LABELS[OPENCODE],
+                        priority=SOURCE_PRIORITY[OPENCODE],
+                        writable=False,
+                        path=entry,
+                        skill_md_path=skill_md,
+                        source_dir=str(skills_dir),
+                        installed_at=_mtime_iso(skill_md),
+                        compatibility=info.get("compatibility") or ["opencode", "codebot"],
+                        metadata=info.get("metadata") or {},
+                        skill_md_content=str(info.get("content") or ""),
+                    )
                 )
-            )
         return entries
 
     def _dedupe(self, entries: List[SkillEntry]) -> List[SkillEntry]:
         result: List[SkillEntry] = []
         seen: set[str] = set()
         for entry in sorted(entries, key=lambda item: item.priority):
-            key = _normalize(entry.slug or entry.name)
-            if not key:
-                key = entry.id
+            try:
+                key = str(entry.path.resolve()).lower()
+            except Exception:
+                key = f"{entry.source}:{_normalize(entry.slug or entry.name) or entry.id}"
             if key in seen:
                 logger.debug(f"[skills] skipped duplicate skill {entry.id}")
                 continue

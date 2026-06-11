@@ -13,7 +13,18 @@ from loguru import logger
 from pathlib import Path
 import re
 
-from config import settings
+from config import settings, app_config
+
+
+def normalize_task_executor(value: Optional[str]) -> str:
+    raw = (value or "").strip().lower()
+    if raw in {"hermes", "hermes_cli", "hermes-agent", "hermes_agent"}:
+        return "hermes"
+    return "opencode"
+
+
+def normalize_task_execution_model(value: Optional[str]) -> str:
+    return (value or "").strip()
 
 
 class ScheduledTask:
@@ -32,6 +43,8 @@ class ScheduledTask:
         created_at: datetime = None,
         run_once: bool = False,
         archived: bool = False,
+        executor: str = "opencode",
+        execution_model: str = "",
     ):
         self.id = id
         self.name = name
@@ -44,6 +57,8 @@ class ScheduledTask:
         self.created_at = created_at or datetime.now()
         self.run_once = run_once
         self.archived = archived
+        self.executor = normalize_task_executor(executor)
+        self.execution_model = normalize_task_execution_model(execution_model)
     
     def calculate_next_run(self) -> datetime:
         """计算下次运行时间"""
@@ -68,6 +83,8 @@ class ScheduledTask:
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "run_once": self.run_once,
             "archived": self.archived,
+            "executor": self.executor,
+            "execution_model": self.execution_model,
         }
 
 
@@ -108,16 +125,22 @@ class TaskScheduler:
                 notify_channels TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 run_once BOOLEAN DEFAULT 0,
-                archived BOOLEAN DEFAULT 0
+                archived BOOLEAN DEFAULT 0,
+                executor TEXT DEFAULT 'opencode',
+                execution_model TEXT DEFAULT ''
             )
         """)
 
-        # Migration: add run_once and archived columns if they don't exist yet
+        # Migration: add columns if they don't exist yet
         existing_cols = {row[1] for row in cursor.execute("PRAGMA table_info(scheduled_tasks)")}
         if "run_once" not in existing_cols:
             cursor.execute("ALTER TABLE scheduled_tasks ADD COLUMN run_once BOOLEAN DEFAULT 0")
         if "archived" not in existing_cols:
             cursor.execute("ALTER TABLE scheduled_tasks ADD COLUMN archived BOOLEAN DEFAULT 0")
+        if "executor" not in existing_cols:
+            cursor.execute("ALTER TABLE scheduled_tasks ADD COLUMN executor TEXT DEFAULT 'opencode'")
+        if "execution_model" not in existing_cols:
+            cursor.execute("ALTER TABLE scheduled_tasks ADD COLUMN execution_model TEXT DEFAULT ''")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS task_logs (
@@ -192,6 +215,8 @@ class TaskScheduler:
                 created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
                 run_once=bool(row["run_once"]) if row["run_once"] is not None else False,
                 archived=bool(row["archived"]) if row["archived"] is not None else False,
+                executor=row["executor"] if "executor" in row.keys() else "opencode",
+                execution_model=row["execution_model"] if "execution_model" in row.keys() else "",
             )
 
             # Bug4 修复：重启后 next_run 若已过期，重新基于当前时间计算下次执行时间
@@ -239,7 +264,8 @@ class TaskScheduler:
         执行逻辑：
         - 带 __REMINDER__ 前缀的纯提醒任务：直接生成提醒内容，不调用 OpenCode
         - 其他所有任务（包括带 __RUN_ONCE__ 前缀的一次性任务）：
-          像聊天一样通过 opencode cli 处理，task_prompt 中只包含纯任务内容
+          按任务自身的 executor 分别交给 Hermes CLI 或 OpenCode 处理，
+          task_prompt 中只包含纯任务内容
           （时间部分已在创建任务时从原始消息中剥离）
         """
         raw_prompt = task.task_prompt or ""
@@ -267,17 +293,34 @@ class TaskScheduler:
         )
 
         try:
+            execution_model = None
+            model_notice = ""
             result = None
             if is_reminder:
                 # 纯提醒：不消耗 AI，直接返回提醒内容
                 result = SimpleNamespace(success=True, content=raw_prompt, error=None, tokens_used=0)
-            elif self.opencode_ws and getattr(self.opencode_ws, "connected", False):
+            else:
+                execution_model, model_notice = await self._resolve_task_execution_model(task)
+
+            if result is not None:
+                pass
+            elif normalize_task_executor(getattr(task, "executor", "opencode")) == "hermes":
+                result = await self._execute_hermes_task(task, raw_prompt, model=execution_model)
+            elif self.opencode_ws:
                 # 像聊天一样通过 opencode cli 执行任务
                 # raw_prompt 此时是纯任务内容（已去除时间前缀）
-                logger.info(f"通过 OpenCode 执行任务：{task.name}，prompt：{raw_prompt[:100]}...")
-                result = await self.opencode_ws.execute_task(raw_prompt)
+                logger.info(f"通过 OpenCode 执行任务：{task.name}，model={execution_model or 'default'}，prompt：{raw_prompt[:100]}...")
+                result = await self.opencode_ws.execute_task(raw_prompt, model=execution_model or None)
             else:
-                raise RuntimeError("OpenCode 未连接，无法执行该定时任务")
+                raise RuntimeError("OpenCode 客户端未初始化，无法执行该定时任务")
+
+            if model_notice and result and result.success:
+                result = SimpleNamespace(
+                    success=True,
+                    content=f"{result.content}\n\n{model_notice}",
+                    error=None,
+                    tokens_used=getattr(result, "tokens_used", 0)
+                )
 
             saved_path = None
             if result and result.success:
@@ -333,13 +376,97 @@ class TaskScheduler:
                     error_message=str(e)
                 )
 
+    def _fallback_execution_model(self) -> str:
+        return (
+            app_config.memory.organize_model
+            or app_config.general.chat_default_model
+            or app_config.models.primary_model
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _match_available_model(requested: str, available_ids: set[str]) -> Optional[str]:
+        requested = normalize_task_execution_model(requested)
+        if not requested:
+            return None
+        if requested in available_ids:
+            return requested
+        if "/" not in requested:
+            suffix = f"/{requested}"
+            matches = [mid for mid in available_ids if mid.endswith(suffix)]
+            if len(matches) == 1:
+                return matches[0]
+        return None
+
+    async def _available_model_ids(self) -> Optional[set[str]]:
+        if not self.opencode_ws:
+            return None
+        try:
+            models = await self.opencode_ws.get_models()
+        except Exception as exc:
+            logger.warning(f"检查定时任务模型可用性失败：{exc}")
+            return None
+        if not isinstance(models, list):
+            return set()
+        return {
+            str(item.get("id") or "").strip()
+            for item in models
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        }
+
+    async def _resolve_task_execution_model(self, task: ScheduledTask) -> tuple[Optional[str], str]:
+        requested = normalize_task_execution_model(getattr(task, "execution_model", ""))
+        fallback = self._fallback_execution_model()
+        available_ids = await self._available_model_ids()
+
+        if available_ids is None:
+            model = requested or fallback
+            if model:
+                logger.warning(f"未能验证定时任务模型可用性，暂按配置模型执行：{model}")
+            return (model or None), ""
+
+        if requested:
+            matched = self._match_available_model(requested, available_ids)
+            if matched:
+                return matched, ""
+            logger.warning(f"定时任务模型不可用，准备使用备用模型：task={task.name}, requested={requested}, fallback={fallback or '未配置'}")
+
+        if fallback:
+            matched_fallback = self._match_available_model(fallback, available_ids)
+            if matched_fallback:
+                if requested and requested != matched_fallback:
+                    return matched_fallback, f"注意：原执行模型 `{requested}` 当前不可用，已改用记忆整理备用模型 `{matched_fallback}`。"
+                return matched_fallback, ""
+            if requested:
+                raise RuntimeError(f"定时任务执行模型不可用：{requested}；备用模型也不可用：{fallback}")
+
+        if requested:
+            raise RuntimeError(f"定时任务执行模型不可用：{requested}；且未配置可用的记忆整理备用模型")
+        return None, ""
+
+    async def _execute_hermes_task(self, task: ScheduledTask, raw_prompt: str, model: Optional[str] = None):
+        from api.routes import hermes as hermes_router
+
+        logger.info(f"通过 Hermes CLI 执行任务：{task.name}，model={model or 'default'}，prompt：{raw_prompt[:100]}...")
+        response = await hermes_router.hermes_chat(
+            hermes_router.HermesChatRequest(
+                message=raw_prompt,
+                model=model,
+                conversation_id=f"scheduled_task:{task.id}",
+            )
+        )
+        data = response.get("data") if isinstance(response, dict) else {}
+        content = str((data or {}).get("content") or "").strip()
+        return SimpleNamespace(success=True, content=content, error=None, tokens_used=0)
+
     def _try_save_markdown_output(self, task_prompt: str, content: str) -> Optional[str]:
         """尝试将任务输出保存为 Markdown 文件。
 
         支持以下路径格式（按优先级）：
         1. "Markdown 文件到 <dir> 目录"
-        2. "保存到 <dir>" / "保存到"<dir>"" （含引号的路径）
-        3. 路径中含盘符的 Windows 绝对路径（如 D:\\xxx）
+        2. "保存到/存放到 <dir>" / "保存到/存放到"<dir>"" （含引号的路径）
+        3. "下载" / "Downloads" 文件夹别名
+        4. 路径中含盘符的 Windows 绝对路径（如 D:\\xxx）
         """
         if not task_prompt or not content:
             return None
@@ -354,20 +481,27 @@ class TaskScheduler:
             out_dir = (m.group(1) or "").strip()
             out_dir = re.split(r"[，。,.!！?？;；\n\r]", out_dir, maxsplit=1)[0].strip().strip("\"''\u201c\u201d")
 
-        # 格式2：保存到"<dir>" 或 保存到 <dir>（支持引号路径）
+        # 格式2：保存到/存放到"<dir>" 或 保存到/存放到 <dir>（支持引号路径）
         if not out_dir:
-            m = re.search(r'保存到\s*["""\'\'](.*?)["""\'\']', task_prompt)
+            m = re.search(r'(?:保存|存放|存|放)(?:到|至)\s*["“\'](.*?)["”\']', task_prompt)
             if m:
                 out_dir = m.group(1).strip()
         if not out_dir:
-            m = re.search(r'保存到\s*([A-Za-z]:[^\s，。,!！?？;；\n\r]+)', task_prompt)
+            m = re.search(r'(?:保存|存放|存|放)(?:到|至)\s*([A-Za-z]:[^\s，。,!！?？;；\n\r]+)', task_prompt)
+            if m:
+                out_dir = m.group(1).strip().rstrip("，。,!！?？;；")
+        if not out_dir:
+            m = re.search(r'(?:保存|存放|存|放)(?:到|至)\s*["“\']?([^"“”\'\s，。,!！?？;；\n\r]+)["”\']?\s*(?:文件夹|目录)?', task_prompt)
             if m:
                 out_dir = m.group(1).strip().rstrip("，。,!！?？;；")
 
         if not out_dir:
             return None
 
-        out_path = Path(out_dir)
+        if out_dir.lower() in {"下载", "下载文件夹", "downloads", "download"}:
+            out_path = Path.home() / "Downloads"
+        else:
+            out_path = Path(out_dir)
         try:
             out_path.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -442,8 +576,8 @@ class TaskScheduler:
                     """INSERT OR REPLACE INTO scheduled_tasks 
                        (id, name, cron_expression, task_prompt, enabled, 
                         last_run, next_run, notify_channels, created_at,
-                        run_once, archived)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        run_once, archived, executor, execution_model)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         task.id,
                         task.name,
@@ -456,6 +590,8 @@ class TaskScheduler:
                         task.created_at.isoformat() if task.created_at else None,
                         task.run_once,
                         task.archived,
+                        task.executor,
+                        task.execution_model,
                     )
                 )
                 conn.commit()
@@ -469,6 +605,8 @@ class TaskScheduler:
         task_prompt: str,
         notify_channels: List[str] = None,
         run_once: bool = False,
+        executor: str = "opencode",
+        execution_model: str = "",
     ) -> ScheduledTask:
         """创建新任务"""
         task = ScheduledTask(
@@ -480,6 +618,8 @@ class TaskScheduler:
             notify_channels=notify_channels or [],
             run_once=run_once,
             archived=False,
+            executor=executor,
+            execution_model=execution_model,
         )
         
         # 计算下次运行时间
@@ -501,6 +641,10 @@ class TaskScheduler:
         
         for key, value in kwargs.items():
             if hasattr(task, key):
+                if key == "executor":
+                    value = normalize_task_executor(value)
+                elif key == "execution_model":
+                    value = normalize_task_execution_model(value)
                 setattr(task, key, value)
         
         # 如果 cron 表达式改变，重新计算下次运行时间
@@ -588,6 +732,8 @@ class TaskScheduler:
                         created_at=datetime.fromisoformat(row["created_at"]) if row["created_at"] else None,
                         run_once=bool(row["run_once"]) if row["run_once"] is not None else False,
                         archived=True,
+                        executor=row["executor"] if "executor" in row.keys() else "opencode",
+                        execution_model=row["execution_model"] if "execution_model" in row.keys() else "",
                     )
                     result.append(t.to_dict())
                 return result

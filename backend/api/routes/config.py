@@ -7,7 +7,16 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List
 
-from config import app_config, save_config, SkillsConfig, settings, AppConfig
+from config import (
+    app_config,
+    save_config,
+    SkillsConfig,
+    HermesConfig,
+    ObsidianConfig,
+    ObsidianKnowledgeBase,
+    settings,
+    AppConfig,
+)
 
 router = APIRouter()
 
@@ -18,6 +27,33 @@ class IntegrationUpdateRequest(BaseModel):
 
 class SkillsConfigUpdateRequest(BaseModel):
     custom_skill_dirs: Optional[List[str]] = None
+
+
+class HermesConfigUpdateRequest(BaseModel):
+    enabled: Optional[bool] = None
+    auto_start: Optional[bool] = None
+    repo_url: Optional[str] = None
+    install_dir: Optional[str] = None
+    cli_path: Optional[str] = None
+    share_models: Optional[bool] = None
+    share_memory: Optional[bool] = None
+    share_scheduler: Optional[bool] = None
+    skill_dirs: Optional[List[str]] = None
+
+
+class ObsidianKnowledgeBaseRequest(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    path: str
+    description: Optional[str] = None
+    enabled: Optional[bool] = True
+
+
+class ObsidianConfigUpdateRequest(BaseModel):
+    enabled: Optional[bool] = None
+    cli_path: Optional[str] = None
+    vault_path: Optional[str] = None
+    knowledge_bases: Optional[List[ObsidianKnowledgeBaseRequest]] = None
 
 
 class LoadConfigFromPathRequest(BaseModel):
@@ -33,6 +69,7 @@ class GeneralConfigUpdateRequest(BaseModel):
     file_search_dirs: Optional[List[str]] = None
     chat_default_model: Optional[str] = None
     growth_candidate_decision: Optional[bool] = None
+    task_candidate_notification_enabled: Optional[bool] = None
 
 
 @router.get("/file-info")
@@ -132,6 +169,87 @@ async def update_skills_config(request: SkillsConfigUpdateRequest):
             "data": app_config.skills.model_dump(),
             "message": "技能目录配置已保存"
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _validate_abs_dir_list(values: Optional[List[str]], label: str) -> List[str]:
+    result: List[str] = []
+    for raw in values or []:
+        value = (raw or "").strip()
+        if not value:
+            continue
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise HTTPException(status_code=400, detail=f"{label} 必须是绝对路径: {value}")
+        result.append(str(path))
+    return result
+
+
+@router.get("/hermes")
+async def get_hermes_config():
+    return {"success": True, "data": app_config.hermes.model_dump()}
+
+
+@router.patch("/hermes")
+async def update_hermes_config(request: HermesConfigUpdateRequest):
+    try:
+        updates = request.model_dump(exclude_unset=True)
+        if "install_dir" in updates and updates["install_dir"]:
+            install_dir = Path(updates["install_dir"]).expanduser()
+            if not install_dir.is_absolute():
+                raise HTTPException(status_code=400, detail="Hermes 安装目录必须是绝对路径")
+            updates["install_dir"] = str(install_dir)
+        if "skill_dirs" in updates:
+            updates["skill_dirs"] = _validate_abs_dir_list(updates.get("skill_dirs"), "Hermes skill 目录")
+        current = app_config.hermes.model_dump()
+        current.update(updates)
+        app_config.hermes = HermesConfig(**current)
+        save_config(app_config)
+        return {"success": True, "data": app_config.hermes.model_dump(), "message": "Hermes 配置已保存"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/obsidian")
+async def get_obsidian_config():
+    return {"success": True, "data": app_config.obsidian.model_dump()}
+
+
+@router.patch("/obsidian")
+async def update_obsidian_config(request: ObsidianConfigUpdateRequest):
+    try:
+        updates = request.model_dump(exclude_unset=True)
+        if "vault_path" in updates and updates["vault_path"]:
+            vault_path = Path(updates["vault_path"]).expanduser()
+            if not vault_path.is_absolute():
+                raise HTTPException(status_code=400, detail="Obsidian 库路径必须是绝对路径")
+            updates["vault_path"] = str(vault_path)
+        if "knowledge_bases" in updates:
+            normalized = []
+            for idx, item in enumerate(updates.get("knowledge_bases") or []):
+                path = Path(item["path"]).expanduser()
+                if not path.is_absolute():
+                    raise HTTPException(status_code=400, detail=f"知识库路径必须是绝对路径: {item['path']}")
+                name = (item.get("name") or path.name or f"知识库{idx + 1}").strip()
+                kb_id = (item.get("id") or name or str(idx + 1)).strip()
+                normalized.append(ObsidianKnowledgeBase(
+                    id=kb_id,
+                    name=name,
+                    path=str(path),
+                    description=(item.get("description") or "").strip(),
+                    enabled=bool(item.get("enabled", True)),
+                ).model_dump())
+            updates["knowledge_bases"] = normalized
+        current = app_config.obsidian.model_dump()
+        current.update(updates)
+        app_config.obsidian = ObsidianConfig(**current)
+        save_config(app_config)
+        return {"success": True, "data": app_config.obsidian.model_dump(), "message": "Obsidian 配置已保存"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -29,7 +29,7 @@ from services.notification import NotificationService
 from utils.installer import check_and_install_opencode, start_opencode_server, stop_opencode_server
 
 # 导入 API 路由
-from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router, growth as growth_router
+from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router, growth as growth_router, hermes as hermes_router
 
 
 # 全局组件实例
@@ -310,6 +310,22 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(sync_to_opencode())
 
+    # Prepare Hermes CLI with Codebot so Hermes chat handoff is warm.
+    if app_config.hermes.enabled and app_config.hermes.auto_start:
+        async def prepare_hermes_cli():
+            try:
+                await hermes_router.prepare_cli_if_enabled()
+                status = await hermes_router.hermes_status()
+                data = status.get("data", {})
+                app_urls = data.get("codebot_app") or {}
+                logger.info(f"Codebot local access: {app_urls.get('local_url', '')}")
+                logger.info(f"Codebot LAN access: {app_urls.get('lan_url', '')}")
+                logger.info(f"Hermes CLI runtime: {data.get('runtime_python', '')}")
+            except Exception as exc:
+                logger.warning(f"Hermes CLI prepare failed: {exc}")
+
+        asyncio.create_task(prepare_hermes_cli())
+
     # 9. 启动记忆自动整理循环
     global _organize_loop_task
     _organize_loop_task = asyncio.create_task(
@@ -447,6 +463,7 @@ app.include_router(notifications.router, prefix="/api/notifications", tags=["通
 app.include_router(lark.router, prefix="/api/lark", tags=["飞书"])
 app.include_router(sandbox_router.router, prefix="/api/sandbox", tags=["沙箱"])
 app.include_router(growth_router.router, prefix="/api/growth", tags=["成长沉淀"])
+app.include_router(hermes_router.router, prefix="/api/hermes", tags=["Hermes"])
 app.include_router(gateway_router.router, prefix="/v1", tags=["模型网关"])
 
 

@@ -476,12 +476,14 @@ async def _organize_from_chat_history(memory_manager, opencode_ws=None) -> Dict[
                         title="待确认定时任务",
                         content=user_text,
                         conversation_id=conv_id,
+                        execution_model=model or "",
                         evidence=user_text,
                     )
                     if staged:
+                        await chat_router.notify_task_growth_candidate(staged, conversation_id=conv_id)
                         stats["tasks_created"] += 1
             else:
-                created = await chat_router._try_create_scheduled_task(user_text)
+                created = await chat_router._try_create_scheduled_task(user_text, execution_model=model or "")
                 if created:
                     stats["tasks_created"] += 1
         except Exception:

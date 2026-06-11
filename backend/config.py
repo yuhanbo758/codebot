@@ -81,6 +81,8 @@ class GeneralConfig(BaseModel):
     chat_default_model: str = ""
     # 开启后，AI 生成的记忆/定时任务/技能先进入成长候选，由用户决定是否接受。
     growth_candidate_decision: bool = False
+    # 开启后，定时任务进入成长候选时发送通知，提醒用户及时处理。
+    task_candidate_notification_enabled: bool = True
 
 
 
@@ -128,6 +130,39 @@ class SkillsConfig(BaseModel):
     custom_skill_dirs: List[str] = []
 
 
+class HermesConfig(BaseModel):
+    """Hermes Agent integration config."""
+    enabled: bool = True
+    auto_start: bool = True
+    repo_url: str = "https://github.com/NousResearch/hermes-agent"
+    install_dir: str = ""
+    cli_path: str = "hermes"
+    share_models: bool = True
+    share_memory: bool = True
+    share_scheduler: bool = True
+    skill_dirs: List[str] = []
+    last_action: str = ""
+    last_status: str = ""
+    last_message: str = ""
+
+
+class ObsidianKnowledgeBase(BaseModel):
+    """A configured Obsidian vault or Markdown knowledge folder."""
+    id: str = ""
+    name: str = ""
+    path: str = ""
+    description: str = ""
+    enabled: bool = True
+
+
+class ObsidianConfig(BaseModel):
+    """Obsidian integration config."""
+    enabled: bool = True
+    cli_path: str = "obsidian-cli"
+    vault_path: str = ""
+    knowledge_bases: List[ObsidianKnowledgeBase] = []
+
+
 class SandboxConfig(BaseModel):
     """
     沙箱配置（工作目录隔离模式）
@@ -172,6 +207,8 @@ class AppConfig(BaseModel):
     network: NetworkConfig = NetworkConfig()
     integration: IntegrationConfig = IntegrationConfig()
     skills: SkillsConfig = SkillsConfig()
+    hermes: HermesConfig = HermesConfig()
+    obsidian: ObsidianConfig = ObsidianConfig()
     sandbox: SandboxConfig = SandboxConfig()
 
 

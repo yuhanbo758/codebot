@@ -78,7 +78,11 @@ class Database:
                 last_run TIMESTAMP,
                 next_run TIMESTAMP,
                 notify_channels TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                run_once BOOLEAN DEFAULT 0,
+                archived BOOLEAN DEFAULT 0,
+                executor TEXT DEFAULT 'opencode',
+                execution_model TEXT DEFAULT ''
             )
         """)
         

@@ -4,6 +4,12 @@
       <el-tab-pane label="通用设置" name="general">
         <GeneralSettings />
       </el-tab-pane>
+      <el-tab-pane label="Hermes" name="hermes">
+        <HermesSettings />
+      </el-tab-pane>
+      <el-tab-pane label="Obsidian" name="obsidian">
+        <ObsidianSettings />
+      </el-tab-pane>
       <el-tab-pane label="通知配置" name="notification">
         <NotificationSettings />
       </el-tab-pane>
@@ -36,6 +42,8 @@
 import { ref } from 'vue'
 import { useRoute } from 'vue-router'
 import GeneralSettings from '@/components/GeneralSettings.vue'
+import HermesSettings from '@/components/HermesSettings.vue'
+import ObsidianSettings from '@/components/ObsidianSettings.vue'
 import NotificationSettings from '@/components/NotificationSettings.vue'
 import LarkSettings from '@/components/LarkSettings.vue'
 import EmailSettings from '@/components/EmailSettings.vue'
@@ -46,7 +54,7 @@ import SandboxSettings from '@/components/SandboxSettings.vue'
 import Docs from '@/views/Docs.vue'
 
 const route = useRoute()
-const tabNames = new Set(['general', 'notification', 'lark', 'email', 'skills', 'backup', 'integration', 'sandbox', 'docs'])
+const tabNames = new Set(['general', 'hermes', 'obsidian', 'notification', 'lark', 'email', 'skills', 'backup', 'integration', 'sandbox', 'docs'])
 const initialTab = typeof route.query.tab === 'string' && tabNames.has(route.query.tab) ? route.query.tab : 'general'
 const activeTab = ref(initialTab)
 </script>

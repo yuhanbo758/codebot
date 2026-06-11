@@ -265,6 +265,7 @@
                   <el-avatar v-else :src="assistantAvatarUrl" />
                 </div>
                 <div class="message-content">
+                  <div v-if="msg.role === 'assistant' && msg.source === 'hermes'" class="message-source-badge">Hermes Agent CLI</div>
                   <div v-if="isCliDisplayMessage(msg)" class="cli-output">{{ msg.content }}</div>
                   <div v-else-if="msg.streaming" class="message-text streaming-text">{{ msg.content }}</div>
                   <div v-else class="message-text markdown-body" v-html="renderMarkdown(msg.content)"></div>
@@ -568,6 +569,7 @@
                   :key="cmd.name"
                   class="command-item"
                   :class="{ active: idx === commandActiveIndex }"
+                  :data-command-index="idx"
                   @mousedown.prevent="selectCommand(cmd)"
                 >
                   <span class="command-label">{{ cmd.label }}</span>
@@ -580,23 +582,47 @@
             <!-- @ 文件搜索面板 -->
             <div v-if="showAtPanel" class="command-panel at-panel" ref="atPanelRef">
               <div class="command-panel-header">
-                <span>插入文件</span>
-                <span class="command-search-hint">{{ atQuery || '输入文件名搜索' }}</span>
+                <span>Skill</span>
+                <span class="command-search-hint">{{ atQuery || "搜索 skill 名称或描述" }}</span>
               </div>
               <div class="command-panel-list">
                 <div
-                  v-for="(file, idx) in atFiles"
-                  :key="file.path"
+                  v-for="(skill, idx) in atSkills"
+                  :key="skill.id"
                   class="command-item"
                   :class="{ active: idx === atActiveIndex }"
-                  @mousedown.prevent="selectAtFile(file)"
+                  :data-at-index="idx"
+                  @mousedown.prevent="selectAtSkill(skill)"
+                >
+                  <el-icon class="command-file-icon"><MagicStick /></el-icon>
+                  <span class="command-label">{{ skill.name }}</span>
+                  <span class="command-desc">[{{ skill.sourceLabel || skill.source }}] {{ skill.description }}</span>
+                </div>
+                <div v-if="atSkills.length === 0 && !atLoading" class="command-empty">未找到 skill</div>
+                <div v-if="atLoading" class="command-empty">搜索中...</div>
+              </div>
+            </div>
+
+            <div v-if="showKnowledgePanel" class="command-panel knowledge-panel" ref="knowledgePanelRef">
+              <div class="command-panel-header">
+                <span>Obsidian 知识库</span>
+                <span class="command-search-hint">{{ knowledgeQuery || "搜索知识库路径或描述" }}</span>
+              </div>
+              <div class="command-panel-list">
+                <div
+                  v-for="(kb, idx) in knowledgeResults"
+                  :key="kb.id || kb.path"
+                  class="command-item"
+                  :class="{ active: idx === knowledgeActiveIndex }"
+                  :data-knowledge-index="idx"
+                  @mousedown.prevent="toggleKnowledgeBase(kb)"
                 >
                   <el-icon class="command-file-icon"><Document /></el-icon>
-                  <span class="command-label">{{ file.name }}</span>
-                  <span class="command-desc">{{ file.path }}</span>
+                  <span class="command-label">{{ kb.name }}</span>
+                  <span class="command-desc">{{ kb.description || kb.path }}</span>
                 </div>
-                <div v-if="atFiles.length === 0 && !atLoading" class="command-empty">未找到文件</div>
-                <div v-if="atLoading" class="command-empty">搜索中...</div>
+                <div v-if="knowledgeResults.length === 0 && !knowledgeLoading" class="command-empty">未找到知识库</div>
+                <div v-if="knowledgeLoading" class="command-empty">搜索中...</div>
               </div>
             </div>
 
@@ -605,7 +631,7 @@
               v-model="inputMessage"
               type="textarea"
               :rows="3"
-              placeholder="输入消息... (Shift+Enter 换行，/ 命令，@ 插入文件)"
+              placeholder="输入消息... (Shift+Enter 换行，/ 命令，@ skill，# 知识库)"
               @keydown="onInputKeydown"
               @paste="onInputPaste"
               @input="onInputChange"
@@ -619,11 +645,7 @@
                     {{ currentProjectDir ? projectDirName : '项目' }}
                   </el-button>
                 </el-tooltip>
-                <el-button @click="triggerFileUpload" :loading="uploadingFile" title="上传文件（支持图片、文档、代码等）">
-                  <el-icon><Paperclip /></el-icon>
-                  附件
-                </el-button>
-                <!-- 隐藏的文件输入 -->
+                <!-- 隐藏的文件输入：拖拽、粘贴仍复用附件处理能力 -->
                 <input
                   ref="fileInputRef"
                   type="file"
@@ -636,6 +658,22 @@
                   <el-icon><MagicStick /></el-icon>
                   生成技能
                 </el-button>
+                <el-button :type="hermesEnabled ? 'primary' : 'default'" @click="toggleHermesMode">
+                  Hermes
+                </el-button>
+                <el-button :type="obsidianEnabled ? 'primary' : 'default'" @click="toggleObsidianMode">
+                  Obsidian
+                </el-button>
+                <el-tag
+                  v-for="kb in selectedKnowledgeBases"
+                  :key="kb.id || kb.path"
+                  closable
+                  size="small"
+                  type="success"
+                  @close="removeKnowledgeBase(kb)"
+                >
+                  # {{ kb.name }}
+                </el-tag>
                 <span v-if="queuedCount > 0" class="queue-indicator">
                   <el-tag size="small" type="warning">{{ queuedCount }} 条待处理</el-tag>
                 </span>
@@ -695,7 +733,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted, nextTick, computed, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Grid, Delete, Refresh, VideoPlay, VideoPause, Upload, Close, Document, Paperclip, Picture, Search, FolderOpened } from '@element-plus/icons-vue'
+import { Grid, Delete, Refresh, VideoPlay, VideoPause, Upload, Close, Document, Paperclip, Picture, Search, FolderOpened, MagicStick, Promotion } from '@element-plus/icons-vue'
 import axios from 'axios'
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js'
@@ -918,6 +956,7 @@ const copyMessage = async (content) => {
 }
 
 const LAST_CONVERSATION_KEY = 'codebot:lastConversationId'
+const CONVERSATION_TARGETS_KEY = 'codebot:conversationTargets'
 
 const conversations = ref([])
 const messages = ref([])
@@ -1225,13 +1264,23 @@ const commandPanelRef = ref(null)
 const allCommands = ref([])
 const allSkillCommands = ref([])
 
+const splitSearchTokens = (value) =>
+  String(value || '').trim().toLowerCase().split(/[\s\u3000]+/).filter(Boolean)
+
+const matchSearchTokens = (query, ...values) => {
+  const tokens = splitSearchTokens(query)
+  if (tokens.length === 0) return true
+  const haystack = values.map((item) => String(item || '')).join(' ').toLowerCase()
+  return tokens.every((token) => haystack.includes(token))
+}
+
 const filteredCommands = computed(() => {
-  const q = commandQuery.value.toLowerCase()
+  const q = commandQuery.value
   const base = allCommands.value.filter(c =>
-    !q || c.label.toLowerCase().includes(q) || c.description.toLowerCase().includes(q)
+    matchSearchTokens(q, c.label, c.description, c.name)
   )
   const skills = allSkillCommands.value.filter(c =>
-    !q || c.label.toLowerCase().includes(q) || c.description.toLowerCase().includes(q) || (c.skill_name || '').toLowerCase().includes(q)
+    matchSearchTokens(q, c.label, c.description, c.skill_name, c.skill_id)
   )
   return [...base, ...skills].slice(0, 10)
 })
@@ -1273,65 +1322,178 @@ const selectCommand = (cmd) => {
   nextTick(() => inputRef.value?.focus())
 }
 
-// ── @ 文件面板 ────────────────────────────────────────────────────────────────
+// ── @ skill 面板 ─────────────────────────────────────────────────────────────
 const showAtPanel = ref(false)
 const atQuery = ref('')
 const atActiveIndex = ref(0)
-const atFiles = ref([])
+const atSkills = ref([])
 const atLoading = ref(false)
 const atPanelRef = ref(null)
 let _atSearchTimer = null
 
-const searchAtFiles = async (query) => {
+const searchAtSkills = async (query) => {
   atLoading.value = true
   try {
-    const params = { query, limit: 15 }
-    if (currentProjectDir.value) {
-      params.project_dir = currentProjectDir.value
-    }
-    const res = await axios.get('/api/chat/files/search', { params })
-    atFiles.value = res.data?.data?.files || []
+    const params = { query, limit: 80 }
+    const res = await axios.get('/api/chat/skills/search', { params })
+    atSkills.value = res.data?.data?.skills || []
   } catch (e) {
-    atFiles.value = []
+    atSkills.value = []
   } finally {
     atLoading.value = false
+    scrollActivePanelItem(atPanelRef, 'data-at-index', atActiveIndex.value)
   }
 }
 
-const selectAtFile = async (file) => {
+const selectAtSkill = async (skill) => {
   showAtPanel.value = false
   atQuery.value = ''
 
-  // 删除已输入的 @xxx 前缀
   const atIdx = inputMessage.value.lastIndexOf('@')
   if (atIdx !== -1) {
     inputMessage.value = inputMessage.value.substring(0, atIdx)
   }
 
-  // 读取文件内容并加入附件
-  try {
-    const payload = { path: file.path }
-    if (file.abs_path) payload.abs_path = file.abs_path
-    const res = await axios.post('/api/chat/read_file', payload)
-    if (res.data?.success) {
-      // 避免重复附加
-      if (!attachedFiles.value.find(f => f.name === res.data.data.name && f.content === res.data.data.content)) {
-        attachedFiles.value.push(res.data.data)
-        ElMessage.success(`已插入文件：${file.name}`)
-      }
-    }
-  } catch (e) {
-    ElMessage.error(`读取文件失败：${file.name}`)
-  }
+  inputMessage.value += `使用技能 @[${skill.id}] ${skill.name} `
+  ElMessage.success(`已选择 skill：${skill.name}`)
   nextTick(() => inputRef.value?.focus())
+}
+
+// ── # Obsidian 知识库面板 ────────────────────────────────────────────────────
+const showKnowledgePanel = ref(false)
+const knowledgeQuery = ref('')
+const knowledgeActiveIndex = ref(0)
+const knowledgeResults = ref([])
+const knowledgeLoading = ref(false)
+const knowledgePanelRef = ref(null)
+const selectedKnowledgeBases = ref([])
+let _knowledgeSearchTimer = null
+
+const loadConversationTargetMap = () => {
+  try {
+    return JSON.parse(localStorage.getItem(CONVERSATION_TARGETS_KEY) || '{}') || {}
+  } catch {
+    return {}
+  }
+}
+
+const saveConversationTargetMap = (map) => {
+  localStorage.setItem(CONVERSATION_TARGETS_KEY, JSON.stringify(map || {}))
+}
+
+const hermesEnabled = ref(false)
+const obsidianEnabled = ref(false)
+
+const chatTarget = computed(() => {
+  if (hermesEnabled.value) return 'hermes'
+  if (obsidianEnabled.value) return 'obsidian'
+  return 'codebot'
+})
+
+const applyConversationTargetState = (conversationId) => {
+  const state = loadConversationTargetMap()[String(conversationId)] || {}
+  const target = state.target || 'codebot'
+  hermesEnabled.value = Boolean(state.hermes_enabled ?? (target === 'hermes'))
+  obsidianEnabled.value = Boolean(state.obsidian_enabled ?? (target === 'obsidian' || (state.knowledge_bases || []).length > 0))
+  selectedKnowledgeBases.value = Array.isArray(state.knowledge_bases) ? state.knowledge_bases : []
+}
+
+const saveCurrentConversationTargetState = () => {
+  if (!currentConversationId.value) return
+  const map = loadConversationTargetMap()
+  map[String(currentConversationId.value)] = {
+    target: chatTarget.value || 'codebot',
+    hermes_enabled: hermesEnabled.value,
+    obsidian_enabled: obsidianEnabled.value,
+    knowledge_bases: selectedKnowledgeBases.value || []
+  }
+  saveConversationTargetMap(map)
+}
+
+const resetCurrentConversationTargetState = () => {
+  hermesEnabled.value = false
+  obsidianEnabled.value = false
+  selectedKnowledgeBases.value = []
+  saveCurrentConversationTargetState()
+}
+
+const toggleHermesMode = () => {
+  hermesEnabled.value = !hermesEnabled.value
+  saveCurrentConversationTargetState()
+}
+
+const toggleObsidianMode = () => {
+  obsidianEnabled.value = !obsidianEnabled.value
+  saveCurrentConversationTargetState()
+}
+
+const searchKnowledgeBases = async (query) => {
+  knowledgeLoading.value = true
+  try {
+    const res = await axios.get('/api/chat/knowledge/search', { params: { query, limit: 20 } })
+    knowledgeResults.value = res.data?.data?.items || []
+  } catch {
+    knowledgeResults.value = []
+  } finally {
+    knowledgeLoading.value = false
+    scrollActivePanelItem(knowledgePanelRef, 'data-knowledge-index', knowledgeActiveIndex.value)
+  }
+}
+
+const toggleKnowledgeBase = (kb) => {
+  const key = kb.id || kb.path
+  const exists = selectedKnowledgeBases.value.some((item) => (item.id || item.path) === key)
+  if (exists) {
+    selectedKnowledgeBases.value = selectedKnowledgeBases.value.filter((item) => (item.id || item.path) !== key)
+  } else {
+    selectedKnowledgeBases.value.push(kb)
+  }
+  obsidianEnabled.value = true
+  saveCurrentConversationTargetState()
+  const hashIdx = inputMessage.value.lastIndexOf('#')
+  if (hashIdx !== -1) inputMessage.value = inputMessage.value.substring(0, hashIdx)
+  showKnowledgePanel.value = false
+  knowledgeQuery.value = ''
+  nextTick(() => inputRef.value?.focus())
+}
+
+const removeKnowledgeBase = (kb) => {
+  const key = kb.id || kb.path
+  selectedKnowledgeBases.value = selectedKnowledgeBases.value.filter((item) => (item.id || item.path) !== key)
+  saveCurrentConversationTargetState()
+}
+
+const scrollActivePanelItem = (panelRef, dataAttr, index) => {
+  nextTick(() => {
+    const panel = panelRef.value
+    const list = panel?.querySelector?.('.command-panel-list')
+    const item = panel?.querySelector?.(`[${dataAttr}="${index}"]`)
+    if (!list || !item) return
+
+    const itemTop = item.offsetTop
+    const itemBottom = itemTop + item.offsetHeight
+    const visibleTop = list.scrollTop
+    const visibleBottom = visibleTop + list.clientHeight
+
+    if (itemTop < visibleTop) {
+      list.scrollTop = itemTop
+    } else if (itemBottom > visibleBottom) {
+      list.scrollTop = itemBottom - list.clientHeight
+    }
+  })
+}
+
+const moveActiveIndex = (current, delta, length) => {
+  if (length <= 0) return 0
+  return Math.min(Math.max(current + delta, 0), length - 1)
 }
 
 // ── 键盘事件处理 ─────────────────────────────────────────────────────────────
 const onInputKeydown = (e) => {
   // 命令面板导航
   if (showCommandPanel.value) {
-    if (e.key === 'ArrowDown') { e.preventDefault(); commandActiveIndex.value = Math.min(commandActiveIndex.value + 1, filteredCommands.value.length - 1) }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); commandActiveIndex.value = Math.max(commandActiveIndex.value - 1, 0) }
+    if (e.key === 'ArrowDown') { e.preventDefault(); commandActiveIndex.value = moveActiveIndex(commandActiveIndex.value, 1, filteredCommands.value.length); scrollActivePanelItem(commandPanelRef, 'data-command-index', commandActiveIndex.value) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); commandActiveIndex.value = moveActiveIndex(commandActiveIndex.value, -1, filteredCommands.value.length); scrollActivePanelItem(commandPanelRef, 'data-command-index', commandActiveIndex.value) }
     else if (e.key === 'Enter') { e.preventDefault(); if (filteredCommands.value[commandActiveIndex.value]) selectCommand(filteredCommands.value[commandActiveIndex.value]) }
     else if (e.key === 'Escape') { e.preventDefault(); showCommandPanel.value = false }
     return
@@ -1339,10 +1501,18 @@ const onInputKeydown = (e) => {
 
   // @ 面板导航
   if (showAtPanel.value) {
-    if (e.key === 'ArrowDown') { e.preventDefault(); atActiveIndex.value = Math.min(atActiveIndex.value + 1, atFiles.value.length - 1) }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); atActiveIndex.value = Math.max(atActiveIndex.value - 1, 0) }
-    else if (e.key === 'Enter') { e.preventDefault(); if (atFiles.value[atActiveIndex.value]) selectAtFile(atFiles.value[atActiveIndex.value]) }
+    if (e.key === 'ArrowDown') { e.preventDefault(); atActiveIndex.value = moveActiveIndex(atActiveIndex.value, 1, atSkills.value.length); scrollActivePanelItem(atPanelRef, 'data-at-index', atActiveIndex.value) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); atActiveIndex.value = moveActiveIndex(atActiveIndex.value, -1, atSkills.value.length); scrollActivePanelItem(atPanelRef, 'data-at-index', atActiveIndex.value) }
+    else if (e.key === 'Enter') { e.preventDefault(); if (atSkills.value[atActiveIndex.value]) selectAtSkill(atSkills.value[atActiveIndex.value]) }
     else if (e.key === 'Escape') { e.preventDefault(); showAtPanel.value = false }
+    return
+  }
+
+  if (showKnowledgePanel.value) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); knowledgeActiveIndex.value = moveActiveIndex(knowledgeActiveIndex.value, 1, knowledgeResults.value.length); scrollActivePanelItem(knowledgePanelRef, 'data-knowledge-index', knowledgeActiveIndex.value) }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); knowledgeActiveIndex.value = moveActiveIndex(knowledgeActiveIndex.value, -1, knowledgeResults.value.length); scrollActivePanelItem(knowledgePanelRef, 'data-knowledge-index', knowledgeActiveIndex.value) }
+    else if (e.key === 'Enter') { e.preventDefault(); if (knowledgeResults.value[knowledgeActiveIndex.value]) toggleKnowledgeBase(knowledgeResults.value[knowledgeActiveIndex.value]) }
+    else if (e.key === 'Escape') { e.preventDefault(); showKnowledgePanel.value = false }
     return
   }
 
@@ -1360,30 +1530,49 @@ const onInputChange = (val) => {
   const slashIdx = text.lastIndexOf('/')
   if (slashIdx !== -1 && (slashIdx === 0 || text[slashIdx - 1] === '\n' || text[slashIdx - 1] === ' ')) {
     const afterSlash = text.substring(slashIdx + 1)
-    if (!afterSlash.includes(' ') && !afterSlash.includes('\n')) {
+    if (!afterSlash.includes('\n')) {
       commandQuery.value = afterSlash
       commandActiveIndex.value = 0
       showCommandPanel.value = true
       showAtPanel.value = false
+      showKnowledgePanel.value = false
       return
     }
   }
   showCommandPanel.value = false
 
-  // 检测最后一次 @ 触发文件面板
+  // 检测最后一次 @ 触发 skill 面板
   const atIdx = text.lastIndexOf('@')
   if (atIdx !== -1 && (atIdx === 0 || text[atIdx - 1] === '\n' || text[atIdx - 1] === ' ')) {
     const afterAt = text.substring(atIdx + 1)
-    if (!afterAt.includes(' ') && !afterAt.includes('\n')) {
+    if (!afterAt.includes('\n')) {
       atQuery.value = afterAt
       atActiveIndex.value = 0
       showAtPanel.value = true
+      showCommandPanel.value = false
+      showKnowledgePanel.value = false
       clearTimeout(_atSearchTimer)
-      _atSearchTimer = setTimeout(() => searchAtFiles(afterAt), 200)
+      _atSearchTimer = setTimeout(() => searchAtSkills(afterAt), 200)
       return
     }
   }
   showAtPanel.value = false
+
+  const hashIdx = text.lastIndexOf('#')
+  if (hashIdx !== -1 && (hashIdx === 0 || text[hashIdx - 1] === '\n' || text[hashIdx - 1] === ' ')) {
+    const afterHash = text.substring(hashIdx + 1)
+    if (!afterHash.includes('\n')) {
+      knowledgeQuery.value = afterHash
+      knowledgeActiveIndex.value = 0
+      showKnowledgePanel.value = true
+      showCommandPanel.value = false
+      showAtPanel.value = false
+      clearTimeout(_knowledgeSearchTimer)
+      _knowledgeSearchTimer = setTimeout(() => searchKnowledgeBases(afterHash), 200)
+      return
+    }
+  }
+  showKnowledgePanel.value = false
 }
 
 const abortTask = async () => {
@@ -1830,6 +2019,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
     }
     if (event?.type === 'done' && assistantMsg) {
       assistantMsg.cli_display = Boolean(event?.cli_display || assistantMsg.cli_display)
+      if (event?.source) assistantMsg.source = event.source
       assistantMsg.content = assistantMsg.cli_display
         ? (event.content || runtimeContent || assistantMsg.content)
         : sanitizeStreamContent(event.content || runtimeContent || assistantMsg.content)
@@ -1845,6 +2035,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
       if (!assistantMsg) continue
       if (event?.type === 'done') {
         assistantMsg.cli_display = Boolean(event?.cli_display || assistantMsg.cli_display)
+        if (event?.source) assistantMsg.source = event.source
         assistantMsg.content = assistantMsg.cli_display
           ? (event.content || runtimeContent || assistantMsg.content)
           : sanitizeStreamContent(event.content || runtimeContent || assistantMsg.content)
@@ -2060,6 +2251,7 @@ const createNewConversation = async () => {
     const conversation = response.data.data
     conversations.value.unshift(conversation)
     await selectConversation(conversation.id)
+    resetCurrentConversationTargetState()
   } catch (error) {
     ElMessage.error('创建对话失败')
   }
@@ -2076,6 +2268,7 @@ const selectConversation = async (conversationId) => {
     const convData = convResponse.data?.data
     currentConversation.value = convData || null
     currentProjectDir.value = convData?.project_dir || ''
+    applyConversationTargetState(conversationId)
     if (isMultiAgentHub(convData)) {
       await loadMultiAgentMembers()
     }
@@ -2613,6 +2806,10 @@ const sendMessage = async () => {
   const conversationId = currentConversationId.value
   const content = inputMessage.value
   const filesToSend = [...attachedFiles.value]
+  const targetToSend = chatTarget.value || 'codebot'
+  const knowledgePathsToSend = obsidianEnabled.value
+    ? selectedKnowledgeBases.value.map((item) => item.id || item.path).filter(Boolean)
+    : []
   const isLoading = isConversationLoading(conversationId)
   const pendingQuestionEvent = filesToSend.length === 0 ? findPendingQuestionEvent() : null
 
@@ -2627,6 +2824,7 @@ const sendMessage = async () => {
       memoryHints.value = []
       showCommandPanel.value = false
       showAtPanel.value = false
+      showKnowledgePanel.value = false
       return
     }
     clearPendingQuestionEvent(pendingQuestionEvent)
@@ -2638,6 +2836,7 @@ const sendMessage = async () => {
   memoryHints.value = []
   showCommandPanel.value = false
   showAtPanel.value = false
+  showKnowledgePanel.value = false
 
   // 构建展示用的消息内容（附件 + 文字）
   const displayContent = filesToSend.length > 0
@@ -2712,6 +2911,8 @@ const sendMessage = async () => {
         mode: agentMode.value || null,
         attached_files: filesToSend.length > 0 ? filesToSend : null,
         project_dir: currentProjectDir.value || null,
+        target: targetToSend,
+        knowledge_paths: knowledgePathsToSend,
         user_already_saved: true,
       })
       if (response.data?.data?.queued) {
@@ -2752,6 +2953,7 @@ const sendMessage = async () => {
       rawContent: '',
       tool_events: [],
       cli_display: opencodeCliDisplay.value,
+      source: targetToSend === 'hermes' ? 'hermes' : '',
       pendingActionEvent: null,
       streaming: true,
       created_at: new Date().toISOString()
@@ -2791,6 +2993,8 @@ const sendMessage = async () => {
         mode: agentMode.value || null,
         attached_files: filesToSend.length > 0 ? filesToSend : null,
         project_dir: currentProjectDir.value || null,
+        target: targetToSend,
+        knowledge_paths: knowledgePathsToSend,
         user_already_saved: true,
       }, async (event) => {
         if (event?.type === 'queued') {
@@ -2840,6 +3044,7 @@ const sendMessage = async () => {
           flushPendingDelta()
           // 优先使用后端返回的已清洗内容，否则使用前端实时清洗后的内容
           if (event?.cli_display) assistantMessage.cli_display = true
+          if (event?.source) assistantMessage.source = event.source
           const finalContent = event.content || assistantMessage.content
           assistantMessage.content = assistantMessage.cli_display
             ? finalContent
@@ -3446,6 +3651,20 @@ onUnmounted(() => {
   background: #f5f7fa;
   padding: 12px 16px;
   border-radius: 12px 12px 12px 0;
+}
+
+.message-source-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  margin-bottom: 8px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: #e8f4ff;
+  color: #1d4f7a;
+  font-size: 12px;
+  line-height: 18px;
+  font-weight: 600;
 }
 
 .compact-mode .message.user .message-content,
@@ -4202,3 +4421,4 @@ onUnmounted(() => {
   margin-left: 3px;
 }
 </style>
+

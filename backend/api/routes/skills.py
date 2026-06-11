@@ -17,6 +17,7 @@ from core.skill_registry import (
     AUTO_GENERATED,
     BUILTIN,
     EXTERNAL,
+    HERMES,
     OPENCLAW,
     OPENCODE,
     SOURCE_LABELS,
@@ -86,6 +87,40 @@ def _write_skill(skill_id: str, data: dict):
 
 def _list_skills() -> List[dict]:
     return get_skill_registry().list_skills()
+
+
+def _search_tokens(text: str) -> set[str]:
+    raw = re.split(r"[\s\u3000,，。；;:：/\\|()（）\[\]【】{}<>《》\"'`]+", (text or "").lower())
+    tokens = {item for item in raw if len(item) >= 2}
+    compact = re.sub(r"\s+", "", (text or "").lower())
+    if compact:
+        tokens.add(compact[:32])
+    return tokens
+
+
+def _skill_similarity(requirement: str, skill: dict) -> float:
+    req_tokens = _search_tokens(requirement)
+    if not req_tokens:
+        return 0.0
+    skill_tokens = _search_tokens(" ".join([
+        str(skill.get("name") or ""),
+        str(skill.get("description") or ""),
+        str(skill.get("slug") or ""),
+    ]))
+    if not skill_tokens:
+        return 0.0
+    return len(req_tokens & skill_tokens) / max(1, len(req_tokens | skill_tokens))
+
+
+def _find_similar_skill(requirement: str) -> tuple[Optional[dict], float]:
+    best: Optional[dict] = None
+    best_score = 0.0
+    for skill in get_skill_registry().list_skills(include_content=True):
+        score = _skill_similarity(requirement, skill)
+        if score > best_score:
+            best = skill
+            best_score = score
+    return best, best_score
 
 
 def _opencode_agents_skills_dir() -> Path:
@@ -163,7 +198,7 @@ def _sync_skill_to_opencode(skill_dir_name: str) -> bool:
 
 
 def _source_is_read_only(source: str) -> bool:
-    return source in {EXTERNAL, OPENCLAW, OPENCODE}
+    return source in {EXTERNAL, HERMES, OPENCLAW, OPENCODE}
 
 
 def _slug_from_description(description: str) -> str:
@@ -206,6 +241,16 @@ async def generate_skill(request: SkillGenerateRequest):
         raise HTTPException(status_code=400, detail="请提供技能描述")
 
     body = ""
+    similar_skill, similarity = _find_similar_skill(description)
+    similar_context = ""
+    if similar_skill and similarity >= 0.6:
+        similar_context = (
+            "A similar skill was found locally. Adapt it to the new requirement instead of copying it verbatim.\n"
+            f"Matched skill: {similar_skill.get('name')} ({similar_skill.get('id')})\n"
+            f"Similarity: {similarity:.2f}\n"
+            f"Existing description: {similar_skill.get('description')}\n"
+            f"Existing SKILL.md:\n{(similar_skill.get('skill_md_content') or '')[:12000]}\n\n"
+        )
     try:
         client = OpenCodeClient(app_config.opencode.server_url)
         ok = await client.try_connect(attempts=2, delay=0.3, open_timeout=1.0)
@@ -213,6 +258,7 @@ async def generate_skill(request: SkillGenerateRequest):
             prompt = (
                 "请根据下面的需求生成一个可复用的 agent skill 操作说明。"
                 "只输出 Markdown 正文步骤，不要创建文件，不要写入 ~/.agents/skills。\n\n"
+                f"{similar_context}"
                 f"需求：{description}"
             )
             result = await client.execute_task(prompt, timeout=60)
@@ -232,8 +278,9 @@ async def generate_skill(request: SkillGenerateRequest):
         )
 
     title = description[:32] if len(description) > 32 else description
+    name_prefix = "自动生成技能（改造）" if similar_skill and similarity >= 0.6 else "自动生成技能"
     item = get_skill_registry().create_auto_skill(
-        name=f"自动生成技能：{title}",
+        name=f"{name_prefix}：{title}",
         description=description[:180],
         body=body,
         user_message=description,
@@ -241,7 +288,7 @@ async def generate_skill(request: SkillGenerateRequest):
     )
     return {
         "success": True,
-        "data": item,
+        "data": {**item, "matched_skill": similar_skill if similar_skill and similarity >= 0.6 else None, "similarity": similarity},
         "message": f"技能已生成到 Codebot 技能目录：{item.get('slug')}",
     }
 
@@ -266,7 +313,7 @@ async def batch_delete_skills(request: BatchDeleteRequest):
             if source == AUTO_GENERATED:
                 registry.delete_auto_skill(skill_id)
                 results["success"].append(skill_id)
-            elif source in {BUILTIN, EXTERNAL, OPENCLAW, OPENCODE}:
+            elif source in {BUILTIN, EXTERNAL, HERMES, OPENCLAW, OPENCODE}:
                 results["skipped"].append(skill_id)
             else:
                 path = _skill_path(skill_id)
@@ -383,7 +430,7 @@ async def update_skill_content(skill_id: str, request: SkillContentUpdateRequest
 async def update_skill(skill_id: str, request: SkillUpdateRequest):
     skill_id = _decode_skill_id(skill_id)
     item = get_skill_registry().find(skill_id)
-    if item and item.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, OPENCLAW, OPENCODE}:
+    if item and item.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, HERMES, OPENCLAW, OPENCODE}:
         raise HTTPException(status_code=400, detail="该技能类型请通过 SKILL.md 或原工具管理")
     path = _skill_path(skill_id)
     if not path.exists():
@@ -412,6 +459,8 @@ async def delete_skill(skill_id: str):
             raise HTTPException(status_code=400, detail="内置技能不支持卸载")
         if source == EXTERNAL:
             raise HTTPException(status_code=400, detail="外部兼容目录技能为只读，请在设置中移除对应目录")
+        if source == HERMES:
+            raise HTTPException(status_code=400, detail="Hermes Agent 技能为只读，请在 Hermes Agent 中管理")
         if source == OPENCLAW:
             raise HTTPException(status_code=400, detail="OpenClaw 技能为只读，请在 OpenClaw/StepClaw 中管理")
         if source == OPENCODE:
@@ -435,3 +484,4 @@ def update_auto_skill_file(skill_md_path: Path, name: str, description: str, use
         user_message=user_message,
         slug=slug,
     )
+

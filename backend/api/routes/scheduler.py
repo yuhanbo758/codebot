@@ -8,7 +8,7 @@ from datetime import datetime
 import re
 import json
 
-from core.scheduler import TaskScheduler
+from core.scheduler import TaskScheduler, normalize_task_executor
 from config import app_config
 
 router = APIRouter()
@@ -24,6 +24,8 @@ class CreateTaskRequest(BaseModel):
     task_prompt: str
     notify_channels: List[str] = []
     run_once: bool = False
+    executor: str = "opencode"
+    execution_model: str = ""
 
 
 class UpdateTaskRequest(BaseModel):
@@ -34,6 +36,8 @@ class UpdateTaskRequest(BaseModel):
     enabled: Optional[bool] = None
     notify_channels: Optional[List[str]] = None
     run_once: Optional[bool] = None
+    executor: Optional[str] = None
+    execution_model: Optional[str] = None
 
 
 @router.get("/tasks")
@@ -80,6 +84,8 @@ async def create_task(request: CreateTaskRequest):
             task_prompt=request.task_prompt,
             notify_channels=notify_channels,
             run_once=request.run_once,
+            executor=normalize_task_executor(request.executor),
+            execution_model=request.execution_model,
         )
         
         return {

@@ -182,6 +182,31 @@
           <el-form-item label="Cron 表达式">
             <el-input v-model="growthEditForm.task.cron_expression" placeholder="0 9 * * *" />
           </el-form-item>
+          <el-form-item label="执行器">
+            <el-radio-group v-model="growthEditForm.task.executor">
+              <el-radio-button label="opencode">OpenCode</el-radio-button>
+              <el-radio-button label="hermes">Hermes</el-radio-button>
+            </el-radio-group>
+          </el-form-item>
+          <el-form-item label="执行模型">
+            <el-select
+              v-model="growthEditForm.task.execution_model"
+              filterable
+              clearable
+              placeholder="使用记忆整理备用模型"
+              style="width: 100%"
+              :loading="growthModelsLoading"
+              @focus="loadGrowthModels"
+            >
+              <el-option label="使用记忆整理备用模型" value="" />
+              <el-option
+                v-for="model in growthAvailableModels"
+                :key="model.id"
+                :label="model.name || model.id"
+                :value="model.id"
+              />
+            </el-select>
+          </el-form-item>
           <el-form-item label="执行内容">
             <el-input v-model="growthEditForm.task.task_prompt" type="textarea" :rows="5" />
           </el-form-item>
@@ -253,10 +278,14 @@ const growthEditForm = ref({
     cron_expression: '',
     schedule_text: '',
     task_prompt: '',
+    executor: 'opencode',
+    execution_model: '',
     run_once: false,
     notify_channels: ['app']
   }
 })
+const growthAvailableModels = ref([])
+const growthModelsLoading = ref(false)
 let removeUpdateListener = null
 let removeAccountChangedListener = null
 let removeSkillDownloadListener = null
@@ -427,6 +456,21 @@ const loadGrowthCandidates = async () => {
   }
 }
 
+const loadGrowthModels = async () => {
+  if (growthAvailableModels.value.length > 0 || growthModelsLoading.value) return
+  growthModelsLoading.value = true
+  try {
+    const resp = await axios.get('/api/chat/models')
+    if (resp.data?.success) {
+      growthAvailableModels.value = resp.data.data?.models || []
+    }
+  } catch (err) {
+    console.warn('加载成长候选模型列表失败:', err)
+  } finally {
+    growthModelsLoading.value = false
+  }
+}
+
 const openGrowthDialog = async () => {
   growthDialogVisible.value = true
   await loadGrowthCandidates()
@@ -456,11 +500,14 @@ const editGrowth = (row) => {
       cron_expression: payload.cron_expression || payload.cron || '',
       schedule_text: payload.schedule_text || '',
       task_prompt: payload.task_prompt || row.content || '',
+      executor: payload.executor || 'opencode',
+      execution_model: payload.execution_model || '',
       run_once: Boolean(payload.run_once),
       notify_channels: Array.isArray(payload.notify_channels) && payload.notify_channels.length ? payload.notify_channels : ['app']
     }
   }
   growthEditVisible.value = true
+  loadGrowthModels()
 }
 
 const saveGrowthEdit = async () => {
@@ -478,6 +525,8 @@ const saveGrowthEdit = async () => {
           cron_expression: growthEditForm.value.task.cron_expression,
           schedule_text: growthEditForm.value.task.schedule_text,
           task_prompt: growthEditForm.value.task.task_prompt,
+          executor: growthEditForm.value.task.executor,
+          execution_model: growthEditForm.value.task.execution_model || '',
           run_once: Boolean(growthEditForm.value.task.run_once),
           notify_channels: growthEditForm.value.task.notify_channels
         }

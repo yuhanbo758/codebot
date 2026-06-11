@@ -38,6 +38,37 @@ def _save(items: List[Dict[str, Any]]) -> None:
     _store_path().write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _merge_payload(existing: Optional[Dict[str, Any]], incoming: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge newly discovered structured fields without clobbering user edits."""
+    result = dict(existing or {})
+    if not isinstance(incoming, dict):
+        return result
+
+    for key, value in incoming.items():
+        current = result.get(key)
+        if isinstance(value, dict):
+            if not value:
+                continue
+            result[key] = _merge_payload(current if isinstance(current, dict) else {}, value)
+            continue
+        if isinstance(value, list):
+            if value and not current:
+                result[key] = value
+            continue
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned and not current:
+                result[key] = cleaned
+            continue
+        if isinstance(value, bool):
+            if value or key not in result:
+                result[key] = value
+            continue
+        if value is not None and not current:
+            result[key] = value
+    return result
+
+
 def list_candidates(status: str = PENDING, limit: int = 50) -> List[Dict[str, Any]]:
     items = _load()
     if status:
@@ -68,11 +99,21 @@ def add_candidate(
     items = _load()
     fingerprint = _fingerprint(kind, title, content)
     now = datetime.now().isoformat()
+    incoming_payload = payload or {}
+    incoming_executor = str(incoming_payload.get("executor") or "").strip().lower()
     for item in items:
         if item.get("fingerprint") == fingerprint and item.get("status") == PENDING:
+            if kind == "task" and incoming_executor:
+                existing_payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+                existing_executor = str((existing_payload or {}).get("executor") or "").strip().lower()
+                if existing_executor and existing_executor != incoming_executor:
+                    continue
             item["hit_count"] = int(item.get("hit_count") or 1) + 1
             item["updated_at"] = now
             item["confidence"] = max(float(item.get("confidence") or 0), float(confidence))
+            item["payload"] = _merge_payload(item.get("payload"), incoming_payload)
+            if evidence and not item.get("evidence"):
+                item["evidence"] = evidence[:1200]
             _save(items)
             return item
     item = {

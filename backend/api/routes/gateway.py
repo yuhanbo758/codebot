@@ -160,26 +160,26 @@ async def _resolve_model(
 
     优先级：
       1. 请求中明确指定的 model
-      2. app_config.memory.organize_model（记忆整理使用模型）
-      3. app_config.general.chat_default_model（聊天页默认模型）
+      2. app_config.general.chat_default_model（聊天页默认模型）
+      3. app_config.memory.organize_model（记忆整理使用模型）
       4. app_config.models.primary_model（用户在设置中配置的主模型）
       5. None — 让 OpenCode 使用自身默认模型
     """
-    if requested_model:
+    if requested_model and requested_model.strip().lower() not in {"default", "codebot-default"}:
         normalized = _normalize_model_name(requested_model)
         if normalized != requested_model:
             logger.info(f"[gateway] 模型别名已规范化: {requested_model} -> {normalized}")
         return normalized
 
+    chat_default = _normalize_model_name(app_config.general.chat_default_model)
+    if chat_default:
+        logger.debug(f"[gateway] no model requested, using chat default model: {chat_default}")
+        return chat_default
+
     organize_model = _normalize_model_name(app_config.memory.organize_model)
     if organize_model:
         logger.debug(f"[gateway] 请求未指定 model，使用记忆整理模型: {organize_model}")
         return organize_model
-
-    chat_default = _normalize_model_name(app_config.general.chat_default_model)
-    if chat_default:
-        logger.debug(f"[gateway] 请求未指定 model，使用聊天默认模型: {chat_default}")
-        return chat_default
 
     primary = _normalize_model_name(app_config.models.primary_model)
     if primary:

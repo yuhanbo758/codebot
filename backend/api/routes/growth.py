@@ -17,6 +17,8 @@ class GrowthTaskPayloadUpdateRequest(BaseModel):
     task_prompt: str
     run_once: bool = False
     notify_channels: Optional[List[str]] = None
+    executor: Optional[str] = None
+    execution_model: Optional[str] = None
 
 
 class GrowthCandidateStructuredUpdateRequest(BaseModel):
@@ -25,6 +27,20 @@ class GrowthCandidateStructuredUpdateRequest(BaseModel):
     evidence: Optional[str] = None
     payload: Optional[dict] = None
     task: Optional[GrowthTaskPayloadUpdateRequest] = None
+
+
+def _task_schedule_source(candidate: dict, payload: dict) -> str:
+    for value in (
+        payload.get("schedule_text"),
+        payload.get("cron_prompt"),
+        candidate.get("evidence"),
+        candidate.get("content"),
+        payload.get("task_prompt"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 @router.get("/candidates")
@@ -74,18 +90,36 @@ async def accept_growth_candidate(candidate_id: str):
         notify_channels = payload.get("notify_channels")
         if not isinstance(notify_channels, list) or not notify_channels:
             notify_channels = ["app"]
+        executor = chat_router._task_executor_from_target(payload.get("executor") or payload.get("target") or "opencode")
+        execution_model = str(payload.get("execution_model") or "").strip()
         if not scheduler_router.scheduler:
             raise HTTPException(status_code=400, detail="定时任务调度器未就绪")
         if not cron_expression:
+            schedule_source = _task_schedule_source(candidate, payload)
+            if schedule_source and chat_router._looks_like_schedule_message(schedule_source):
+                try:
+                    cron_data = await scheduler_router.generate_cron_from_text(schedule_source)
+                    cron_expression = str((cron_data or {}).get("cron") or "").strip()
+                    if cron_expression:
+                        payload["cron_expression"] = cron_expression
+                        payload.setdefault("schedule_text", schedule_source)
+                except Exception:
+                    cron_expression = ""
+        if not cron_expression:
             raise HTTPException(status_code=400, detail="该任务候选缺少明确 cron，请在定时任务页面手动创建或补充时间后再执行")
+        payload["executor"] = executor
+        payload["execution_model"] = execution_model
+        update_candidate(candidate_id, {"payload": payload})
         task = scheduler_router.scheduler.create_task(
             name=name[:60] or "成长候选定时任务",
             cron_expression=cron_expression,
             task_prompt=task_prompt or name,
             notify_channels=notify_channels,
             run_once=bool(payload.get("run_once", False)),
+            executor=executor,
+            execution_model=execution_model,
         )
-        created = {"kind": "task", "task": {"id": task.id, "name": task.name, "cron_expression": task.cron_expression}}
+        created = {"kind": "task", "task": {"id": task.id, "name": task.name, "cron_expression": task.cron_expression, "executor": task.executor, "execution_model": task.execution_model}}
     else:
         raise HTTPException(status_code=400, detail="未知候选类型")
 
@@ -131,12 +165,17 @@ async def edit_growth_candidate(candidate_id: str, request: GrowthCandidateStruc
             raise HTTPException(status_code=400, detail="请填写 Cron 表达式或自然语言时间")
 
         notify_channels = request.task.notify_channels if isinstance(request.task.notify_channels, list) and request.task.notify_channels else ["app"]
+        executor = chat_router._task_executor_from_target(request.task.executor or payload.get("executor") or "opencode")
+        model_source = request.task.execution_model if request.task.execution_model is not None else payload.get("execution_model")
+        execution_model = str(model_source or "").strip()
         payload.update({
             "name": title,
             "task_prompt": task_prompt,
             "cron_expression": cron_expression,
             "notify_channels": notify_channels,
             "run_once": bool(request.task.run_once),
+            "executor": executor,
+            "execution_model": execution_model,
         })
         if schedule_text:
             payload["schedule_text"] = schedule_text

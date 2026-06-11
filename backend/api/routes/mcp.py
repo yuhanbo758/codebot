@@ -1314,7 +1314,7 @@ def _build_codebot_tool_definitions() -> List[dict]:
         },
         {
             "name": "codebot_create_task",
-            "description": "在 Codebot 中创建定时任务，可直接给 cron_expression，或用 schedule_description 让 Codebot 生成 cron。",
+            "description": "在 Codebot 中创建定时任务，可直接给 cron_expression，或用 schedule_description 让 Codebot 生成 cron。executor=hermes 时后续由 Hermes CLI 执行，否则由 OpenCode 执行。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1322,6 +1322,15 @@ def _build_codebot_tool_definitions() -> List[dict]:
                     "task_prompt": {"type": "string"},
                     "cron_expression": {"type": "string"},
                     "schedule_description": {"type": "string"},
+                    "execution_model": {
+                        "type": "string",
+                        "description": "任务执行时优先使用的模型 ID，例如 provider/model；不可用时会回退到记忆自动整理模型。"
+                    },
+                    "executor": {
+                        "type": "string",
+                        "enum": ["opencode", "hermes"],
+                        "description": "任务触发时使用的执行器。Hermes 会使用 Hermes CLI；OpenCode 使用 OpenCode。"
+                    },
                     "notify_channels": {
                         "type": "array",
                         "items": {"type": "string"}
@@ -1530,6 +1539,8 @@ async def _call_codebot_tool(name: str, arguments: dict) -> dict:
             cron_expression=cron_expression,
             task_prompt=task_prompt,
             notify_channels=[str(item) for item in notify_channels if str(item).strip()],
+            executor=str(args.get("executor") or "opencode"),
+            execution_model=str(args.get("execution_model") or args.get("model") or ""),
         )
         return {"content": [{"type": "text", "text": json.dumps(task.to_dict(), ensure_ascii=False)}]}
 
