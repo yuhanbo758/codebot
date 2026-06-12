@@ -3,12 +3,16 @@ OpenCode HTTP 客户端
 """
 import asyncio
 import json
+import os
+import re
 import time
 from typing import Optional, AsyncGenerator, List, Dict, Any
 from urllib.parse import urlparse, urlunparse
 from loguru import logger
 import httpx
 from datetime import datetime
+
+from utils.installer import collect_opencode_commands
 
 # 全局任务队列：每个对话有自己的任务队列和当前 session_id
 # key: conversation_id (str), value: asyncio.Queue of coroutines
@@ -98,6 +102,17 @@ class OpenCodeClient:
             ""
         ))
 
+    def _normalize_model_id(self, model: Optional[str]) -> str:
+        model_id = (model or "").strip()
+        if not model_id:
+            return ""
+        if "/" in model_id:
+            provider_id, raw_model_id = model_id.split("/", 1)
+            provider_id = self._PROVIDER_ALIASES.get(provider_id, provider_id)
+            raw_model_id = self._MODEL_ALIASES.get(raw_model_id, raw_model_id)
+            return f"{provider_id}/{raw_model_id}"
+        return self._MODEL_ALIASES.get(model_id, model_id)
+
     def _build_prompt_payload(
         self,
         prompt: str,
@@ -129,13 +144,12 @@ class OpenCodeClient:
         if mode in {"plan", "build"}:
             payload["agent"] = mode
         if model:
-            if "/" in model:
-                provider_id, model_id = model.split("/", 1)
-                provider_id = self._PROVIDER_ALIASES.get(provider_id, provider_id)
-                model_id = self._MODEL_ALIASES.get(model_id, model_id)
+            normalized_model = self._normalize_model_id(model)
+            if "/" in normalized_model:
+                provider_id, model_id = normalized_model.split("/", 1)
                 payload["model"] = {"providerID": provider_id, "modelID": model_id}
             else:
-                payload["model"] = {"modelID": self._MODEL_ALIASES.get(model, model)}
+                payload["model"] = {"modelID": normalized_model}
         return payload
 
     def _extract_text_from_parts(self, parts: Any) -> str:
@@ -306,12 +320,109 @@ class OpenCodeClient:
         """确保连接状态"""
         if not self.connected:
             await self.connect()
+
+    def _dedupe_models(self, models: List[dict]) -> List[dict]:
+        seen = set()
+        result = []
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("id")
+            if not model_id or model_id in seen:
+                continue
+            seen.add(model_id)
+            result.append(item)
+        return result
+
+    def _parse_models_cli_output(self, stdout: str) -> List[dict]:
+        models: List[dict] = []
+        ansi_re = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+        for raw_line in (stdout or "").splitlines():
+            line = ansi_re.sub("", raw_line).strip()
+            if not line or "/" not in line:
+                continue
+            token = line.split()[0].strip()
+            if "/" not in token or token.startswith("-"):
+                continue
+            provider_id, model_id = token.split("/", 1)
+            provider_id = provider_id.strip()
+            model_id = model_id.strip()
+            if not provider_id or not model_id:
+                continue
+            models.append({
+                "id": f"{provider_id}/{model_id}",
+                "name": f"{model_id} ({provider_id})",
+                "provider": provider_id,
+                "model": model_id,
+            })
+        return self._dedupe_models(models)
+
+    def _build_cli_command(self, command: List[str], args: List[str]) -> List[str]:
+        executable = command[0]
+        suffix = os.path.splitext(executable)[1].lower()
+        if os.name == "nt" and suffix in {".cmd", ".bat"}:
+            return ["cmd.exe", "/c", executable, *command[1:], *args]
+        if os.name == "nt" and suffix == ".ps1":
+            return [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                executable,
+                *command[1:],
+                *args,
+            ]
+        return [*command, *args]
+
+    async def _run_opencode_models_cli(self) -> List[dict]:
+        commands = collect_opencode_commands()
+        if not commands:
+            return []
+        for command in commands:
+            try:
+                argv = self._build_cli_command(command, ["models"])
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    await proc.communicate()
+                    logger.warning(f"OpenCode CLI models command timed out: {command[0]}")
+                    continue
+                if proc.returncode != 0:
+                    err_text = (stderr or b"").decode("utf-8", errors="ignore").strip()
+                    logger.warning(f"OpenCode CLI models command failed: {command[0]} ({proc.returncode}) {err_text}")
+                    continue
+                out_text = (stdout or b"").decode("utf-8", errors="ignore")
+                models = self._parse_models_cli_output(out_text)
+                if models:
+                    logger.info(f"OpenCode CLI models loaded: {command[0]} ({len(models)} models)")
+                    return models
+            except Exception as e:
+                logger.warning(f"OpenCode CLI models command error: {command[0]} ({e})")
+        return []
+
+    async def get_models_from_cli(self) -> List[dict]:
+        return await self._run_opencode_models_cli()
     
-    async def get_models(self) -> list:
+    async def get_models(self, prefer_cli: bool = False, quiet: bool = False, http_timeout: float = 10) -> list:
         """获取 OpenCode 可用模型列表（从 /provider 端点解析已连接的 provider）"""
+        if prefer_cli:
+            cli_models = await self.get_models_from_cli()
+            if cli_models:
+                return cli_models
         try:
             client = await self._get_client()
-            response = await client.get(f"{self.base_url}/provider", timeout=10)
+            response = await client.get(f"{self.base_url}/provider", timeout=http_timeout)
             response.raise_for_status()
             data = response.json()
             if not isinstance(data, dict):
@@ -342,10 +453,40 @@ class OpenCodeClient:
                             "provider": provider_id,
                             "model": model_key,
                         })
-            return models
+            return self._dedupe_models(models)
         except Exception as e:
-            logger.warning(f"获取模型列表失败: {e}")
+            log_fn = logger.debug if quiet else logger.warning
+            log_fn(f"获取模型列表失败: {e}")
             return []
+
+    async def _validate_model_available_on_server(self, model: Optional[str]) -> Optional[str]:
+        normalized_model = self._normalize_model_id(model)
+        if not normalized_model or "/" not in normalized_model:
+            return None
+        server_models = await self.get_models(prefer_cli=False, quiet=True, http_timeout=5)
+        server_ids = {
+            str(item.get("id") or "").strip()
+            for item in server_models
+            if isinstance(item, dict) and item.get("id")
+        }
+        if normalized_model in server_ids:
+            return None
+        provider_id = normalized_model.split("/", 1)[0]
+        provider_ids = sorted({
+            str(item.get("provider") or "").strip()
+            for item in server_models
+            if isinstance(item, dict) and item.get("provider")
+        })
+        provider_hint = "当前 server 尚未返回任何已连接 provider。"
+        if provider_ids:
+            provider_hint = f"当前 server 已连接 provider：{', '.join(provider_ids[:12])}"
+            if len(provider_ids) > 12:
+                provider_hint += " ..."
+        return (
+            f"当前 OpenCode Server ({self.base_url}) 尚未加载模型 {normalized_model}。"
+            f"请刷新或重启这个 server，使 provider `{provider_id}` 在当前 server_url 下可用；"
+            f"{provider_hint}"
+        )
 
     async def abort_session(self, session_id: str) -> bool:
         """终止一个运行中的 session"""
@@ -518,6 +659,9 @@ class OpenCodeClient:
             mark_conversation_running(conv_id)
         try:
             client = await self._get_client()
+            validation_error = await self._validate_model_available_on_server(model)
+            if validation_error:
+                return TaskResult(success=False, error=validation_error)
             session_id = await self._resolve_session_id(
                 client=client,
                 conversation_id=conversation_id,
@@ -561,6 +705,10 @@ class OpenCodeClient:
             mark_conversation_running(conv_id)
         try:
             client = await self._get_client()
+            validation_error = await self._validate_model_available_on_server(model)
+            if validation_error:
+                yield {"type": "error", "message": validation_error, "error": validation_error}
+                return
             session_id = await self._resolve_session_id(
                 client=client,
                 conversation_id=conversation_id,
@@ -817,7 +965,7 @@ class OpenCodeClient:
         except Exception as e:
             self.connected = False
             logger.error(f"流式任务执行失败：{e}")
-            yield {"type": "error", "error": str(e)}
+            yield {"type": "error", "message": str(e), "error": str(e)}
         finally:
             if conv_id:
                 unmark_conversation_running(conv_id)

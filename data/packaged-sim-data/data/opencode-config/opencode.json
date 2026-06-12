@@ -1,12 +1,4 @@
 {
-  "mcp": {
-    "codebot": {
-      "type": "remote",
-      "url": "http://127.0.0.1:18099/api/mcp/codebot/sse",
-      "enabled": true,
-      "oauth": false
-    }
-  },
   "provider": {
     "wolfai": {
       "name": "wolfai",

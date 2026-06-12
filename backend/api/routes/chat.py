@@ -42,7 +42,11 @@ from core.skill_registry import (
 )
 from api.routes import scheduler as scheduler_router
 from api.routes import mcp as mcp_router
-from utils.installer import start_opencode_server
+from utils.installer import (
+    is_managed_opencode_server_running,
+    restart_managed_opencode_server,
+    start_opencode_server,
+)
 
 router = APIRouter()
 opencode_ws: Optional[OpenCodeClient] = None
@@ -74,13 +78,18 @@ def _collect_opencode_retry_ports() -> List[int]:
     return candidate_ports
 
 
-async def _ensure_opencode_client_connected(client: OpenCodeClient) -> bool:
+async def _ensure_opencode_client_connected(client: OpenCodeClient, allow_port_fallback: bool = True) -> bool:
     ok = await client.try_connect(attempts=3, delay=0.4, open_timeout=1.0)
     if ok:
         return True
 
     actual_port = 0
-    for port in _collect_opencode_retry_ports():
+    candidate_ports = _collect_opencode_retry_ports() if allow_port_fallback else []
+    if not candidate_ports:
+        parsed = urlparse(client.base_url or app_config.opencode.server_url or "")
+        configured_port = parsed.port or 11200
+        candidate_ports = [configured_port]
+    for port in candidate_ports:
         actual_port = await start_opencode_server(port)
         if actual_port:
             break
@@ -5661,6 +5670,53 @@ async def undo_message(conversation_id: int, request: UndoMessageRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _mark_model_sources(cli_models: List[dict], server_models: List[dict]) -> tuple[List[dict], List[str]]:
+    server_ids = {
+        str(item.get("id") or "").strip()
+        for item in server_models
+        if isinstance(item, dict) and item.get("id")
+    }
+    seen: set[str] = set()
+    merged: List[dict] = []
+    missing_runnable: List[str] = []
+
+    for raw in cli_models:
+        if not isinstance(raw, dict):
+            continue
+        model_id = str(raw.get("id") or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        item = dict(raw)
+        runnable = model_id in server_ids
+        item["source"] = "cli"
+        item["runnable"] = runnable
+        if not runnable:
+            missing_runnable.append(model_id)
+        merged.append(item)
+        seen.add(model_id)
+
+    for raw in server_models:
+        if not isinstance(raw, dict):
+            continue
+        model_id = str(raw.get("id") or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        item = dict(raw)
+        item["source"] = "server"
+        item["runnable"] = True
+        merged.append(item)
+        seen.add(model_id)
+
+    return merged, missing_runnable
+
+
+async def _load_current_server_models_for_refresh(client: OpenCodeClient) -> List[dict]:
+    ok = await _ensure_opencode_client_connected(client, allow_port_fallback=False)
+    if not ok:
+        return []
+    return await client.get_models(prefer_cli=False, quiet=True, http_timeout=5)
+
+
 @router.get("/models")
 async def get_models():
     """获取 OpenCode 可用模型列表"""
@@ -5671,11 +5727,40 @@ async def get_models():
         if client is None:
             client = OpenCodeClient(app_config.opencode.server_url)
             created_client = True
-        ok = await _ensure_opencode_client_connected(client)
-        if not ok:
+
+        cli_models = await client.get_models_from_cli()
+        server_models = await _load_current_server_models_for_refresh(client)
+
+        if cli_models:
+            merged, missing_runnable = _mark_model_sources(cli_models, server_models)
+            if missing_runnable and server_models and is_managed_opencode_server_running():
+                parsed = urlparse(client.base_url or app_config.opencode.server_url or "")
+                port = parsed.port or 11200
+                actual_port = await restart_managed_opencode_server(port)
+                if actual_port:
+                    await client.disconnect()
+                    client.base_url = f"http://127.0.0.1:{actual_port}"
+                    server_models = await _load_current_server_models_for_refresh(client)
+                    merged, missing_runnable = _mark_model_sources(cli_models, server_models)
+
+            message = ""
+            if missing_runnable:
+                sample = "、".join(missing_runnable[:5])
+                if len(missing_runnable) > 5:
+                    sample += " 等"
+                message = (
+                    f"已从 opencode models 读取最新模型，但当前 server_url ({client.base_url}) "
+                    f"尚未加载 {sample}，这些模型会暂时标记为未加载。请重启当前 OpenCode Server 后再刷新。"
+                )
+            return {"success": True, "data": {"models": merged}, "message": message}
+
+        if not server_models:
             return {"success": False, "data": {"models": []}, "message": "OpenCode 未连接"}
-        models = await client.get_models()
-        return {"success": True, "data": {"models": models}, "message": ""}
+        for item in server_models:
+            if isinstance(item, dict):
+                item["source"] = "server"
+                item["runnable"] = True
+        return {"success": True, "data": {"models": server_models}, "message": ""}
     except Exception as e:
         logger.error(f"获取模型列表失败: {e}")
         return {"success": False, "data": {"models": []}, "message": str(e)}

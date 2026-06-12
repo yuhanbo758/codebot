@@ -1,12 +1,5 @@
 {
-  "mcp": {
-    "codebot": {
-      "type": "remote",
-      "url": "http://127.0.0.1:18099/api/mcp/codebot/sse",
-      "enabled": true,
-      "oauth": false
-    }
-  },
+  "$schema": "https://opencode.ai/config.json",
   "provider": {
     "wolfai": {
       "name": "wolfai",
@@ -91,6 +84,35 @@
           "name": "minimax-m3"
         }
       }
+    }
+  },
+  "disabled_providers": [
+    "github-copilot",
+    "openrouter",
+    "iflowcn",
+    "novita-ai",
+    "alibaba-coding-plan-cn",
+    "aliyun_coding"
+  ],
+  "mcp": {
+    "episodic-memory": {
+      "type": "local",
+      "command": [
+        "node",
+        "C:\\Users\\yuhan\\.local\\share\\episodic-memory\\dist\\mcp-server.js"
+      ],
+      "enabled": true
+    },
+    "pencil": {
+      "command": [
+        "C:\\Users\\yuhan\\.pencil\\mcp\\trae\\out\\mcp-server-windows-x64.exe",
+        "--app",
+        "trae",
+        "--agent",
+        "openCodeCLI"
+      ],
+      "enabled": true,
+      "type": "local"
     }
   }
 }

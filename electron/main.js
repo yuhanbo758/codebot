@@ -14,7 +14,7 @@ try {
 
 const isDevRuntime = !app.isPackaged;
 const backendPort = process.env.CODEBOT_BACKEND_PORT || (isDevRuntime ? '18080' : '15682');
-const opencodePort = process.env.CODEBOT_OPENCODE_PREFERRED_PORT || (isDevRuntime ? '11203' : '11200');
+const opencodePort = process.env.CODEBOT_OPENCODE_PREFERRED_PORT || '11200';
 const BACKEND_URL = `http://127.0.0.1:${backendPort}`;
 const FRONTEND_DEV_URL = 'http://127.0.0.1:3000';
 const SHOP_BASE_URL = process.env.CODEBOT_SHOP_BASE_URL || 'https://shop.sanrenjz.com';

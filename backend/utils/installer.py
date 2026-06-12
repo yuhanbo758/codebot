@@ -4,6 +4,7 @@ OpenCode 安装检查工具
 import subprocess
 import sys
 import os
+import json
 import platform
 import shutil
 import socket
@@ -20,6 +21,18 @@ import httpx
 _opencode_server_process: Optional[subprocess.Popen] = None
 
 
+def _is_runnable_opencode_path(p: Path) -> bool:
+    if not p.is_file():
+        return False
+    if os.name == "nt" and p.suffix.lower() == ".exe":
+        try:
+            with open(p, "rb") as f:
+                return f.read(2) == b"MZ"
+        except Exception:
+            return False
+    return True
+
+
 def _collect_opencode_commands() -> List[List[str]]:
     commands: List[List[str]] = []
     seen = set()
@@ -28,19 +41,75 @@ def _collect_opencode_commands() -> List[List[str]]:
         key = str(p).strip().lower()
         if not key or key in seen:
             return
-        if p.exists():
+        if _is_runnable_opencode_path(p):
             seen.add(key)
             commands.append([str(p)])
 
-    configured_path = os.environ.get("CODEBOT_OPENCODE_PATH", "").strip()
-    if configured_path:
+    def _append_opencode_dir(directory: Path):
+        # Windows packaged / npm / scoop installs may expose either `opencode`
+        # or `opencode-ai` as the actual shim name. Probe both so the desktop
+        # app can still discover the CLI even when PATH differs from the shell.
+        if os.name == "nt":
+            base_names = ["opencode", "opencode-ai"]
+            suffixes = [".cmd", ".bat", ".ps1", ".exe", ""]
+        else:
+            base_names = ["opencode", "opencode-ai"]
+            suffixes = ["", ".exe"]
+        for base_name in base_names:
+            for suffix in suffixes:
+                _append_path(directory / f"{base_name}{suffix}")
+
+    def _append_windows_known_dirs():
+        if os.name != "nt":
+            return
+
+        candidate_dirs: List[Path] = []
+        seen_dirs = set()
+
+        def _append_dir(raw_dir):
+            if not raw_dir:
+                return
+            directory = Path(raw_dir)
+            key = str(directory).strip().lower()
+            if not key or key in seen_dirs:
+                return
+            seen_dirs.add(key)
+            candidate_dirs.append(directory)
+
+        user_profile = os.environ.get("USERPROFILE", "").strip()
+        app_data = os.environ.get("APPDATA", "").strip()
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        program_data = os.environ.get("ProgramData", "").strip()
+        home_dir = Path.home()
+
+        # Electron / packaged app processes often miss the user's shell PATH.
+        # Probe the most common Windows shim directories directly so model
+        # refresh can still find the same CLI that works in PowerShell.
+        _append_dir(Path(app_data) / "npm" if app_data else None)
+        _append_dir(Path(user_profile) / "AppData" / "Roaming" / "npm" if user_profile else None)
+        _append_dir(home_dir / "AppData" / "Roaming" / "npm")
+        _append_dir(Path(user_profile) / "scoop" / "shims" if user_profile else None)
+        _append_dir(home_dir / "scoop" / "shims")
+        _append_dir(Path(local_app_data) / "Microsoft" / "WinGet" / "Links" if local_app_data else None)
+        _append_dir(Path(program_data) / "chocolatey" / "bin" if program_data else None)
+
+        for directory in candidate_dirs:
+            _append_opencode_dir(directory)
+
+    configured_paths = [os.environ.get("CODEBOT_OPENCODE_PATH", "").strip()]
+    try:
+        from config import app_config
+        configured_paths.append(getattr(app_config.opencode, "cli_path", "").strip())
+    except Exception:
+        pass
+
+    for configured_path in configured_paths:
+        if not configured_path:
+            continue
         configured = Path(configured_path)
         candidates = [configured]
         if configured.is_dir():
-            candidates.extend([
-                configured / "opencode.exe",
-                configured / "opencode",
-            ])
+            _append_opencode_dir(configured)
         for p in candidates:
             _append_path(p)
 
@@ -48,30 +117,128 @@ def _collect_opencode_commands() -> List[List[str]]:
     #    Electron sets CODEBOT_RESOURCES_DIR to process.resourcesPath.
     resources_dir = os.environ.get("CODEBOT_RESOURCES_DIR", "").strip()
     if resources_dir:
-        candidates = [
-            Path(resources_dir) / "opencode" / "opencode.exe",
-            Path(resources_dir) / "opencode" / "opencode",
-        ]
-        for p in candidates:
-            _append_path(p)
+        _append_opencode_dir(Path(resources_dir) / "opencode")
 
     repo_root = Path(__file__).resolve().parents[2]
-    dev_candidates = [
-        repo_root / "electron" / "vendor" / "opencode" / "opencode.exe",
-        repo_root / "electron" / "vendor" / "opencode" / "opencode",
-        repo_root / "vendor" / "opencode" / "opencode.exe",
-        repo_root / "vendor" / "opencode" / "opencode",
-    ]
-    for p in dev_candidates:
-        _append_path(p)
+    for directory in [
+        repo_root / "electron" / "vendor" / "opencode",
+        repo_root / "vendor" / "opencode",
+    ]:
+        _append_opencode_dir(directory)
+
+    _append_windows_known_dirs()
 
     # 2. Fall back to system PATH
-    for name in ["opencode", "opencode-ai"]:
+    if os.name == "nt":
+        path_names = [
+            "opencode.cmd",
+            "opencode.bat",
+            "opencode.ps1",
+            "opencode.exe",
+            "opencode",
+            "opencode-ai.cmd",
+            "opencode-ai.bat",
+            "opencode-ai.ps1",
+            "opencode-ai.exe",
+            "opencode-ai",
+        ]
+    else:
+        path_names = ["opencode", "opencode-ai"]
+    for name in path_names:
         path_found = shutil.which(name)
         if path_found:
             _append_path(Path(path_found))
 
     return commands
+
+
+def collect_opencode_commands() -> List[List[str]]:
+    return _collect_opencode_commands()
+
+
+def _external_opencode_config_candidates() -> List[Path]:
+    candidates: List[Path] = []
+    seen = set()
+
+    def _append(path: Path):
+        key = str(path).strip().lower()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        candidates.append(path)
+
+    xdg_config_home = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    if xdg_config_home:
+        _append(Path(xdg_config_home) / "opencode" / "opencode.json")
+
+    app_data = os.environ.get("APPDATA", "").strip()
+    if app_data:
+        _append(Path(app_data) / "opencode" / "opencode.json")
+
+    # OpenCode CLI on this Windows machine stores config under ~/.config/opencode/.
+    _append(Path.home() / ".config" / "opencode" / "opencode.json")
+    _append(Path.home() / ".opencode" / "opencode.json")
+    return candidates
+
+
+def _sync_external_provider_config(managed_config_dir: Path) -> None:
+    """
+    Merge user-level provider definitions into Codebot's managed OpenCode config.
+
+    Codebot keeps its own MCP/skill config under DATA_DIR/opencode-config to avoid
+    mutating the user's global OpenCode setup. However, newly added providers
+    (such as volcengine) are usually saved in the global opencode.json. Copy only
+    the provider section so the managed server can load the same models while
+    preserving Codebot's isolated MCP bridge config.
+    """
+    managed_config_path = managed_config_dir / "opencode.json"
+    source_path: Optional[Path] = None
+    source_data: dict = {}
+    for candidate in _external_opencode_config_candidates():
+        if not candidate.exists():
+            continue
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("provider"), dict) and data["provider"]:
+            source_path = candidate
+            source_data = data
+            break
+
+    if not source_path:
+        return
+
+    try:
+        managed_data = json.loads(managed_config_path.read_text(encoding="utf-8")) if managed_config_path.exists() else {}
+    except Exception:
+        managed_data = {}
+    if not isinstance(managed_data, dict):
+        managed_data = {}
+
+    source_providers = source_data.get("provider") if isinstance(source_data.get("provider"), dict) else {}
+    managed_providers = managed_data.get("provider") if isinstance(managed_data.get("provider"), dict) else {}
+
+    merged_providers = dict(source_providers)
+    merged_providers.update(managed_providers)
+
+    if managed_providers == merged_providers:
+        return
+
+    managed_data["provider"] = merged_providers
+    managed_config_dir.mkdir(parents=True, exist_ok=True)
+    managed_config_path.write_text(
+        json.dumps(managed_data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    logger.info(
+        "已同步全局 OpenCode provider 配置到 Codebot managed config: "
+        f"{source_path} -> {managed_config_path}"
+    )
+
+
+def is_managed_opencode_server_running() -> bool:
+    return _opencode_server_process is not None and _opencode_server_process.poll() is None
 
 
 def _find_opencode_command() -> Optional[List[str]]:
@@ -315,10 +482,15 @@ async def start_opencode_server(port: int = 11200) -> int:
             opencode_config_dir = str(Path.home() / ".codebot" / "opencode-config")
 
         # 确保 opencode 配置目录存在
-        Path(opencode_config_dir).mkdir(parents=True, exist_ok=True)
+        managed_config_dir = Path(opencode_config_dir)
+        managed_config_dir.mkdir(parents=True, exist_ok=True)
+        _sync_external_provider_config(managed_config_dir)
 
         # 构建子进程环境变量：
-        # - XDG_CONFIG_HOME 覆盖配置主目录，opencode 将在其下建立 opencode/opencode.json
+        # - 使用 OPENCODE_CONFIG_HOME 指向 managed config 目录
+        # - 不再同时覆写 XDG_CONFIG_HOME；实测这会让 opencode 回到另一套
+        #   配置解析分支，导致 data/opencode-config/opencode.json 中的新
+        #   provider（如 volcengine）无法被当前 server 加载
         # - 保留原有环境，以免 PATH 等必要变量丢失
         proc_env = dict(os.environ)
         # Desktop OpenCode injects these variables into child processes. If they
@@ -333,11 +505,8 @@ async def start_opencode_server(port: int = 11200) -> int:
             "OPENCODE_RUN_ID",
         ]:
             proc_env.pop(key, None)
-        # opencode 遵循 XDG Base Directory 规范，配置读写路径为 $XDG_CONFIG_HOME/opencode/
-        # 将其重定向到 codebot 数据目录下，与系统级 ~/.config/opencode/ 完全隔离
-        xdg_config_parent = str(Path(opencode_config_dir).parent)
-        proc_env["XDG_CONFIG_HOME"] = xdg_config_parent
-        # 同时设置 OPENCODE_CONFIG_HOME（opencode 未来可能支持的专属变量）
+        # 明确移除 XDG 覆盖，只保留 OPENCODE_CONFIG_HOME。
+        proc_env.pop("XDG_CONFIG_HOME", None)
         proc_env["OPENCODE_CONFIG_HOME"] = opencode_config_dir
 
         stdout_file = open(stdout_path, "a", encoding="utf-8")
@@ -388,8 +557,26 @@ def stop_opencode_server():
     try:
         logger.info("正在停止 codebot 管理的 OpenCode 实例...")
         proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.warning("OpenCode 实例未及时退出，正在强制结束...")
+            proc.kill()
+            proc.wait(timeout=5)
     except Exception:
         pass
+
+
+async def restart_managed_opencode_server(port: int = 11200) -> int:
+    """Restart only Codebot's own OpenCode process on the same configured port."""
+    if not is_managed_opencode_server_running():
+        return 0
+    stop_opencode_server()
+    for _ in range(20):
+        if not _is_port_open("127.0.0.1", port):
+            break
+        await asyncio.sleep(0.25)
+    return await start_opencode_server(port)
 
 
 if __name__ == "__main__":

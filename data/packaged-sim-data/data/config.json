@@ -1,0 +1,117 @@
+{
+  "version": "4.0.0",
+  "general": {
+    "language": "zh-CN",
+    "compact_mode": false,
+    "opencode_cli_display": true,
+    "link_open_mode": "system",
+    "file_storage_path": "",
+    "file_search_dirs": [],
+    "chat_default_model": "",
+    "growth_candidate_decision": false,
+    "task_candidate_notification_enabled": true
+  },
+  "memory": {
+    "auto_cleanup_enabled": false,
+    "cleanup_days": 180,
+    "cleanup_archived_memories": true,
+    "archive_enabled": true,
+    "archive_days": 90,
+    "vector_search_top_k": 5,
+    "similarity_threshold": 0.7,
+    "show_archived_in_search": true,
+    "organize_enabled": true,
+    "organize_chat_enabled": true,
+    "organize_time": "03:00",
+    "organize_last_run": null,
+    "organize_model": null
+  },
+  "logs": {
+    "task_log_retention_days": 30,
+    "chat_log_retention_days": 30,
+    "system_log_retention_days": 7,
+    "log_level": "INFO"
+  },
+  "notification": {
+    "app_enabled": true,
+    "desktop_enabled": false,
+    "lark_enabled": false,
+    "lark_webhook_url": null,
+    "lark_secret": null,
+    "email_enabled": false,
+    "email_smtp_host": "smtp.gmail.com",
+    "email_smtp_port": 587,
+    "email_username": "",
+    "email_password": "",
+    "email_from": "",
+    "email_to": [],
+    "poll_interval": 30
+  },
+  "lark_bot": {
+    "enabled": false,
+    "connection_mode": "ws",
+    "app_id": "",
+    "app_secret": "",
+    "verify_token": "",
+    "encrypt_key": "",
+    "receive_id_type": "chat_id"
+  },
+  "opencode": {
+    "server_url": "http://127.0.0.1:11200",
+    "cli_path": "",
+    "auto_install": true,
+    "auto_start": true
+  },
+  "models": {
+    "primary_model": "",
+    "multimodal_model": "",
+    "models": []
+  },
+  "network": {
+    "host": "0.0.0.0",
+    "port": 15682
+  },
+  "integration": {
+    "modelscope_api_key": ""
+  },
+  "skills": {
+    "custom_skill_dirs": []
+  },
+  "hermes": {
+    "enabled": true,
+    "auto_start": true,
+    "repo_url": "https://github.com/NousResearch/hermes-agent",
+    "install_dir": "",
+    "cli_path": "hermes",
+    "share_models": true,
+    "share_memory": true,
+    "share_scheduler": true,
+    "skill_dirs": [],
+    "last_action": "",
+    "last_status": "",
+    "last_message": ""
+  },
+  "obsidian": {
+    "enabled": true,
+    "cli_path": "obsidian-cli",
+    "vault_path": "",
+    "knowledge_bases": []
+  },
+  "sandbox": {
+    "execution_mode": "auto",
+    "enabled": false,
+    "workspace_dir": "",
+    "exec_timeout": 300,
+    "network_enabled": true,
+    "runtime_binary": "",
+    "image_path": "",
+    "memory_mb": 2048,
+    "startup_timeout": 60,
+    "ipc_dir": "",
+    "auto_download": false,
+    "extra_qemu_args": [],
+    "snapshot_mode": false,
+    "image_url": "",
+    "runtime_url": ""
+  }
+}

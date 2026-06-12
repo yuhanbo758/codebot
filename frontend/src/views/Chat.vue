@@ -505,9 +505,10 @@
                       :key="m.id"
                       :label="m.name"
                       :value="m.id"
+                      :disabled="m.runnable === false"
                     >
                       <span class="model-option-name">{{ m.model }}</span>
-                      <span class="model-option-provider">{{ m.provider }}</span>
+                      <span class="model-option-provider">{{ m.runnable === false ? `${m.provider} · 未加载` : m.provider }}</span>
                     </el-option>
                   </template>
                   <template v-else>
@@ -521,9 +522,10 @@
                         :key="m.id"
                         :label="m.name"
                         :value="m.id"
+                        :disabled="m.runnable === false"
                       >
                         <span class="model-option-name">{{ m.model }}</span>
-                        <span class="model-option-provider">{{ m.provider }}</span>
+                        <span class="model-option-provider">{{ m.runnable === false ? `${m.provider} · 未加载` : m.provider }}</span>
                       </el-option>
                     </el-option-group>
                   </template>
@@ -532,7 +534,7 @@
                   size="small"
                   text
                   :loading="modelsLoading"
-                  @click="loadModels"
+                  @click="loadModels({ manual: true })"
                   title="刷新模型列表"
                   class="refresh-btn"
                 >
@@ -1607,7 +1609,13 @@ const normalizeModelId = (modelId) => {
   const model = modelAliases[rawModel] || rawModel
   return `${provider}/${model}`
 }
-const makeModelOption = (id) => ({ id, name: id, provider: id.split('/')[0] || '', model: id.split('/')[1] || id })
+const makeModelOption = (id, extra = {}) => ({
+  id,
+  name: id,
+  provider: id.split('/')[0] || '',
+  model: id.split('/')[1] || id,
+  ...extra
+})
 const _savedModel = normalizeModelId(localStorage.getItem(LAST_MODEL_KEY) || '')
 if (_savedModel) localStorage.setItem(LAST_MODEL_KEY, _savedModel)
 const selectedModel = ref(_savedModel)
@@ -2027,7 +2035,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
       continue
     }
     if (event?.type === 'error' && assistantMsg) {
-      assistantMsg.content = event.message || '执行失败'
+      assistantMsg.content = event.message || event.error || '执行失败'
       assistantMsg.streaming = false
     }
     if (running && (event?.type === 'done' || event?.type === 'error') && !assistantMsg) {
@@ -2041,7 +2049,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
           : sanitizeStreamContent(event.content || runtimeContent || assistantMsg.content)
         assistantMsg.streaming = false
       } else {
-        assistantMsg.content = event.message || '执行失败'
+        assistantMsg.content = event.message || event.error || '执行失败'
         assistantMsg.streaming = false
       }
     }
@@ -2185,17 +2193,28 @@ const loadConversations = async (autoSelect = false) => {
 }
 
 // 加载可用模型列表
-const loadModels = async () => {
+const loadModels = async (options = {}) => {
+  const manual = Boolean(options?.manual)
   modelsLoading.value = true
   try {
     const res = await axios.get('/api/chat/models')
+    if (manual && res.data?.success === false) {
+      ElMessage.error(res.data?.message || '刷新模型列表失败')
+    }
     const raw = res.data?.data?.models || []
     const newList = raw.map(m => {
-      if (typeof m === 'string') return { id: m, name: m, provider: '', model: m }
+      if (typeof m === 'string') return makeModelOption(m, { runnable: true, source: 'server' })
       const id = m.id || m.modelID || m.name || ''
       const provider = m.provider || id.split('/')[0] || ''
       const model = m.model || id.split('/')[1] || id
-      return { id, name: m.name || id, provider, model }
+      return {
+        id,
+        name: m.name || id,
+        provider,
+        model,
+        source: m.source || '',
+        runnable: m.runnable !== false,
+      }
     }).filter(m => m.id)
 
     // 如果用户有已保存的模型，且新列表中没有对应条目，则保留一个占位条目以避免 el-select 显示空值
@@ -2204,9 +2223,12 @@ const loadModels = async () => {
       selectedModel.value = saved
     }
     if (saved && !newList.find(m => m.id === saved)) {
-      newList.push(makeModelOption(saved))
+      newList.push(makeModelOption(saved, { runnable: false, source: 'saved' }))
     }
     availableModels.value = newList
+    if (manual && res.data?.message) {
+      ElMessage.warning(res.data.message)
+    }
   } catch {
     // 加载失败时，如果有已保存模型，保留其占位条目
     const saved = normalizeModelId(selectedModel.value)
@@ -2214,9 +2236,12 @@ const loadModels = async () => {
       selectedModel.value = saved
     }
     if (saved) {
-      availableModels.value = [makeModelOption(saved)]
+      availableModels.value = [makeModelOption(saved, { runnable: false, source: 'saved' })]
     } else {
       availableModels.value = []
+    }
+    if (manual) {
+      ElMessage.error('刷新模型列表失败')
     }
   } finally {
     modelsLoading.value = false
@@ -2927,6 +2952,9 @@ const sendMessage = async () => {
 
   incrementLoading(conversationId)
 
+  let assistantMessage = null
+  let flushPendingDelta = () => {}
+
   try {
     await axios.post(`/api/chat/conversations/${conversationId}/messages`, {
       content: displayContent
@@ -2946,7 +2974,7 @@ const sendMessage = async () => {
       scrollToBottom(true)
     }
 
-    const assistantMessage = {
+    assistantMessage = {
       id: Date.now() + 1,
       role: 'assistant',
       content: '',
@@ -2964,7 +2992,7 @@ const sendMessage = async () => {
 
     let pendingDelta = ''
     let flushScheduled = false
-    const flushPendingDelta = () => {
+    flushPendingDelta = () => {
       if (!pendingDelta) return
       // 将新增 delta 追加到累积内容后，再整体清洗一次
       // 整体清洗确保跨 delta 的标签（如 <think> 开始在一个 delta，结束在另一个）能被正确处理
@@ -3073,6 +3101,11 @@ const sendMessage = async () => {
 
   } catch (error) {
     const msg = error?.message || '发送消息失败'
+    if (assistantMessage) {
+      flushPendingDelta()
+      assistantMessage.content = msg === '发送消息失败' ? msg : `发送消息失败：${msg}`
+      assistantMessage.streaming = false
+    }
     ElMessage.error(msg === '发送消息失败' ? msg : `发送消息失败：${msg}`)
   } finally {
     decrementLoading(conversationId)

@@ -89,6 +89,7 @@ class GeneralConfig(BaseModel):
 class OpenCodeConfig(BaseModel):
     """OpenCode 配置"""
     server_url: str = "http://127.0.0.1:11200"
+    cli_path: str = ""
     auto_install: bool = True
     auto_start: bool = True
 
