@@ -140,7 +140,7 @@
             <template v-for="msg in messages" :key="msg.id">
               <!-- 工具步骤事件：独立气泡展示，不显示头像 -->
               <div v-if="msg.role === 'event'" class="message event-message">
-                <div class="tool-event-item">
+                <div class="tool-event-item" :class="classifyHermesEventClass(msg.event)">
                   <div class="tool-event-header" @click="toggleEventDetails(msg)">
                     <span class="tool-event-type">{{ toolEventLabel(msg.event) }}</span>
                     <span class="tool-event-summary">{{ toolEventSummary(msg.event) }}</span>
@@ -178,14 +178,14 @@
                         <div class="question-panel-options">
                           <button
                             v-for="option in currentQuestionPanelQuestion(msg.event)?.options || []"
-                            :key="option.label"
+                            :key="option.value || option.label"
                             type="button"
                             class="question-option"
-                            :class="{ picked: isQuestionOptionPicked(msg.event, option.label) }"
+                            :class="{ picked: isQuestionOptionPicked(msg.event, option.value || option.label) }"
                             :disabled="isQuestionPanelSending(msg.event)"
-                            @click="toggleQuestionOption(msg.event, option.label)"
+                            @click="toggleQuestionOption(msg.event, option.value || option.label)"
                           >
-                            <span class="question-option-mark" :class="{ multi: currentQuestionPanelQuestion(msg.event)?.multiple, picked: isQuestionOptionPicked(msg.event, option.label) }"></span>
+                            <span class="question-option-mark" :class="{ multi: currentQuestionPanelQuestion(msg.event)?.multiple, picked: isQuestionOptionPicked(msg.event, option.value || option.label) }"></span>
                             <span class="question-option-main">
                               <span class="question-option-label">{{ option.label }}</span>
                               <span v-if="option.description" class="question-option-description">{{ option.description }}</span>
@@ -206,12 +206,21 @@
                             </span>
                           </button>
                           <el-input
-                            v-if="currentQuestionPanelQuestion(msg.event)?.custom && isQuestionCustomEnabled(msg.event)"
+                            v-if="currentQuestionPanelQuestion(msg.event)?.custom && isQuestionCustomEnabled(msg.event) && currentQuestionPanelQuestion(msg.event)?.input_type === 'password'"
+                            :model-value="currentQuestionCustomValue(msg.event)"
+                            type="password"
+                            show-password
+                            placeholder="输入自定义回答"
+                            :disabled="isQuestionPanelSending(msg.event)"
+                            @update:model-value="updateQuestionCustomValue(msg.event, $event)"
+                          />
+                          <el-input
+                            v-else-if="currentQuestionPanelQuestion(msg.event)?.custom && isQuestionCustomEnabled(msg.event)"
                             :model-value="currentQuestionCustomValue(msg.event)"
                             type="textarea"
                             :rows="2"
                             resize="none"
-                            placeholder="输入自定义回答"
+                            :placeholder="currentQuestionPanelQuestion(msg.event)?.placeholder || '输入自定义回答'"
                             :disabled="isQuestionPanelSending(msg.event)"
                             @update:model-value="updateQuestionCustomValue(msg.event, $event)"
                           />
@@ -312,14 +321,14 @@
                         <div class="question-panel-options">
                           <button
                             v-for="option in currentQuestionPanelQuestion(msg.pendingActionEvent)?.options || []"
-                            :key="option.label"
+                            :key="option.value || option.label"
                             type="button"
                             class="question-option"
-                            :class="{ picked: isQuestionOptionPicked(msg.pendingActionEvent, option.label) }"
+                            :class="{ picked: isQuestionOptionPicked(msg.pendingActionEvent, option.value || option.label) }"
                             :disabled="isQuestionPanelSending(msg.pendingActionEvent)"
-                            @click="toggleQuestionOption(msg.pendingActionEvent, option.label)"
+                            @click="toggleQuestionOption(msg.pendingActionEvent, option.value || option.label)"
                           >
-                            <span class="question-option-mark" :class="{ multi: currentQuestionPanelQuestion(msg.pendingActionEvent)?.multiple, picked: isQuestionOptionPicked(msg.pendingActionEvent, option.label) }"></span>
+                            <span class="question-option-mark" :class="{ multi: currentQuestionPanelQuestion(msg.pendingActionEvent)?.multiple, picked: isQuestionOptionPicked(msg.pendingActionEvent, option.value || option.label) }"></span>
                             <span class="question-option-main">
                               <span class="question-option-label">{{ option.label }}</span>
                               <span v-if="option.description" class="question-option-description">{{ option.description }}</span>
@@ -340,12 +349,21 @@
                             </span>
                           </button>
                           <el-input
-                            v-if="currentQuestionPanelQuestion(msg.pendingActionEvent)?.custom && isQuestionCustomEnabled(msg.pendingActionEvent)"
+                            v-if="currentQuestionPanelQuestion(msg.pendingActionEvent)?.custom && isQuestionCustomEnabled(msg.pendingActionEvent) && currentQuestionPanelQuestion(msg.pendingActionEvent)?.input_type === 'password'"
+                            :model-value="currentQuestionCustomValue(msg.pendingActionEvent)"
+                            type="password"
+                            show-password
+                            placeholder="输入自定义回答"
+                            :disabled="isQuestionPanelSending(msg.pendingActionEvent)"
+                            @update:model-value="updateQuestionCustomValue(msg.pendingActionEvent, $event)"
+                          />
+                          <el-input
+                            v-else-if="currentQuestionPanelQuestion(msg.pendingActionEvent)?.custom && isQuestionCustomEnabled(msg.pendingActionEvent)"
                             :model-value="currentQuestionCustomValue(msg.pendingActionEvent)"
                             type="textarea"
                             :rows="2"
                             resize="none"
-                            placeholder="输入自定义回答"
+                            :placeholder="currentQuestionPanelQuestion(msg.pendingActionEvent)?.placeholder || '输入自定义回答'"
                             :disabled="isQuestionPanelSending(msg.pendingActionEvent)"
                             @update:model-value="updateQuestionCustomValue(msg.pendingActionEvent, $event)"
                           />
@@ -701,10 +719,11 @@
             </div>
           </div>
 
-          <!-- 生成技能对话框（对接 /api/skills/generate） -->
-          <el-dialog v-model="showSkillDialog" title="AI 生成技能" width="520px">
+          <!-- 生成技能对话框（优先 find-skills，再按需走 skill-creator） -->
+          <el-dialog v-model="showSkillDialog" title="生成技能" width="520px">
             <p style="margin: 0 0 12px; color: #606266; font-size: 14px;">
-              描述你需要的技能功能，AI 将自动生成完整的技能并保存到技能库。
+              描述你需要的技能功能。Codebot 会先调用 `find-skills` 搜索并评估现有 skill，
+              贴合度足够时直接下载并改造；否则改走 `skill-creator` 创建新 skill，最终统一保存到“自动生成”目录。
             </p>
             <el-input
               v-model="skillGenDescription"
@@ -1061,7 +1080,13 @@ const skillGenDescription = ref('')
 // Agent 模式：'build' = 默认, 'plan', 'build'
 const AGENT_MODE_KEY = 'codebot:agentMode'
 const agentMode = ref(localStorage.getItem(AGENT_MODE_KEY) || 'build')
-watch(agentMode, (val) => { localStorage.setItem(AGENT_MODE_KEY, val) })
+let applyingConversationUiState = false
+watch(agentMode, (val) => {
+  if (!applyingConversationUiState) {
+    localStorage.setItem(AGENT_MODE_KEY, val || 'build')
+    saveCurrentConversationTargetState()
+  }
+})
 
 // 项目文件夹（每个对话独立）
 const currentProjectDir = ref('')
@@ -1395,9 +1420,20 @@ const chatTarget = computed(() => {
 const applyConversationTargetState = (conversationId) => {
   const state = loadConversationTargetMap()[String(conversationId)] || {}
   const target = state.target || 'codebot'
-  hermesEnabled.value = Boolean(state.hermes_enabled ?? (target === 'hermes'))
-  obsidianEnabled.value = Boolean(state.obsidian_enabled ?? (target === 'obsidian' || (state.knowledge_bases || []).length > 0))
-  selectedKnowledgeBases.value = Array.isArray(state.knowledge_bases) ? state.knowledge_bases : []
+  applyingConversationUiState = true
+  try {
+    hermesEnabled.value = Boolean(state.hermes_enabled ?? (target === 'hermes'))
+    obsidianEnabled.value = Boolean(state.obsidian_enabled ?? (target === 'obsidian' || (state.knowledge_bases || []).length > 0))
+    selectedKnowledgeBases.value = Array.isArray(state.knowledge_bases) ? state.knowledge_bases : []
+    agentMode.value = state.mode || localStorage.getItem(AGENT_MODE_KEY) || 'build'
+    const model = normalizeModelId(state.model || localStorage.getItem(LAST_MODEL_KEY) || selectedModel.value || '')
+    selectedModel.value = model
+    ensureSelectedModelOption(model)
+  } finally {
+    nextTick(() => {
+      applyingConversationUiState = false
+    })
+  }
 }
 
 const saveCurrentConversationTargetState = () => {
@@ -1407,16 +1443,28 @@ const saveCurrentConversationTargetState = () => {
     target: chatTarget.value || 'codebot',
     hermes_enabled: hermesEnabled.value,
     obsidian_enabled: obsidianEnabled.value,
-    knowledge_bases: selectedKnowledgeBases.value || []
+    knowledge_bases: selectedKnowledgeBases.value || [],
+    mode: agentMode.value || 'build',
+    model: selectedModel.value || ''
   }
   saveConversationTargetMap(map)
 }
 
 const resetCurrentConversationTargetState = () => {
-  hermesEnabled.value = false
-  obsidianEnabled.value = false
-  selectedKnowledgeBases.value = []
-  saveCurrentConversationTargetState()
+  applyingConversationUiState = true
+  try {
+    hermesEnabled.value = false
+    obsidianEnabled.value = false
+    selectedKnowledgeBases.value = []
+    agentMode.value = localStorage.getItem(AGENT_MODE_KEY) || 'build'
+    selectedModel.value = normalizeModelId(localStorage.getItem(LAST_MODEL_KEY) || selectedModel.value || '')
+    ensureSelectedModelOption(selectedModel.value)
+  } finally {
+    nextTick(() => {
+      applyingConversationUiState = false
+      saveCurrentConversationTargetState()
+    })
+  }
 }
 
 const toggleHermesMode = () => {
@@ -1616,6 +1664,13 @@ const makeModelOption = (id, extra = {}) => ({
   model: id.split('/')[1] || id,
   ...extra
 })
+const ensureSelectedModelOption = (modelId) => {
+  const id = normalizeModelId(modelId)
+  if (!id) return
+  if (!availableModels.value.find((item) => item.id === id)) {
+    availableModels.value = [makeModelOption(id, { runnable: false, source: 'saved' }), ...availableModels.value]
+  }
+}
 const _savedModel = normalizeModelId(localStorage.getItem(LAST_MODEL_KEY) || '')
 if (_savedModel) localStorage.setItem(LAST_MODEL_KEY, _savedModel)
 const selectedModel = ref(_savedModel)
@@ -1639,11 +1694,19 @@ const syncChatDefaultModel = async (modelId) => {
 }
 
 watch(selectedModel, (val) => {
+  const normalized = normalizeModelId(val)
+  if (normalized && normalized !== val) {
+    selectedModel.value = normalized
+    return
+  }
+  ensureSelectedModelOption(normalized)
+  if (applyingConversationUiState) return
   if (val) {
     localStorage.setItem(LAST_MODEL_KEY, val)
   } else {
     localStorage.removeItem(LAST_MODEL_KEY)
   }
+  saveCurrentConversationTargetState()
   syncChatDefaultModel(val || '')
 })
 
@@ -1838,9 +1901,10 @@ const notifyActionRequiredEvent = (event) => {
   const key = event.request_id || event?.data?.id || event?.data?.requestID || `${event.event_type}:${event.summary}`
   if (!key || actionRequiredEventSeen.value[key]) return
   actionRequiredEventSeen.value = { ...actionRequiredEventSeen.value, [key]: true }
+  const sourceLabel = eventSourceName(event) === 'hermes' ? 'Hermes' : 'OpenCode'
   ElMessage({
     type: 'warning',
-    message: event.summary || 'OpenCode 正在等待你的选择',
+    message: event.summary || `${sourceLabel} 正在等待你的选择`,
     duration: 8000,
     showClose: true,
   })
@@ -1854,6 +1918,7 @@ const looksLikeCliOutput = (content = '') => {
 
 const isCliDisplayMessage = (msg) => {
   if (msg?.role !== 'assistant') return false
+  if (msg?.source === 'hermes') return false
   return Boolean(msg.cli_display || (opencodeCliDisplay.value && looksLikeCliOutput(msg.content)))
 }
 
@@ -1866,6 +1931,12 @@ const attachCliActionEvent = (assistantMsg, event) => {
 
 const shouldShowStructuredEvent = (event) => {
   if (!event) return false
+  if (
+    eventSourceName(event) === 'hermes'
+    && ['session.status', 'session.idle', 'session.trace', 'session.retry'].includes(event?.event_type)
+  ) {
+    return true
+  }
   if (event.type === 'tool_event') {
     return ['tool', 'tool-call', 'tool-result', 'patch', 'file', 'subtask'].includes(event.event_type)
   }
@@ -1893,6 +1964,19 @@ const createStructuredEventMessage = (conversationId, event, seq) => ({
 
 const cacheStructuredEventMessage = (conversationId, eventMsg) => {
   const convEvents = perConversationEventMessages.value[conversationId] || []
+  const key = eventActionKey(eventMsg?.event)
+  if (key) {
+    const index = convEvents.findIndex((item) => eventActionKey(item?.event) === key)
+    if (index >= 0) {
+      const nextEvents = [...convEvents]
+      nextEvents[index] = eventMsg
+      perConversationEventMessages.value = {
+        ...perConversationEventMessages.value,
+        [conversationId]: nextEvents
+      }
+      return
+    }
+  }
   perConversationEventMessages.value = {
     ...perConversationEventMessages.value,
     [conversationId]: [...convEvents, eventMsg]
@@ -1922,6 +2006,40 @@ const eventActionKey = (event) => {
   const kind = eventActionKind(event)
   const id = eventRequestId(event)
   return kind && id ? `${kind}:${id}` : ''
+}
+
+const eventSourceName = (event) => String(event?.source || event?.data?.source || '').toLowerCase()
+
+const shouldUseChatEventPanel = (event) => (
+  eventSourceName(event) === 'hermes'
+  && event?.requires_user_action
+  && event?.event_type === 'question.asked'
+)
+
+const upsertStructuredEventMessage = (conversationId, event, anchorMsg = null) => {
+  if (currentConversationId.value !== conversationId || !event) return null
+  const key = eventActionKey(event)
+  let existing = null
+  if (key) {
+    existing = messages.value.find((msg) => msg?.role === 'event' && eventActionKey(msg?.event) === key)
+  }
+  if (existing) {
+    existing.event = event
+    cacheStructuredEventMessage(conversationId, existing)
+    notifyActionRequiredEvent(event)
+    return existing
+  }
+
+  const eventMsg = createStructuredEventMessage(conversationId, event)
+  const anchorIndex = anchorMsg ? messages.value.findIndex((msg) => msg.id === anchorMsg.id) : -1
+  if (anchorIndex >= 0) {
+    messages.value.splice(anchorIndex + 1, 0, eventMsg)
+  } else {
+    messages.value.push(eventMsg)
+  }
+  cacheStructuredEventMessage(conversationId, eventMsg)
+  notifyActionRequiredEvent(event)
+  return eventMsg
 }
 
 const isActionResolvedEvent = (event) => [
@@ -1993,6 +2111,7 @@ const ensureRuntimeAssistant = (conversationId) => {
 const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => {
   if (currentConversationId.value !== conversationId) return
   const seen = new Set(runtimeEventSeqSeen.value[conversationId] || [])
+  const runtimeHasHermes = (events || []).some((event) => eventSourceName(event) === 'hermes' || event?.source === 'hermes')
   let assistantMsg = null
   const newEventMsgs = []
   for (const event of (events || [])) {
@@ -2001,7 +2120,14 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
     if (seq > 0) seen.add(seq)
     if (event?.type === 'tool_event' || event?.type === 'meta_event') {
       resolvePendingActionEvents(conversationId, event)
-      if (event?.cli_inline || opencodeCliDisplay.value) {
+      const eventSource = String(event?.source || event?.data?.source || '').toLowerCase()
+      const forceStructuredEvent = eventSource === 'hermes' && !event?.requires_user_action
+      if (shouldUseChatEventPanel(event)) {
+        assistantMsg = assistantMsg || ensureRuntimeAssistant(conversationId)
+        upsertStructuredEventMessage(conversationId, event, assistantMsg)
+        continue
+      }
+      if (!forceStructuredEvent && (event?.cli_inline || opencodeCliDisplay.value)) {
         assistantMsg = assistantMsg || ensureRuntimeAssistant(conversationId)
         attachCliActionEvent(assistantMsg, event)
         continue
@@ -2074,6 +2200,10 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
     assistantMsg = assistantMsg || ensureRuntimeAssistant(conversationId)
   }
   if (assistantMsg) {
+    if (runtimeHasHermes) {
+      assistantMsg.source = 'hermes'
+      assistantMsg.cli_display = false
+    }
     if (typeof runtimeContent === 'string' && runtimeContent) {
       assistantMsg.content = assistantMsg.cli_display ? runtimeContent : sanitizeStreamContent(runtimeContent)
     }
@@ -2285,6 +2415,9 @@ const createNewConversation = async () => {
 // 选择对话
 const selectConversation = async (conversationId) => {
   shouldAutoScroll.value = true
+  if (currentConversationId.value && currentConversationId.value !== conversationId) {
+    saveCurrentConversationTargetState()
+  }
   currentConversationId.value = conversationId
   localStorage.setItem(LAST_CONVERSATION_KEY, String(conversationId))
   try {
@@ -2354,6 +2487,8 @@ const toolEventLabel = (event) => {
     'todo.updated': '待办',
     'session.status': '会话状态',
     'session.idle': '会话状态',
+    'session.trace': '运行轨迹',
+    'session.retry': '自动重试',
     'session.error': '会话错误',
     'message.updated': '消息状态',
     'message.part.updated': '消息片段',
@@ -2389,6 +2524,15 @@ const toolEventDetail = (event) => {
   return ''
 }
 
+const classifyHermesEventClass = (event) => {
+  if ((event?.source || event?.data?.source || '').toLowerCase() !== 'hermes') return ''
+  if (event?.event_type === 'session.idle') return 'hermes-idle'
+  if (event?.event_type === 'session.status') return 'hermes-status'
+  if (event?.event_type === 'session.trace') return 'hermes-trace'
+  if (event?.event_type === 'tool-call') return 'hermes-tool'
+  return ''
+}
+
 const toolEventActions = (event) => {
   if (!event || event.replied || shouldShowQuestionPanel(event)) return []
   return Array.isArray(event.actions) ? event.actions : []
@@ -2405,10 +2549,11 @@ const normalizeQuestionPanelOptions = (options) => {
   if (!Array.isArray(options)) return []
   return options
     .map((option) => {
-      if (typeof option === 'string') return { label: option.trim(), description: '' }
+      if (typeof option === 'string') return { label: option.trim(), value: option.trim(), description: '' }
       if (!option || typeof option !== 'object') return null
       return {
         label: String(option.label || '').trim(),
+        value: String(option.value || option.label || '').trim(),
         description: String(option.description || '').trim(),
       }
     })
@@ -2439,6 +2584,8 @@ const normalizeQuestionPanelQuestion = (question, event) => {
     question: String(question?.question || event?.question || event?.summary || 'OpenCode 正在等待你的选择').trim(),
     multiple: Boolean(question?.multiple),
     custom: question?.custom !== false,
+    input_type: String(question?.input_type || question?.inputType || 'textarea').trim().toLowerCase(),
+    placeholder: String(question?.placeholder || '').trim(),
     options: rawOptions.length > 0 ? rawOptions : fallbackOptions,
   }
 }
@@ -2662,24 +2809,27 @@ const permissionReplyLabel = (reply) => {
 const replyQuestion = async (event, actionOrReply) => {
   const action = typeof actionOrReply === 'string' ? { reply: actionOrReply } : (actionOrReply || {})
   const requestId = event?.request_id || event?.data?.id || event?.data?.requestID
+  const sourceLabel = (event?.source || event?.data?.source || '').toLowerCase() === 'hermes' ? 'Hermes' : 'OpenCode'
   if (!requestId) {
-    ElMessage.error('缺少 OpenCode 问题请求 ID')
+    ElMessage.error(`缺少${sourceLabel}问题请求 ID`)
     return false
   }
   let payload = {
     request_id: requestId,
     conversation_id: currentConversationId.value,
     project_dir: currentProjectDir.value || null,
+    source: event?.source || event?.data?.source || '',
+    response_dir: event?.data?.response_dir || '',
   }
   if (action.reply === 'question_reject') {
     payload.reject = true
   } else if (action.custom) {
     try {
-      const result = await ElMessageBox.prompt(event?.question || event?.summary || '请输入回答', '回复 OpenCode', {
+      const result = await ElMessageBox.prompt(event?.question || event?.summary || '请输入回答', `回复${sourceLabel}`, {
         confirmButtonText: '发送',
         cancelButtonText: '取消',
-        inputType: 'textarea',
-        inputPlaceholder: '输入你的回答'
+        inputType: (event?.questions?.[0]?.input_type || event?.data?.questions?.[0]?.input_type || event?.data?.input_type || 'textarea') === 'password' ? 'password' : 'textarea',
+        inputPlaceholder: event?.questions?.[0]?.placeholder || event?.data?.questions?.[0]?.placeholder || event?.data?.placeholder || '输入你的回答'
       })
       const answer = String(result?.value || '').trim()
       if (!answer) {
@@ -2706,10 +2856,10 @@ const replyQuestion = async (event, actionOrReply) => {
     event.summary = payload.reject ? '你已取消/先不回答' : `你已选择：${payload.answer || (payload.answers || []).map((group) => (group || []).join(', ')).join('；')}`
     event.actions = []
     clearQuestionPanelState(event)
-    ElMessage.success('已回复 OpenCode')
+    ElMessage.success(payload.source === 'hermes' ? '已回复 Hermes' : '已回复 OpenCode')
     return true
   } catch (error) {
-    ElMessage.error(error?.response?.data?.detail || '回复 OpenCode 问题失败')
+    ElMessage.error(error?.response?.data?.detail || (payload.source === 'hermes' ? '回复 Hermes 问题失败' : '回复 OpenCode 问题失败'))
     return false
   } finally {
     event.replying = ''
@@ -2853,7 +3003,7 @@ const sendMessage = async () => {
       return
     }
     clearPendingQuestionEvent(pendingQuestionEvent)
-    ElMessage.warning('上一个 OpenCode 问题已失效，已按普通消息发送')
+    ElMessage.warning(`上一个${(pendingQuestionEvent?.source || pendingQuestionEvent?.data?.source || '').toLowerCase() === 'hermes' ? 'Hermes' : 'OpenCode'}问题已失效，已按普通消息发送`)
   }
 
   inputMessage.value = ''
@@ -2977,10 +3127,10 @@ const sendMessage = async () => {
     assistantMessage = {
       id: Date.now() + 1,
       role: 'assistant',
-      content: '',
-      rawContent: '',
+      content: targetToSend === 'hermes' ? 'Hermes CLI 已启动，正在处理...' : '',
+      rawContent: targetToSend === 'hermes' ? 'Hermes CLI 已启动，正在处理...' : '',
       tool_events: [],
-      cli_display: opencodeCliDisplay.value,
+      cli_display: targetToSend === 'hermes' ? false : opencodeCliDisplay.value,
       source: targetToSend === 'hermes' ? 'hermes' : '',
       pendingActionEvent: null,
       streaming: true,
@@ -3044,7 +3194,14 @@ const sendMessage = async () => {
         }
         if (event?.type === 'tool_event' || event?.type === 'meta_event') {
           resolvePendingActionEvents(conversationId, event)
-          if (event?.cli_inline || assistantMessage.cli_display || opencodeCliDisplay.value) {
+          const eventSource = String(event?.source || event?.data?.source || '').toLowerCase()
+          const forceStructuredEvent = eventSource === 'hermes' && !event?.requires_user_action
+          if (shouldUseChatEventPanel(event)) {
+            upsertStructuredEventMessage(conversationId, event, assistantMessage)
+            scheduleStreamScroll()
+            return
+          }
+          if (!forceStructuredEvent && (event?.cli_inline || assistantMessage.cli_display || opencodeCliDisplay.value)) {
             attachCliActionEvent(assistantMessage, event)
             scheduleStreamScroll()
             return
@@ -3121,7 +3278,7 @@ const uploadImage = () => {
   triggerFileUpload()
 }
 
-// 生成技能 — 调用 /api/skills/generate（与技能页面一致）
+// 生成技能：后端会先走 find-skills 检索，再决定改造现有 skill 还是调用 skill-creator 创建。
 const generateSkill = async () => {
   if (!skillGenDescription.value.trim()) {
     ElMessage.warning('请输入技能描述')
@@ -3132,7 +3289,11 @@ const generateSkill = async () => {
     const response = await axios.post('/api/skills/generate', {
       description: skillGenDescription.value.trim()
     })
-    ElMessage.success(response.data.message || '技能已生成，可在技能页面查看')
+    const strategy = response?.data?.data?.strategy
+    const strategyLabel = strategy === 'find-skills-adapt'
+      ? '已通过 find-skills 检索并改造'
+      : '已通过 skill 工作流生成'
+    ElMessage.success(response.data.message || `${strategyLabel}，可在技能页面查看`)
     showSkillDialog.value = false
     skillGenDescription.value = ''
   } catch (error) {
@@ -3756,10 +3917,10 @@ onUnmounted(() => {
 }
 
 .question-panel {
-  background: #111318;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 14px;
-  color: #f3f5f7;
+  background: #ffffff;
+  border: 1px solid #dcdfe6;
+  border-radius: 8px;
+  color: #303133;
   padding: 14px;
   display: flex;
   flex-direction: column;
@@ -3776,7 +3937,7 @@ onUnmounted(() => {
 
 .question-panel-title {
   font-size: 12px;
-  color: #9aa4b2;
+  color: #409eff;
   font-weight: 600;
 }
 
@@ -3790,7 +3951,7 @@ onUnmounted(() => {
   height: 6px;
   border: 0;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.12);
+  background: #dcdfe6;
   cursor: pointer;
 }
 
@@ -3799,7 +3960,7 @@ onUnmounted(() => {
 }
 
 .question-progress-dot.answered {
-  box-shadow: inset 0 0 0 1px rgba(64, 158, 255, 0.4);
+  box-shadow: inset 0 0 0 1px #409eff;
 }
 
 .question-panel-body {
@@ -3811,12 +3972,12 @@ onUnmounted(() => {
 .question-panel-question {
   font-size: 15px;
   font-weight: 600;
-  color: #f3f5f7;
+  color: #303133;
 }
 
 .question-panel-hint {
   font-size: 12px;
-  color: #9aa4b2;
+  color: #909399;
 }
 
 .question-panel-options {
@@ -3827,10 +3988,10 @@ onUnmounted(() => {
 
 .question-option {
   width: 100%;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.03);
-  color: inherit;
-  border-radius: 12px;
+  border: 1px solid #dcdfe6;
+  background: #ffffff;
+  color: #303133;
+  border-radius: 8px;
   padding: 12px;
   display: flex;
   align-items: flex-start;
@@ -3841,15 +4002,15 @@ onUnmounted(() => {
 
 .question-option:hover,
 .question-option.picked {
-  border-color: rgba(64, 158, 255, 0.55);
-  background: rgba(64, 158, 255, 0.12);
+  border-color: #409eff;
+  background: #ecf5ff;
 }
 
 .question-option-mark {
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  border: 2px solid #6b7280;
+  border: 2px solid #909399;
   margin-top: 1px;
   flex: 0 0 auto;
   position: relative;
@@ -3882,12 +4043,12 @@ onUnmounted(() => {
 .question-option-label {
   font-size: 14px;
   font-weight: 600;
-  color: #f3f5f7;
+  color: #303133;
 }
 
 .question-option-description {
   font-size: 12px;
-  color: #9aa4b2;
+  color: #606266;
   line-height: 1.5;
 }
 
@@ -3898,15 +4059,15 @@ onUnmounted(() => {
 }
 
 .question-panel :deep(.el-textarea__inner) {
-  background: rgba(255, 255, 255, 0.04);
-  border-color: rgba(255, 255, 255, 0.1);
-  color: #f3f5f7;
+  background: #ffffff;
+  border-color: #dcdfe6;
+  color: #303133;
 }
 
 .question-panel :deep(.el-button:not(.el-button--primary)) {
-  background: rgba(255, 255, 255, 0.04);
-  border-color: rgba(255, 255, 255, 0.1);
-  color: #f3f5f7;
+  background: #ffffff;
+  border-color: #dcdfe6;
+  color: #606266;
 }
 
 .tool-events {
@@ -3937,6 +4098,22 @@ onUnmounted(() => {
 
 .compact-mode .tool-event-item {
   padding: 3px 8px;
+}
+
+.tool-event-item.hermes-tool {
+  background: #eef6ff;
+  border-color: #c6e2ff;
+}
+
+.tool-event-item.hermes-trace {
+  background: #f6f8fa;
+  border-color: #e5e7eb;
+}
+
+.tool-event-item.hermes-status,
+.tool-event-item.hermes-idle {
+  background: #fff8e8;
+  border-color: #f3d19e;
 }
 
 .tool-event-header {
@@ -4454,4 +4631,3 @@ onUnmounted(() => {
   margin-left: 3px;
 }
 </style>
-

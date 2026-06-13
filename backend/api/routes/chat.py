@@ -282,6 +282,8 @@ class QuestionReplyRequest(BaseModel):
     reject: bool = False
     conversation_id: Optional[int] = None
     project_dir: Optional[str] = None
+    source: Optional[str] = None
+    response_dir: Optional[str] = None
 
 class UpdateTitleRequest(BaseModel):
     title: str
@@ -1727,14 +1729,10 @@ async def _sync_codebot_as_third_party():
     mcp_router.ensure_codebot_remote_mcp_in_opencode()
 
 
-async def _execute_hermes_proxy(
+def _prepare_hermes_proxy_request(
     message: str,
-    model: Optional[str] = None,
-    conversation_id: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
-) -> str:
-    from api.routes import hermes as hermes_router
-
+) -> Tuple[str, List[str], Optional[dict], bool]:
     selected_skill = None
     cleaned_message = message
     hermes_skills: List[str] = []
@@ -1758,11 +1756,42 @@ async def _execute_hermes_proxy(
             )
             if "obsidian" not in {name.lower() for name in hermes_skills}:
                 hermes_skills.append("obsidian")
+    # Hermes can execute its native skills and Codebot writable skills, but some
+    # OpenCode-shared skills still stall inside Hermes' own runtime. When the
+    # user explicitly points to an OpenCode-root skill, transparently delegate
+    # that turn back to the parent OpenCode execution chain instead of letting
+    # Hermes hang in a silent subprocess.
+    should_delegate_to_opencode = bool(selected_skill and selected_skill.get("source") == OPENCODE)
+    return hermes_message, hermes_skills, selected_skill, should_delegate_to_opencode
+
+
+async def _execute_hermes_proxy(
+    message: str,
+    model: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    knowledge_paths: Optional[List[str]] = None,
+) -> str:
+    from api.routes import hermes as hermes_router
+
+    hermes_message, hermes_skills, _, should_delegate_to_opencode = _prepare_hermes_proxy_request(
+        message,
+        knowledge_paths,
+    )
 
     conv_id = str(conversation_id) if conversation_id is not None else ""
     if conv_id:
         mark_conversation_running(conv_id)
     try:
+        if should_delegate_to_opencode:
+            return await _execute_opencode(
+                message,
+                model=model,
+                mode="agent",
+                conversation_id=conversation_id,
+                project_dir=None,
+                target="codebot",
+                knowledge_paths=knowledge_paths,
+            )
         response = await hermes_router.hermes_chat(
             hermes_router.HermesChatRequest(
                 message=hermes_message,
@@ -1775,6 +1804,124 @@ async def _execute_hermes_proxy(
     finally:
         if conv_id:
             unmark_conversation_running(conv_id)
+
+
+async def _stream_hermes_proxy_events(
+    message: str,
+    model: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+    knowledge_paths: Optional[List[str]] = None,
+):
+    from api.routes import hermes as hermes_router
+
+    hermes_message, hermes_skills, selected_skill, should_delegate_to_opencode = _prepare_hermes_proxy_request(
+        message,
+        knowledge_paths,
+    )
+    conv_id = str(conversation_id) if conversation_id is not None else ""
+    content = ""
+    if conv_id:
+        mark_conversation_running(conv_id)
+    try:
+        if should_delegate_to_opencode:
+            skill_name = str(
+                (selected_skill or {}).get("slug")
+                or (selected_skill or {}).get("name")
+                or "OpenCode 共享 skill"
+            )
+            yield {
+                "type": "meta_event",
+                "source": "hermes",
+                "event_type": "session.compat",
+                "summary": f"Hermes 检测到共享 skill `{skill_name}`，已切换到 OpenCode 原生执行",
+                "detail": (
+                    "该 skill 来自 OpenCode 共享目录。运行时证据表明这类 skill 在 Hermes 子进程中"
+                    "可能长时间静默卡住，因此 Codebot 会透明委托给 OpenCode CLI 执行，"
+                    "避免暗箱等待。"
+                ),
+                "data": {
+                    "source": "hermes",
+                    "delegate": "opencode",
+                    "skill_name": skill_name,
+                    "skill_source": (selected_skill or {}).get("source"),
+                },
+            }
+            async for delegated_event in _stream_execute_opencode_with_meta(
+                message,
+                model=model,
+                mode="agent",
+                conversation_id=conversation_id,
+                project_dir=None,
+                target="codebot",
+                knowledge_paths=knowledge_paths,
+            ):
+                yield delegated_event
+            return
+        async for hermes_event in hermes_router.run_hermes_oneshot_stream(
+            message=hermes_message,
+            model=model or "",
+            system=None,
+            conversation_id=conversation_id,
+            skills=hermes_skills,
+        ):
+            event_type = hermes_event.get("type")
+            if event_type == "stdout":
+                delta = hermes_event.get("delta") or ""
+                content = hermes_event.get("content") or f"{content}{delta}"
+                if delta:
+                    yield {
+                        "type": "content_delta",
+                        "delta": delta,
+                        "content": content,
+                        "source": "hermes",
+                        "cli_display": False,
+                    }
+                continue
+            if event_type == "interaction":
+                event = hermes_event.get("event") if isinstance(hermes_event.get("event"), dict) else {}
+                if event:
+                    yield event
+                continue
+            if event_type == "event":
+                event = hermes_event.get("event") if isinstance(hermes_event.get("event"), dict) else {}
+                if event:
+                    yield event
+                continue
+            if event_type == "done":
+                content = (hermes_event.get("output") or hermes_event.get("final") or content or "").strip()
+                returncode = hermes_event.get("returncode")
+                if returncode not in (0, None):
+                    detail = content or "Hermes CLI failed"
+                    raise HTTPException(status_code=502, detail=detail)
+                continue
+            if event_type == "aborted":
+                raise HTTPException(
+                    status_code=499,
+                    detail=hermes_event.get("output") or "Hermes CLI task was aborted",
+                )
+            if event_type == "error":
+                raise HTTPException(
+                    status_code=int(hermes_event.get("status_code") or 502),
+                    detail=hermes_event.get("message") or "Hermes CLI failed",
+                )
+    finally:
+        if conv_id:
+            unmark_conversation_running(conv_id)
+
+    yield {
+        "type": "status",
+        "phase": "hermes_cli",
+        "source": "hermes",
+        "message": "Hermes Agent CLI completed",
+    }
+    yield {
+        "type": "done",
+        "content": _sanitize_assistant_output(content or "", user_message=message),
+        "parts": [],
+        "source": "hermes",
+        "agent": "Hermes Agent CLI",
+        "cli_display": False,
+    }
 
 
 async def _execute_opencode(
@@ -1920,27 +2067,13 @@ async def _stream_execute_opencode_with_meta(
         return
 
     if (target or "").strip().lower() == "hermes":
-        model_text = f"（模型：{model}）" if model else ""
-        yield {
-            "type": "content_delta",
-            "delta": f"Hermes Agent CLI 正在处理{model_text}...\n\n",
-            "content": f"Hermes Agent CLI 正在处理{model_text}...\n\n",
-            "source": "hermes",
-        }
-        content = await _execute_hermes_proxy(message, model=model, conversation_id=conversation_id, knowledge_paths=knowledge_paths)
-        yield {
-            "type": "status",
-            "phase": "hermes_cli",
-            "source": "hermes",
-            "message": "Hermes Agent CLI completed",
-        }
-        yield {
-            "type": "done",
-            "content": _sanitize_assistant_output(content or "", user_message=message),
-            "parts": [],
-            "source": "hermes",
-            "agent": "Hermes Agent CLI",
-        }
+        async for event in _stream_hermes_proxy_events(
+            message,
+            model=model,
+            conversation_id=conversation_id,
+            knowledge_paths=knowledge_paths,
+        ):
+            yield event
         return
 
     try:
@@ -2725,6 +2858,12 @@ def _extract_requested_skill(message: str) -> Tuple[Optional[dict], str, bool]:
     text = message or ""
     registry = get_skill_registry()
 
+    def _clean_invocation_text(start: int, end: int) -> str:
+        cleaned = f"{text[:start]} {text[end:]}".strip()
+        cleaned = re.sub(r"^[\s，,。：:；;、]+", "", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        return cleaned or text
+
     marker = re.search(r"使用技能\[([^\]]+)\]", text)
     if marker:
         skill_id = marker.group(1).strip()
@@ -2739,11 +2878,31 @@ def _extract_requested_skill(message: str) -> Tuple[Optional[dict], str, bool]:
         cleaned = (text[:slash.start()] + text[slash.end():]).strip()
         return item, cleaned or text, bool(item and item.get("source") == OPENCODE)
 
-    natural = re.search(r"(?:使用|调用|启用)\s+(.{1,80}?)\s+技能", text)
+    explicit_skill = re.search(
+        r"(?:使用|调用|启用|use|invoke|call|enable)\s+[`\"]?([A-Za-z0-9_./:-]{1,120})[`\"]?\s+(?:技能|skill)(?![A-Za-z0-9_-])",
+        text,
+        re.IGNORECASE,
+    )
+    if explicit_skill:
+        query = explicit_skill.group(1).strip()
+        item = registry.find(query) or registry.find_by_query(query, allow_opencode=True)
+        cleaned = _clean_invocation_text(explicit_skill.start(), explicit_skill.end())
+        return item, cleaned, bool(item and item.get("source") == OPENCODE)
+
+    ascii_skill = re.search(r"([A-Za-z0-9_./:-]{1,120})\s+skill\b", text, re.IGNORECASE)
+    if ascii_skill:
+        query = ascii_skill.group(1).strip().strip("`'\"")
+        item = registry.find(query) or registry.find_by_query(query, allow_opencode=True)
+        if item:
+            cleaned = _clean_invocation_text(ascii_skill.start(), ascii_skill.end())
+            return item, cleaned, bool(item and item.get("source") == OPENCODE)
+
+    natural = re.search(r"(?:使用|调用|启用)\s+(.{1,80}?)\s+(?:技能|skill)\b", text, re.IGNORECASE)
     if natural:
         query = natural.group(1).strip()
         item = registry.find_by_query(query, allow_opencode=True)
-        return item, text, bool(item and item.get("source") == OPENCODE)
+        cleaned = _clean_invocation_text(natural.start(), natural.end())
+        return item, cleaned, bool(item and item.get("source") == OPENCODE)
 
     return None, text, False
 
@@ -2885,9 +3044,16 @@ async def _build_opencode_prompt_parts(
         system_lines.append(_build_skill_system_context(selected_skill))
 
     normalized_target = (target or "codebot").strip().lower()
-    if normalized_target == "hermes":
-        system_lines.append(_build_hermes_context(model=model))
-    elif normalized_target == "obsidian":
+    if normalized_target == "obsidian":
+        # Obsidian target should actively bias the agent toward the Obsidian
+        # skill/toolchain instead of only attaching note snippets as passive
+        # context.
+        obsidian_skill = get_skill_registry().find_by_query("obsidian", allow_opencode=True)
+        if obsidian_skill and not selected_skill:
+            selected_skill = obsidian_skill
+            opencode_skill_fallback = bool(obsidian_skill.get("source") == OPENCODE)
+        elif obsidian_skill and selected_skill and obsidian_skill.get("id") != selected_skill.get("id"):
+            system_lines.append(_build_skill_system_context(obsidian_skill))
         obsidian_context = _build_obsidian_context(cleaned_message or raw_message, knowledge_paths)
         if obsidian_context:
             system_lines.append(obsidian_context)
@@ -3970,6 +4136,8 @@ def _build_obsidian_context(message: str, knowledge_paths: Optional[List[str]]) 
     lines = [
         "Obsidian mode is active. Treat configured Obsidian vaults and knowledge folders as plain Markdown sources.",
         "Use obsidian-cli when available for Obsidian actions such as search, templates, note creation, moves, and wiki-link-safe operations.",
+        "Preserve native Obsidian wiki structure, including wikilinks [[Note]], embeds ![[Note]], YAML frontmatter, tags, callouts, and relative Markdown organization.",
+        "When a template is needed, prefer the vault's existing template workflow instead of inventing a new format.",
         "Do not create a vector database for these knowledge bases; preserve and inspect Markdown files directly.",
         "Selected knowledge roots:",
     ]
@@ -3980,28 +4148,6 @@ def _build_obsidian_context(message: str, knowledge_paths: Optional[List[str]]) 
             snippet = (note.get("snippet") or "")[:1200]
             lines.append(f"\n## {note.get('relative_path')}\nPath: {note.get('path')}\n```markdown\n{snippet}\n```")
     return "\n".join(lines)
-
-
-def _build_hermes_context(model: Optional[str] = None) -> str:
-    try:
-        from api.routes.hermes import write_bridge_config
-        bridge_path = write_bridge_config()
-    except Exception:
-        bridge_path = settings.DATA_DIR / "hermes" / "codebot_bridge.json"
-    background_model = app_config.memory.organize_model or app_config.general.chat_default_model or ""
-    active_model = model or app_config.general.chat_default_model or ""
-    return (
-        "Hermes mode is active. Process this turn as Hermes Agent, with Codebot acting only as the message relay UI.\n"
-        "Use Codebot shared resources instead of asking the user to configure separate models.\n"
-        f"OpenCode server URL: {app_config.opencode.server_url}\n"
-        f"Main chat model: {active_model}\n"
-        f"Background memory organization model: {background_model}\n"
-        f"Shared memory database: {settings.CONVERSATIONS_DB}\n"
-        f"Shared scheduler database: {settings.SCHEDULED_TASKS_DB}\n"
-        f"Shared Codebot skills directory: {settings.SKILLS_DIR}\n"
-        f"Hermes bridge config: {bridge_path}\n"
-        "Hermes skills, memory, scheduled automations, and model availability should be treated as shared with Codebot."
-    )
 
 
 @router.post("/upload_file")
@@ -4797,8 +4943,10 @@ async def _notify_opencode_action_required(conversation_id: int, event: dict):
         _opencode_action_notification_keys.clear()
         _opencode_action_notification_keys.add(key)
 
-    title = "OpenCode 等待你的选择"
-    summary = str(event.get("summary") or "有一个 OpenCode 操作需要确认")
+    source = str(event.get("source") or (event.get("data") or {}).get("source") or "").strip().lower()
+    actor = "Hermes" if source == "hermes" else "OpenCode"
+    title = f"{actor} 等待你的选择"
+    summary = str(event.get("summary") or f"有一个 {actor} 操作需要确认")
     message = f"{summary}\n\n对话ID: {conversation_id}\n请回到 Codebot 聊天窗口处理。"
     try:
         from api.routes import notifications as notifications_router
@@ -4815,7 +4963,7 @@ async def _notify_opencode_action_required(conversation_id: int, event: dict):
             )
         )
     except Exception as exc:
-        logger.debug(f"OpenCode 操作提醒发送失败（跳过）: {exc}")
+        logger.debug(f"{actor} 操作提醒发送失败（跳过）: {exc}")
 
 
 def _opencode_cli_display_enabled() -> bool:
@@ -5182,7 +5330,8 @@ async def send_to_opencode_stream(request: SendMessageRequest):
             parts: List[dict] = []
             internal_prompt: str = ""
             tool_events_log: List[dict] = []
-            cli_display = _opencode_cli_display_enabled()
+            is_hermes_target = (request.target or "").strip().lower() == "hermes"
+            cli_display = _opencode_cli_display_enabled() and not is_hermes_target
             cli_seen: set[str] = set()
             cli_text_started = False
             async for stream_event in _stream_execute_opencode_with_meta(
@@ -5216,6 +5365,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                             "delta": delta,
                             "content": content,
                             "cli_display": True,
+                            "source": stream_event.get("source") or ("hermes" if is_hermes_target else None),
                         })
                         continue
                     next_content = _sanitize_assistant_output(raw_content, user_message=request.message)
@@ -5252,6 +5402,19 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                             _runtime_append_event(conv_id, converted)
                             await event_queue.put(converted)
                             await _notify_opencode_action_required(request.conversation_id, converted)
+                    elif stream_event.get("event_type"):
+                        tool_events_log.append(stream_event)
+                        event_to_send = stream_event
+                        if cli_display and stream_event.get("requires_user_action"):
+                            event_to_send = {**stream_event, "cli_inline": True}
+                        _runtime_append_event(conv_id, event_to_send)
+                        await event_queue.put(event_to_send)
+                        await _notify_opencode_action_required(request.conversation_id, event_to_send)
+                    continue
+                if event_type == "meta_event":
+                    _runtime_append_event(conv_id, stream_event)
+                    await event_queue.put(stream_event)
+                    await _notify_opencode_action_required(request.conversation_id, stream_event)
                     continue
                 if event_type == "opencode_event":
                     converted = _opencode_event_to_stream_event(stream_event)
@@ -5353,8 +5516,14 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                 logger.warning(f"聊天日志保存失败（跳过）: {_log_err}")
 
             asyncio.create_task(_drain_queue(conv_id, request.conversation_id))
-            _runtime_append_event(conv_id, {"type": "done", "content": content or "", "cli_display": cli_display})
-            await event_queue.put({"type": "done", "content": content or "", "cli_display": cli_display})
+            done_event = {
+                "type": "done",
+                "content": content or "",
+                "cli_display": cli_display,
+                "source": "hermes" if is_hermes_target else "opencode",
+            }
+            _runtime_append_event(conv_id, done_event)
+            await event_queue.put(done_event)
         except Exception as e:
             _runtime_append_event(conv_id, {"type": "error", "message": str(e)})
             await event_queue.put({"type": "error", "message": str(e)})
@@ -5432,6 +5601,39 @@ async def reply_opencode_question(request: QuestionReplyRequest):
     request_id = (request.request_id or "").strip()
     if not request_id:
         raise HTTPException(status_code=400, detail="缺少 question 请求 ID")
+
+    if (request.source or "").strip().lower() == "hermes" or request_id.startswith("hermes-"):
+        from api.routes import hermes as hermes_router
+
+        answers = request.answers
+        answer = (request.answer or "").strip()
+        if not request.reject and answers is None and not answer:
+            raise HTTPException(status_code=400, detail="缺少问题回答")
+        success = hermes_router.reply_hermes_interaction(
+            request_id=request_id,
+            answers=answers,
+            answer=answer,
+            reject=request.reject,
+            response_dir=request.response_dir,
+        )
+        if not success:
+            raise HTTPException(status_code=502, detail="回复 Hermes 问题失败")
+        if request.reject:
+            reply_text = "已取消/先不回答"
+        elif answer:
+            reply_text = answer
+        else:
+            reply_text = "；".join(", ".join(group or []) for group in (answers or []))
+        if request.conversation_id:
+            _runtime_append_event(str(request.conversation_id), {
+                "type": "meta_event",
+                "event_type": "question.local_reply",
+                "summary": f"你已回复：{reply_text}",
+                "detail": "",
+                "source": "hermes",
+                "data": {"request_id": request_id, "reply": reply_text, "rejected": request.reject, "source": "hermes"},
+            })
+        return {"success": True, "message": "已回复 Hermes 问题"}
 
     client = opencode_ws or OpenCodeClient(app_config.opencode.server_url)
     ok = await _ensure_opencode_client_connected(client)

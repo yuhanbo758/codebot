@@ -45,6 +45,7 @@ data/*.db
 data/*.json
 data/chroma/
 data/chroma_v2/
+data/hermes/
 data/sandbox/
 *.qcow2
 data/backups/*.zip

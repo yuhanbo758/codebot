@@ -1,5 +1,13 @@
 <template>
   <div class="obsidian-settings">
+    <el-alert
+      class="settings-alert"
+      title="Obsidian 兼容说明"
+      type="info"
+      :closable="false"
+      show-icon
+      description="Codebot 会把 Obsidian 库和知识库路径当作原生 Markdown / wiki 结构直接处理，优先调用 obsidian-cli 与相关 Obsidian skill；不会为这些知识库生成向量库，避免内容丢失。"
+    />
     <el-form :model="form" label-width="150px" v-loading="loading">
       <el-form-item label="启用 Obsidian">
         <el-switch v-model="form.enabled" />
@@ -106,6 +114,10 @@ onMounted(load)
 <style scoped>
 .obsidian-settings {
   padding: 20px;
+}
+
+.settings-alert {
+  margin-bottom: 16px;
 }
 
 .kb-list {

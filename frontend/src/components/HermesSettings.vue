@@ -37,6 +37,13 @@
             <el-icon><Plus /></el-icon>
             添加目录
           </el-button>
+          <div v-if="sharedSkillDirs.length" class="dir-tip">
+            以下目录由 Codebot 自动并入 Hermes 的有效 skill 根目录，包含 Hermes Agent 默认 skill 目录、OpenCode CLI skills，以及 Codebot 内置/自动生成 skills。
+          </div>
+          <div v-for="dir in sharedSkillDirs" :key="`shared-${dir}`" class="dir-row dir-row--readonly">
+            <el-input :model-value="dir" readonly />
+            <el-tag type="info">自动共享</el-tag>
+          </div>
         </div>
       </el-form-item>
 
@@ -98,6 +105,13 @@
         <span>后台模型</span>
         <code>{{ status.background_model || '-' }}</code>
       </div>
+      <div class="status-row status-row--top">
+        <span>生效 Skill 目录</span>
+        <div class="skill-dir-preview">
+          <code v-for="dir in effectiveSkillDirs" :key="`effective-${dir}`">{{ dir }}</code>
+          <code v-if="!effectiveSkillDirs.length">-</code>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -140,6 +154,8 @@ const bridgeText = computed(() => {
 })
 
 const codebotApp = computed(() => status.value?.codebot_app || {})
+const sharedSkillDirs = computed(() => status.value?.shared_skill_dirs || [])
+const effectiveSkillDirs = computed(() => status.value?.skill_dirs || [])
 
 const normalizedPayload = () => ({
   ...form.value,
@@ -180,7 +196,11 @@ const syncBridge = async () => {
   syncing.value = true
   try {
     const res = await axios.post('/api/hermes/sync')
-    status.value = { ...(status.value || {}), bridge_config_path: res.data?.data?.bridge_config_path }
+    const statusRes = await axios.get('/api/hermes/status')
+    status.value = {
+      ...(statusRes.data?.data || {}),
+      bridge_config_path: res.data?.data?.bridge_config_path || statusRes.data?.data?.bridge_config_path
+    }
     ElMessage.success('Hermes 共享配置已同步')
   } catch (error) {
     ElMessage.error(error?.response?.data?.detail || '同步失败')
@@ -221,6 +241,17 @@ onMounted(load)
   margin-bottom: 8px;
 }
 
+.dir-row--readonly :deep(.el-input__wrapper) {
+  background: var(--el-fill-color-light);
+}
+
+.dir-tip {
+  margin: 8px 0;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .action-row {
   display: flex;
   gap: 10px;
@@ -257,6 +288,10 @@ onMounted(load)
   min-height: 28px;
 }
 
+.status-row--top {
+  align-items: flex-start;
+}
+
 .status-row .el-link {
   justify-content: flex-start;
   word-break: break-all;
@@ -264,5 +299,11 @@ onMounted(load)
 
 .status-row code {
   word-break: break-all;
+}
+
+.skill-dir-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 </style>

@@ -51,7 +51,7 @@ opencode_ws: Optional[OpenCodeClient] = None
 # ── 请求/响应模型 ──────────────────────────────────────────────────────────
 
 class ChatMessage(BaseModel):
-    role: str  # "system" | "user" | "assistant"
+    role: str  # "system" | "developer" | "user" | "assistant"
     content: str
 
 class ChatCompletionRequest(BaseModel):
@@ -113,7 +113,7 @@ def _build_user_prompt(messages: List[ChatMessage]) -> tuple[str, Optional[str]]
     conversation_parts = []
     
     for msg in messages:
-        if msg.role == "system":
+        if msg.role in {"system", "developer"}:
             system_parts.append(msg.content)
         elif msg.role == "user":
             conversation_parts.append(f"用户: {msg.content}")

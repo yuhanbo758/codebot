@@ -278,6 +278,7 @@ codebot/
 - 支持在聊天中保存记忆（如"帮我记住 广东揭阳普宁船埔 这个地址""10月2日是姐姐的生日"，可在记忆中查看）
 - **意图分类**: 消息自动分类为"定时任务/保存记忆/普通对话"，避免误判
 - **Agent 模式**: 支持 `plan`（结构化规划）和 `build`（直接执行）两种模式
+- **对话级状态**: 每个普通对话会独立保存当前模式、模型、Hermes/Obsidian 目标和已选知识库；在 B 对话切换模型或处理目标，不会覆盖 A 对话原来的选择。新建对话仍会沿用最近主动选择的全局默认模型，创建后再形成自己的独立状态
 - 消息一键复制（Electron 使用系统剪贴板）
 - 支持文件附件上传；多模态模型支持图片分析
 - 支持截图后直接在聊天输入框粘贴图片，图片会自动作为附件加入当前消息
@@ -346,8 +347,8 @@ codebot/
 
 ### 1.2 Hermes / Obsidian / 文档入口
 
-- **Hermes 模式**: 在聊天页点击 `Hermes` 后，当前消息会交给 Hermes Agent CLI 的 `hermes -z` 处理；Codebot 会立即显示 Hermes CLI 正在处理、把发送按钮切到“处理中”，并支持用终止按钮结束当前 Hermes CLI 进程；最终回复仍回到当前聊天气泡中展示。Hermes 模式会通过共享配置、聊天后处理和成长候选流程衔接 Codebot 的模型、记忆、定时任务与技能目录。Hermes 模式下沉淀或创建的定时任务会记录 `executor=hermes`，后续到点触发时继续由 Hermes CLI 执行；OpenCode 模式创建的任务则记录 `executor=opencode`
-- **Obsidian 模式**: 在设置页配置 Obsidian 库路径后，可在聊天页通过 `#` 选择多个知识库路径；Codebot 会把这些 Markdown 知识库当成普通文件夹直接检索和引用，不会把它们先转成向量库
+- **Hermes 模式**: 在聊天页点击 `Hermes` 后，当前消息默认会交给 Codebot 管理目录中的 Hermes Agent CLI 处理。设置页中的 `Hermes` 标签位于“通用设置”右侧，提供“一键安装 / 一键修复 / 一键更新”，默认把 Hermes 安装到 Codebot 根目录下的 `hermes-agent/`。Codebot 只作为薄适配层：写入共享配置（模型网关、记忆库、定时任务库、技能目录和 Obsidian 路径），启动 Hermes CLI 子进程，把终端输出持续追加到当前聊天气泡；当 CLI 明确要求确认、继续、密码、密钥或输入时，会在聊天页显示交互面板，并把用户回答写回 Hermes stdin。若 CLI 长时间暂时没有正文输出，Codebot 会在聊天窗口中持续映射 Hermes 运行状态：包括 `session.status` 启动状态、`session.trace` 运行轨迹，以及非阻塞的 `session.idle` 后台心跳，明确告诉用户当前仍在处理、已静默多久、以及最后一条可见输出，避免出现“后台到底卡住还是正在处理”的黑箱感。为了更接近 OpenCode CLI 的可读性，Codebot 现在还会把明显像“加载 skill / 调用 tool / 扫描资源 / 运行步骤”的 Hermes 行优先归类成可见的“工具调用”事件，其余普通说明继续归类为“运行轨迹”，让中间过程和最终正文更清楚地区分。针对开发态排查中发现的“启动后长时间 0 输出但同消息重试可成功”的间歇性卡死，Codebot 现在会在 Hermes 启动后连续 90 秒仍无任何 stdout 时自动重试 1 次，仅针对尚未产生任何输出的启动阶段，不影响已经开始正常输出的长任务。重构后的 Hermes 接入不再导入 Hermes 内部 Agent 类，也不再依赖自定义 runner；聊天执行入口也已从顶层 `hermes -z/--oneshot` 切换为 Hermes 官方 `--cli chat -q` 单次查询路径，避免继续走 `oneshot` 那条“只输出最终结果并绕过 `cli.py`”的旁路。Hermes 的 skill 共享模型现在统一收敛为“目录共享”而不是“执行委派”：Codebot 会把 **Hermes Agent 自身默认可发现的 skill 目录**、**用户手动配置的 Hermes Skill 目录**、**Codebot 内置/自动生成 skills 目录**、以及 **OpenCode CLI skill roots** 一起并入 Hermes 的有效 `skills.external_dirs` / 共享上下文。这样 Hermes 自带 skill 与 OpenCode CLI skills 会在 Codebot 中一起被发现、展示，并且都能进入 Hermes 的实际可扫描 skill 根目录。对于“显式点名且来源于 OpenCode 共享目录”的 skill，Codebot 现在会先检测 Hermes 兼容分流：运行时证据表明某些 OpenCode-shared skill 会在 Hermes 子进程中长期静默卡住，因此这类请求会透明切换到 OpenCode 原生执行链，并在聊天中显示 `session.compat` 说明，避免暗箱等待。模型方面，Hermes 不要求用户单独配置模型：聊天主模型跟随当前聊天模型，后台辅助模型跟随“记忆 → 配置 → 自动整理 → 整理使用模型”，因此 Codebot 能调用的 OpenCode 模型，Hermes 也会共用同一套 `/v1` 网关。设置页中的“Hermes Skill 目录”会继续让用户维护自己的自定义目录，同时额外展示 Codebot 自动共享进去的只读目录，方便确认 Hermes 当前实际可扫描到的共享 skill 根路径。为避免开发版 Windows 环境下的中文乱码和终端样式污染，Codebot 现在会对 Hermes stdout 使用增量 UTF-8 解码，并过滤 ANSI 控制序列、Rich 边框、`Resume this session` / `session_id` / `Session` 等终端辅助行，只把更接近正文的内容映射到聊天消息。Hermes 执行超时按“空闲无输出/无交互”计算；终止按钮会结束当前 Hermes 进程。Hermes 模式下沉淀或创建的定时任务会记录 `executor=hermes`，后续到点触发时继续由 Hermes CLI 执行；OpenCode 模式创建的任务则记录 `executor=opencode`
+- **Obsidian 模式**: 设置页中的 `Obsidian` 标签支持配置默认 Vault 路径与多个知识库路径；聊天页通过 `#` 可多选知识库。Codebot 会把这些 Markdown 知识库当成原生 Obsidian wiki 结构直接处理，优先引导调用 `obsidian-cli` 与相关 Obsidian skill 去完成检索、模板调用、读取、写入、移动与 wiki-link 安全操作，不会把知识库先转成向量库
 - **技能搜索**: 聊天输入框中的 `@` 会搜索全部技能来源，包括 Codebot 内置/自动生成、OpenCode、Hermes Agent 与 OpenClaw，支持描述、单词和多词搜索
 - **命令搜索**: 聊天输入框中的 `/` 会搜索 OpenCode CLI 命令，并支持按描述、单词和多词进行匹配
 - **文档入口**: 设置页里的“文档”会直接渲染本 README，文档右上角可刷新，适合在改动配置、功能或使用方式后重新查看
@@ -414,7 +415,7 @@ codebot/
 - **低干扰注入**: 仅在高相关度下启用技能上下文，降低无关技能误触发
 - **内部上下文隔离**: 技能与 MCP 上下文仅用于内部推理，不向用户直接展示“技能参考”等标签
 - **自动沉淀技能**: 对高复用的已完成任务，自动生成可复用技能元数据，便于后续任务快速命中
-- **对话生成技能**: 本地规则生成，不调用 OpenCode，写入 `codebot/skills`
+- **对话生成技能**: 聊天页点击“生成技能”后，后端会先调用 `find-skills` 搜索并评估现有 skill；当最佳结果与需求差异小于 40%（即相似度至少 60%）时，Codebot 会基于该 skill 改造并保存；否则会继续调用 `skill-creator` 创建新 skill。最终产物统一迁移或写入 `skills/auto_*`，在技能页中归类为“自动生成”
 - **OpenCode 本地技能**: 自动读取 `~/.agents/skills`，可在技能页卸载
 - **自定义目录技能**: 支持配置多个外部文件夹路径，自动扫描其中包含 `SKILL.md` 的子目录并加载为只读技能，方便复用其他工具的技能文件
 - **技能市场**: 从 GitHub 安装技能（开发中）
@@ -679,7 +680,7 @@ npm run build
 - `DELETE /api/skills/{skill_id}` - 删除技能
 - `GET /api/skills/{skill_id}/content` - 读取 SKILL.md 内容
 - `PUT /api/skills/{skill_id}/content` - 更新 SKILL.md 内容
-- `POST /api/skills/generate` - 从对话生成技能
+- `POST /api/skills/generate` - 先经 `find-skills` 检索，再按需改造或调用 `skill-creator` 生成技能
 - `POST /api/skills/sync-to-opencode` - 高级导出接口，默认禁用；需设置 `CODEBOT_ALLOW_OPENCODE_SKILL_EXPORT=1`
 - `POST /api/skills/{skill_id}/sync-to-opencode` - 高级导出单个 Codebot 技能，默认禁用
 - `GET /api/skills/opencode-sync-status` - 获取历史导出状态和遗留 `codebot-*` 技能信息
