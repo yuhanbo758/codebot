@@ -22,7 +22,7 @@ from loguru import logger
 from config import settings, app_config
 from database.init_db import conversations_db
 from core.memory_manager import MemoryManager
-from core.opencode_ws import OpenCodeClient, _conversation_current_session, is_conversation_running, mark_conversation_running, unmark_conversation_running
+from core.opencode_ws import OpenCodeClient, _conversation_current_session, _conversation_current_workspace, is_conversation_running, mark_conversation_running, unmark_conversation_running
 from core.memory_extractor import extract_and_save_background, extract_candidates
 from core.growth import add_candidate, record_chat_growth_candidates
 from core.skill_generator import generate_skill_body_from_chat
@@ -1408,7 +1408,27 @@ async def _build_multi_agent_hub_reply(user_message: str, members: List[Dict], r
     return "\n".join(lines).strip()
 
 
-async def _execute_opencode_client(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None, system: Optional[str] = None, user_message: str = "") -> Tuple[Optional[str], bool]:
+def _resolve_opencode_workspace(project_dir: Optional[str] = None, target: Optional[str] = None) -> Optional[str]:
+    if (target or "").strip().lower() == "obsidian":
+        try:
+            settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
+            return str(settings.DATA_DIR.resolve())
+        except Exception:
+            return str(settings.BASE_DIR.resolve())
+
+    raw = (project_dir or "").strip()
+    if not raw:
+        return None
+    try:
+        path = Path(raw).expanduser()
+        if path.exists() and path.is_dir():
+            return str(path.resolve())
+    except Exception:
+        return None
+    return None
+
+
+async def _execute_opencode_client(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None, system: Optional[str] = None, user_message: str = "", workspace: Optional[str] = None) -> Tuple[Optional[str], bool]:
     client = opencode_ws
     created_client = False
     try:
@@ -1418,7 +1438,7 @@ async def _execute_opencode_client(message: str, model: Optional[str] = None, mo
         ok = await _ensure_opencode_client_connected(client)
         if not ok:
             return None, False
-        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id, system=system)
+        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id, system=system, workspace=workspace)
         if result.success:
             return _sanitize_assistant_output(result.content or "", user_message=user_message) or None, True
         return result.error or None, True
@@ -1439,7 +1459,8 @@ async def _execute_opencode_client_with_parts(
     mode: Optional[str] = None,
     conversation_id: Optional[str] = None,
     system: Optional[str] = None,
-    user_message: str = ""
+    user_message: str = "",
+    workspace: Optional[str] = None
 ) -> Tuple[Optional[str], bool, List[dict]]:
     client = opencode_ws
     created_client = False
@@ -1450,7 +1471,7 @@ async def _execute_opencode_client_with_parts(
         ok = await _ensure_opencode_client_connected(client)
         if not ok:
             return None, False, []
-        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id, system=system)
+        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id, system=system, workspace=workspace)
         if result.success:
             return _sanitize_assistant_output(result.content or "", user_message=user_message) or None, True, result.parts or []
         return result.error or None, True, []
@@ -1966,8 +1987,9 @@ async def _execute_opencode(
         knowledge_paths=knowledge_paths,
         model=model,
     )
+    workspace = _resolve_opencode_workspace(project_dir=project_dir, target=target)
     try:
-        content, _ = await _execute_opencode_client(user_message, model=model, mode=mode, conversation_id=conversation_id, system=system_prompt, user_message=message)
+        content, _ = await _execute_opencode_client(user_message, model=model, mode=mode, conversation_id=conversation_id, system=system_prompt, user_message=message, workspace=workspace)
         content = _sanitize_assistant_output(content or "", user_message=message)
 
         if not content:
@@ -2015,6 +2037,7 @@ async def _execute_opencode_with_meta(
         knowledge_paths=knowledge_paths,
         model=model,
     )
+    workspace = _resolve_opencode_workspace(project_dir=project_dir, target=target)
     try:
         content, _, parts = await _execute_opencode_client_with_parts(
             user_message,
@@ -2022,7 +2045,8 @@ async def _execute_opencode_with_meta(
             mode=mode,
             conversation_id=conversation_id,
             system=system_prompt,
-            user_message=message
+            user_message=message,
+            workspace=workspace
         )
         content = _sanitize_assistant_output(content or "", user_message=message)
 
@@ -2096,6 +2120,7 @@ async def _stream_execute_opencode_with_meta(
         knowledge_paths=knowledge_paths,
         model=model,
     )
+    workspace = _resolve_opencode_workspace(project_dir=project_dir, target=target)
     # 首先 yield 内部提示词事件，供聊天日志记录
     yield {"type": "internal_prompt", "prompt": f"[system]\n{system_prompt}\n\n[user]\n{user_message}"}
 
@@ -2114,7 +2139,8 @@ async def _stream_execute_opencode_with_meta(
             model=model,
             mode=mode,
             conversation_id=conversation_id,
-            system=system_prompt
+            system=system_prompt,
+            workspace=workspace
         ):
             yield event
     finally:
@@ -5815,6 +5841,7 @@ async def abort_task(request: AbortRequest):
             logger.warning(f"终止 session 出错: {e}")
         finally:
             _conversation_current_session.pop(target_id, None)
+            _conversation_current_workspace.pop(target_id, None)
             unmark_conversation_running(target_id)
 
     _runtime_append_event(conv_id, {"type": "error", "message": "任务已被用户终止"})

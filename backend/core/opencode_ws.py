@@ -18,6 +18,7 @@ from utils.installer import collect_opencode_commands
 # key: conversation_id (str), value: asyncio.Queue of coroutines
 _conversation_queues: dict = {}
 _conversation_current_session: dict = {}  # key: conversation_id -> current session_id
+_conversation_current_workspace: dict = {}  # key: conversation_id -> normalized workspace
 _conversation_running_counts: dict = {}  # key: conversation_id -> running task count
 _queue_lock = asyncio.Lock()
 
@@ -113,6 +114,15 @@ class OpenCodeClient:
             return f"{provider_id}/{raw_model_id}"
         return self._MODEL_ALIASES.get(model_id, model_id)
 
+    def _normalize_workspace_key(self, workspace: Optional[str]) -> str:
+        raw = (workspace or "").strip()
+        if not raw:
+            return ""
+        try:
+            return os.path.normcase(os.path.abspath(os.path.expanduser(raw)))
+        except Exception:
+            return raw.lower()
+
     def _build_prompt_payload(
         self,
         prompt: str,
@@ -206,6 +216,7 @@ class OpenCodeClient:
             session_id = await self._create_session(client=client, workspace=workspace)
             if conversation_id:
                 _conversation_current_session[str(conversation_id)] = session_id
+                _conversation_current_workspace[str(conversation_id)] = self._normalize_workspace_key(workspace)
             prompt_resp = await client.post(
                 f"{self.base_url}/session/{session_id}/prompt_async",
                 json=payload,
@@ -619,11 +630,14 @@ class OpenCodeClient:
     ) -> str:
         if conversation_id:
             conv_id = str(conversation_id)
+            workspace_key = self._normalize_workspace_key(workspace)
             existing = _conversation_current_session.get(conv_id)
-            if isinstance(existing, str) and existing:
+            existing_workspace = _conversation_current_workspace.get(conv_id, "")
+            if isinstance(existing, str) and existing and existing_workspace == workspace_key:
                 return existing
             created = await self._create_session(client=client, workspace=workspace)
             _conversation_current_session[conv_id] = created
+            _conversation_current_workspace[conv_id] = workspace_key
             return created
         return await self._create_session(client=client, workspace=workspace)
 
@@ -735,6 +749,7 @@ class OpenCodeClient:
                     tracked_session_ids = {session_id}
                     if conversation_id:
                         _conversation_current_session[str(conversation_id)] = session_id
+                        _conversation_current_workspace[str(conversation_id)] = self._normalize_workspace_key(workspace)
                     prompt_resp = await client.post(
                         f"{self.base_url}/session/{session_id}/prompt_async",
                         json=payload,
