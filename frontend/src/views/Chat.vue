@@ -1412,18 +1412,24 @@ const hermesEnabled = ref(false)
 const obsidianEnabled = ref(false)
 
 const chatTarget = computed(() => {
+  if (hermesEnabled.value && obsidianEnabled.value) return 'hermes_obsidian'
   if (hermesEnabled.value) return 'hermes'
   if (obsidianEnabled.value) return 'obsidian'
   return 'codebot'
 })
+
+const isHermesChatTarget = (target) => {
+  const value = String(target || '').trim().toLowerCase()
+  return value === 'hermes' || value.startsWith('hermes_')
+}
 
 const applyConversationTargetState = (conversationId) => {
   const state = loadConversationTargetMap()[String(conversationId)] || {}
   const target = state.target || 'codebot'
   applyingConversationUiState = true
   try {
-    hermesEnabled.value = Boolean(state.hermes_enabled ?? (target === 'hermes'))
-    obsidianEnabled.value = Boolean(state.obsidian_enabled ?? (target === 'obsidian' || (state.knowledge_bases || []).length > 0))
+    hermesEnabled.value = Boolean(state.hermes_enabled ?? isHermesChatTarget(target))
+    obsidianEnabled.value = Boolean(state.obsidian_enabled ?? (target === 'obsidian' || String(target || '').includes('obsidian') || (state.knowledge_bases || []).length > 0))
     selectedKnowledgeBases.value = Array.isArray(state.knowledge_bases) ? state.knowledge_bases : []
     agentMode.value = state.mode || localStorage.getItem(AGENT_MODE_KEY) || 'build'
     const model = normalizeModelId(state.model || localStorage.getItem(LAST_MODEL_KEY) || selectedModel.value || '')
@@ -2982,6 +2988,7 @@ const sendMessage = async () => {
   const content = inputMessage.value
   const filesToSend = [...attachedFiles.value]
   const targetToSend = chatTarget.value || 'codebot'
+  const isHermesTargetToSend = isHermesChatTarget(targetToSend)
   const knowledgePathsToSend = obsidianEnabled.value
     ? selectedKnowledgeBases.value.map((item) => item.id || item.path).filter(Boolean)
     : []
@@ -3127,11 +3134,11 @@ const sendMessage = async () => {
     assistantMessage = {
       id: Date.now() + 1,
       role: 'assistant',
-      content: targetToSend === 'hermes' ? 'Hermes CLI 已启动，正在处理...' : '',
-      rawContent: targetToSend === 'hermes' ? 'Hermes CLI 已启动，正在处理...' : '',
+      content: isHermesTargetToSend ? 'Hermes CLI 已启动，正在处理...' : '',
+      rawContent: isHermesTargetToSend ? 'Hermes CLI 已启动，正在处理...' : '',
       tool_events: [],
-      cli_display: targetToSend === 'hermes' ? false : opencodeCliDisplay.value,
-      source: targetToSend === 'hermes' ? 'hermes' : '',
+      cli_display: isHermesTargetToSend ? false : opencodeCliDisplay.value,
+      source: isHermesTargetToSend ? 'hermes' : '',
       pendingActionEvent: null,
       streaming: true,
       created_at: new Date().toISOString()

@@ -286,7 +286,42 @@ def _configured_skill_dirs(selected_skills: Optional[List[str]] = None) -> List[
         return _dedupe_dir_values([*_manual_skill_dirs(), *_shared_skill_dirs()])
 
     registry = get_skill_registry()
+    candidate_roots = [Path(value) for value in _dedupe_dir_values([*_manual_skill_dirs(), *_shared_skill_dirs()])]
     chosen_dirs: List[str] = []
+
+    def _add_root_for_skill_dir(skill_dir: Path) -> None:
+        try:
+            resolved_skill_dir = skill_dir.expanduser().resolve()
+        except Exception:
+            resolved_skill_dir = skill_dir
+        for root in candidate_roots:
+            try:
+                resolved_root = root.expanduser().resolve()
+                resolved_skill_dir.relative_to(resolved_root)
+            except Exception:
+                continue
+            chosen_dirs.append(str(resolved_root))
+            return
+        # Fallback: if the registry only knows the leaf directory, mount its
+        # parent rather than the leaf. Hermes resolves --skills by joining the
+        # requested identifier onto each configured skills root.
+        parent = resolved_skill_dir.parent
+        if parent.exists():
+            chosen_dirs.append(str(parent))
+
+    for selected in selected_names:
+        normalized_selected = selected.replace("\\", "/").strip("/")
+        if "/" not in normalized_selected:
+            continue
+        for root in candidate_roots:
+            try:
+                direct_dir = root / Path(*normalized_selected.split("/"))
+                if (direct_dir / "SKILL.md").exists() or direct_dir.with_suffix(".md").exists():
+                    chosen_dirs.append(str(root.expanduser().resolve()))
+                    break
+            except Exception:
+                continue
+
     for item in registry.list_skills(include_content=True):
         item_id = str(item.get("id") or "").strip()
         slug = str(item.get("slug") or "").strip()
@@ -296,10 +331,7 @@ def _configured_skill_dirs(selected_skills: Optional[List[str]] = None) -> List[
             continue
         if not any(chosen in {item_id, slug, name} for chosen in selected_names):
             continue
-        # Hermes scans external_dirs recursively with os.walk, so mounting the
-        # exact skill directory keeps the selected skill loadable while avoiding
-        # a full rescan of every shared root.
-        chosen_dirs.append(skill_dir)
+        _add_root_for_skill_dir(Path(skill_dir))
 
     result = _dedupe_dir_values(chosen_dirs)
     if not result:
@@ -871,6 +903,23 @@ def _progress_status_event(event_type: str, summary: str, detail: str = "", data
     }
 
 
+def _output_tail(text: str, limit: int = 2000) -> str:
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return f"...\n{value[-limit:]}"
+
+
+def _hermes_error_message(reason: str, *, returncode: Optional[int] = None, output: str = "") -> str:
+    lines = [reason.strip() or "Hermes CLI 调用失败"]
+    if returncode is not None:
+        lines.append(f"退出码：{returncode}")
+    tail = _output_tail(output)
+    if tail:
+        lines.append(f"最后输出：\n{tail}")
+    return "\n".join(lines)
+
+
 def _trace_events_from_delta(delta: str) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -999,16 +1048,20 @@ async def run_hermes_oneshot_stream(
     last_visible_line = ""
     loop = asyncio.get_running_loop()
     last_output_at = loop.time()
+    last_visible_output_at = last_output_at
     last_idle_notice_at = 0.0
     last_idle_debug_at = 0.0
     stdout_debugged = False
     startup_restart_count = 0
-    idle_timeout = int(os.environ.get("CODEBOT_HERMES_IDLE_TIMEOUT", "900") or "900")
+    idle_timeout = int(os.environ.get("CODEBOT_HERMES_IDLE_TIMEOUT", "300") or "300")
     startup_no_output_restart_seconds = int(
-        os.environ.get("CODEBOT_HERMES_STARTUP_NO_OUTPUT_RESTART_SECONDS", "90") or "90"
+        os.environ.get("CODEBOT_HERMES_STARTUP_NO_OUTPUT_RESTART_SECONDS", "45") or "45"
     )
     startup_no_output_restart_limit = int(
         os.environ.get("CODEBOT_HERMES_STARTUP_NO_OUTPUT_RESTART_LIMIT", "1") or "1"
+    )
+    no_visible_output_timeout = int(
+        os.environ.get("CODEBOT_HERMES_NO_VISIBLE_OUTPUT_TIMEOUT", "180") or "180"
     )
     # Hermes can run silently for a long time. Emit visible heartbeat events so
     # the user can distinguish "still processing" from "stuck", but keep them
@@ -1151,13 +1204,39 @@ async def run_hermes_oneshot_stream(
                             pass
                     process = await _spawn_process()
                     last_output_at = loop.time()
+                    last_visible_output_at = last_output_at
                     last_idle_notice_at = 0.0
                     last_idle_debug_at = 0.0
                     yield _session_status_event(process, "Hermes CLI 已重新启动，正在处理", event_type="session.status")
                     continue
+                visible_idle_for = int(now - last_visible_output_at)
+                if (
+                    no_visible_output_timeout > 0
+                    and visible_idle_for >= no_visible_output_timeout
+                    and not clean_output.strip()
+                ):
+                    try:
+                        process.kill()
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                    except Exception:
+                        pass
+                    message = _hermes_error_message(
+                        f"Hermes CLI 已连续 {visible_idle_for}s 没有返回可显示输出，已停止本次任务。",
+                        returncode=504,
+                        output=visible_output,
+                    )
+                    yield {
+                        "type": "error",
+                        "status_code": 504,
+                        "message": message,
+                        "output": visible_output[-12000:],
+                        "returncode": 504,
+                    }
+                    return
                 if now - last_output_at > idle_timeout:
                     try:
                         process.kill()
+                        await asyncio.wait_for(process.wait(), timeout=5)
                     except Exception:
                         pass
                     # #region debug-point E:idle-timeout
@@ -1168,10 +1247,15 @@ async def run_hermes_oneshot_stream(
                         {"pid": process.pid, "idle_timeout": idle_timeout, "visible_output_len": len(visible_output)},
                     )
                     # #endregion
+                    message = _hermes_error_message(
+                        f"Hermes CLI 空闲超时（{idle_timeout}s 内没有新的输出或交互）",
+                        returncode=499,
+                        output=visible_output,
+                    )
                     yield {
                         "type": "error",
                         "status_code": 499,
-                        "message": f"Hermes CLI 空闲超时（{idle_timeout}s 内没有新的输出或交互）",
+                        "message": message,
                         "output": visible_output[-12000:],
                         "returncode": 499,
                     }
@@ -1213,6 +1297,7 @@ async def run_hermes_oneshot_stream(
             clean_delta, stream_buffer = _consume_hermes_terminal_stream(stream_buffer, flush=False)
             if clean_delta:
                 clean_output = f"{clean_output}{clean_delta}"
+                last_visible_output_at = loop.time()
                 trace_events = _trace_events_from_delta(clean_delta)
                 if trace_events:
                     last_visible_line = str(trace_events[-1].get("summary") or last_visible_line)
@@ -1266,6 +1351,7 @@ async def run_hermes_oneshot_stream(
         final_delta, stream_buffer = _consume_hermes_terminal_stream(stream_buffer, flush=True)
         if final_delta:
             clean_output = f"{clean_output}{final_delta}"
+            last_visible_output_at = loop.time()
             trace_events = _trace_events_from_delta(final_delta)
             if trace_events:
                 last_visible_line = str(trace_events[-1].get("summary") or last_visible_line)
@@ -1292,6 +1378,33 @@ async def run_hermes_oneshot_stream(
         if aborted:
             _aborted_keys.discard(key)
             yield {"type": "aborted", "returncode": -999, "output": (clean_output or visible_output)[-12000:]}
+            return
+        output_tail = (clean_output or visible_output)[-12000:]
+        if process.returncode not in (0, None):
+            yield {
+                "type": "error",
+                "status_code": 502,
+                "message": _hermes_error_message(
+                    "Hermes CLI 进程异常退出。",
+                    returncode=process.returncode,
+                    output=output_tail,
+                ),
+                "output": output_tail,
+                "returncode": process.returncode,
+            }
+            return
+        if not clean_output.strip():
+            yield {
+                "type": "error",
+                "status_code": 502,
+                "message": _hermes_error_message(
+                    "Hermes CLI 已结束，但没有返回可显示内容。",
+                    returncode=process.returncode,
+                    output=visible_output[-12000:],
+                ),
+                "output": visible_output[-12000:],
+                "returncode": process.returncode,
+            }
             return
         yield {"type": "done", "returncode": process.returncode, "output": (clean_output or visible_output)[-12000:]}
     finally:

@@ -53,6 +53,7 @@ opencode_ws: Optional[OpenCodeClient] = None
 chat_memory_manager: Optional[MemoryManager] = None
 # 由 main.py lifespan 注入（可为 None）
 sandbox_manager = None
+HERMES_OBSIDIAN_SKILL = "note-taking/obsidian"
 
 
 def _collect_opencode_retry_ports() -> List[int]:
@@ -262,7 +263,7 @@ class SendMessageRequest(BaseModel):
     attached_files: Optional[List[AttachedFile]] = None
     user_already_saved: bool = False
     project_dir: Optional[str] = None  # 用户选择的项目文件夹路径
-    target: Optional[str] = None  # codebot | hermes | obsidian
+    target: Optional[str] = None  # codebot | hermes | obsidian | hermes_obsidian
     knowledge_paths: Optional[List[str]] = None
 
 
@@ -700,8 +701,22 @@ async def notify_task_growth_candidate(candidate: Optional[Dict[str, Any]], conv
         logger.debug(f"定时任务成长候选通知发送失败（跳过）: {exc}")
 
 
+def _normalized_chat_target(target: Optional[str]) -> str:
+    return re.sub(r"[\s+:-]+", "_", str(target or "").strip().lower())
+
+
+def _is_hermes_target(target: Optional[str]) -> bool:
+    normalized = _normalized_chat_target(target)
+    return normalized == "hermes" or normalized.startswith("hermes_")
+
+
+def _is_obsidian_target(target: Optional[str]) -> bool:
+    normalized = _normalized_chat_target(target)
+    return normalized == "obsidian" or "obsidian" in normalized.split("_")
+
+
 def _task_executor_from_target(target: Optional[str]) -> str:
-    return "hermes" if str(target or "").strip().lower() == "hermes" else "opencode"
+    return "hermes" if _is_hermes_target(target) else "opencode"
 
 
 def _task_execution_model_from_chat_model(model: Optional[str]) -> str:
@@ -1409,7 +1424,7 @@ async def _build_multi_agent_hub_reply(user_message: str, members: List[Dict], r
 
 
 def _resolve_opencode_workspace(project_dir: Optional[str] = None, target: Optional[str] = None) -> Optional[str]:
-    if (target or "").strip().lower() == "obsidian":
+    if _is_obsidian_target(target):
         try:
             settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
             return str(settings.DATA_DIR.resolve())
@@ -1758,6 +1773,7 @@ async def _sync_codebot_as_third_party():
 def _prepare_hermes_proxy_request(
     message: str,
     knowledge_paths: Optional[List[str]] = None,
+    obsidian_enabled: bool = False,
 ) -> Tuple[str, List[str], Optional[dict], bool]:
     selected_skill = None
     cleaned_message = message
@@ -1772,16 +1788,23 @@ def _prepare_hermes_proxy_request(
         logger.debug(f"[Hermes] skill marker parse failed: {exc}")
 
     hermes_message = cleaned_message or message
-    if knowledge_paths:
+    if obsidian_enabled or knowledge_paths:
         obsidian_context = _build_obsidian_context(hermes_message, knowledge_paths)
         if obsidian_context:
             hermes_message = (
                 f"{hermes_message}\n\n"
-                "[Codebot selected Obsidian Markdown context]\n"
+                "[Codebot selected Hermes + Obsidian Markdown context]\n"
                 f"{obsidian_context}"
             )
-            if "obsidian" not in {name.lower() for name in hermes_skills}:
-                hermes_skills.append("obsidian")
+        else:
+            hermes_message = (
+                f"{hermes_message}\n\n"
+                "[Codebot selected Hermes + Obsidian mode]\n"
+                "Obsidian mode is active, but Codebot could not resolve a configured vault or knowledge base. "
+                "Ask the user to configure Obsidian Settings if Markdown vault access is required."
+            )
+        if HERMES_OBSIDIAN_SKILL.lower() not in {name.lower() for name in hermes_skills}:
+            hermes_skills.append(HERMES_OBSIDIAN_SKILL)
     # Hermes can execute its native skills and Codebot writable skills, but some
     # OpenCode-shared skills still stall inside Hermes' own runtime. When the
     # user explicitly points to an OpenCode-root skill, transparently delegate
@@ -1796,12 +1819,14 @@ async def _execute_hermes_proxy(
     model: Optional[str] = None,
     conversation_id: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
+    obsidian_enabled: bool = False,
 ) -> str:
     from api.routes import hermes as hermes_router
 
     hermes_message, hermes_skills, _, should_delegate_to_opencode = _prepare_hermes_proxy_request(
         message,
         knowledge_paths,
+        obsidian_enabled=obsidian_enabled,
     )
 
     conv_id = str(conversation_id) if conversation_id is not None else ""
@@ -1815,7 +1840,7 @@ async def _execute_hermes_proxy(
                 mode="agent",
                 conversation_id=conversation_id,
                 project_dir=None,
-                target="codebot",
+                target="obsidian" if obsidian_enabled else "codebot",
                 knowledge_paths=knowledge_paths,
             )
         response = await hermes_router.hermes_chat(
@@ -1837,12 +1862,14 @@ async def _stream_hermes_proxy_events(
     model: Optional[str] = None,
     conversation_id: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
+    obsidian_enabled: bool = False,
 ):
     from api.routes import hermes as hermes_router
 
     hermes_message, hermes_skills, selected_skill, should_delegate_to_opencode = _prepare_hermes_proxy_request(
         message,
         knowledge_paths,
+        obsidian_enabled=obsidian_enabled,
     )
     conv_id = str(conversation_id) if conversation_id is not None else ""
     content = ""
@@ -1878,7 +1905,7 @@ async def _stream_hermes_proxy_events(
                 mode="agent",
                 conversation_id=conversation_id,
                 project_dir=None,
-                target="codebot",
+                target="obsidian" if obsidian_enabled else "codebot",
                 knowledge_paths=knowledge_paths,
             ):
                 yield delegated_event
@@ -1968,8 +1995,14 @@ async def _execute_opencode(
     if schedule_result:
         return schedule_result
 
-    if (target or "").strip().lower() == "hermes":
-        content = await _execute_hermes_proxy(message, model=model, conversation_id=conversation_id, knowledge_paths=knowledge_paths)
+    if _is_hermes_target(target):
+        content = await _execute_hermes_proxy(
+            message,
+            model=model,
+            conversation_id=conversation_id,
+            knowledge_paths=knowledge_paths,
+            obsidian_enabled=_is_obsidian_target(target),
+        )
         return _sanitize_assistant_output(content or "", user_message=message)
 
     try:
@@ -2018,8 +2051,14 @@ async def _execute_opencode_with_meta(
     if schedule_result:
         return schedule_result, []
 
-    if (target or "").strip().lower() == "hermes":
-        content = await _execute_hermes_proxy(message, model=model, conversation_id=conversation_id, knowledge_paths=knowledge_paths)
+    if _is_hermes_target(target):
+        content = await _execute_hermes_proxy(
+            message,
+            model=model,
+            conversation_id=conversation_id,
+            knowledge_paths=knowledge_paths,
+            obsidian_enabled=_is_obsidian_target(target),
+        )
         return _sanitize_assistant_output(content or "", user_message=message), []
 
     try:
@@ -2095,12 +2134,13 @@ async def _stream_execute_opencode_with_meta(
         }
         return
 
-    if (target or "").strip().lower() == "hermes":
+    if _is_hermes_target(target):
         async for event in _stream_hermes_proxy_events(
             message,
             model=model,
             conversation_id=conversation_id,
             knowledge_paths=knowledge_paths,
+            obsidian_enabled=_is_obsidian_target(target),
         ):
             yield event
         return
@@ -3087,8 +3127,8 @@ async def _build_opencode_prompt_parts(
     if selected_skill and selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, HERMES, OPENCLAW}:
         system_lines.append(_build_skill_system_context(selected_skill))
 
-    normalized_target = (target or "codebot").strip().lower()
-    if normalized_target == "obsidian":
+    normalized_target = _normalized_chat_target(target or "codebot")
+    if _is_obsidian_target(normalized_target):
         # Obsidian target should actively bias the agent toward the Obsidian
         # skill/toolchain instead of only attaching note snippets as passive
         # context.
@@ -4136,44 +4176,49 @@ def _search_markdown_notes(query: str, knowledge_paths: Optional[List[str]], lim
     roots = _resolve_knowledge_roots(knowledge_paths)
     results: List[Dict[str, Any]] = []
     seen: set[str] = set()
-    skip_dirs = {".git", ".obsidian", "node_modules", "__pycache__", ".trash", ".venv", "venv"}
+    skip_dirs = {".git", ".obsidian", ".opencode", "node_modules", "__pycache__", ".trash", ".venv", "venv"}
     tokens = _split_search_tokens(query)
     for root in roots:
         if len(results) >= limit:
             break
-        for path in root.glob("**/*.md"):
-            if len(results) >= limit:
-                break
-            if any(part in skip_dirs for part in path.parts):
-                continue
-            try:
-                key = str(path.resolve()).lower()
-                if key in seen:
+        for current_dir, dirnames, filenames in os.walk(root, topdown=True, onerror=lambda _err: None):
+            dirnames[:] = [name for name in dirnames if name not in skip_dirs]
+            for filename in filenames:
+                if len(results) >= limit:
+                    break
+                if not filename.lower().endswith(".md"):
                     continue
-                rel = str(path.relative_to(root)).replace("\\", "/")
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                continue
-            title_match = _matches_tokens(query, rel, path.stem)
-            content_match = _matches_tokens(query, text[:20000])
-            if tokens and not (title_match or content_match):
-                continue
-            seen.add(key)
-            snippet = ""
-            if tokens:
-                lower_text = text.lower()
-                positions = [lower_text.find(token) for token in tokens if lower_text.find(token) >= 0]
-                start = max(0, min(positions) - 240) if positions else 0
-            else:
-                start = 0
-            snippet = text[start:start + 1200].strip()
-            results.append({
-                "name": path.stem,
-                "path": str(path),
-                "relative_path": rel,
-                "root": str(root),
-                "snippet": snippet,
-            })
+                path = Path(current_dir) / filename
+                try:
+                    key = str(path.resolve()).lower()
+                    if key in seen:
+                        continue
+                    rel = str(path.relative_to(root)).replace("\\", "/")
+                    text = path.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                title_match = _matches_tokens(query, rel, path.stem)
+                content_match = _matches_tokens(query, text[:20000])
+                if tokens and not (title_match or content_match):
+                    continue
+                seen.add(key)
+                snippet = ""
+                if tokens:
+                    lower_text = text.lower()
+                    positions = [lower_text.find(token) for token in tokens if lower_text.find(token) >= 0]
+                    start = max(0, min(positions) - 240) if positions else 0
+                else:
+                    start = 0
+                snippet = text[start:start + 1200].strip()
+                results.append({
+                    "name": path.stem,
+                    "path": str(path),
+                    "relative_path": rel,
+                    "root": str(root),
+                    "snippet": snippet,
+                })
+                if len(results) >= limit:
+                    break
     return results
 
 
@@ -5379,7 +5424,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
             parts: List[dict] = []
             internal_prompt: str = ""
             tool_events_log: List[dict] = []
-            is_hermes_target = (request.target or "").strip().lower() == "hermes"
+            is_hermes_target = _is_hermes_target(request.target)
             cli_display = _opencode_cli_display_enabled() and not is_hermes_target
             cli_seen: set[str] = set()
             cli_text_started = False
