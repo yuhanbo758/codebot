@@ -238,6 +238,13 @@ def _iter_skill_dirs(base_dir: Path, recursive: bool = False) -> Iterable[Path]:
     return matches
 
 
+def _normalized_dir_key(raw: Path | str) -> str:
+    try:
+        return str(Path(raw).expanduser().resolve()).lower()
+    except Exception:
+        return str(raw).strip().lower()
+
+
 def _distinct_existing_dirs(candidates: Iterable[Path]) -> List[Path]:
     result: List[Path] = []
     seen: set[str] = set()
@@ -246,7 +253,7 @@ def _distinct_existing_dirs(candidates: Iterable[Path]) -> List[Path]:
             path = raw.expanduser()
             if not path.exists() or not path.is_dir():
                 continue
-            key = str(path.resolve()).lower()
+            key = _normalized_dir_key(path)
         except Exception:
             continue
         if key in seen:
@@ -290,15 +297,37 @@ def opencode_skill_dirs() -> List[Path]:
     return _distinct_existing_dirs(candidates)
 
 
-def hermes_skill_dirs() -> List[Path]:
+def hermes_manual_skill_dirs() -> List[Path]:
     candidates: List[Path] = []
-
     hermes_cfg = getattr(app_config, "hermes", None)
     if hermes_cfg:
         for raw in getattr(hermes_cfg, "skill_dirs", []) or []:
             if str(raw or "").strip():
                 candidates.append(Path(str(raw).strip()))
+    return _distinct_existing_dirs(candidates)
 
+
+def hermes_excluded_auto_skill_dirs() -> List[str]:
+    hermes_cfg = getattr(app_config, "hermes", None)
+    values = getattr(hermes_cfg, "excluded_auto_skill_dirs", []) if hermes_cfg else []
+    deduped: List[str] = []
+    seen: set[str] = set()
+    for raw in values or []:
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        key = _normalized_dir_key(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(str(Path(value).expanduser()))
+    return deduped
+
+
+def hermes_native_skill_dirs(include_excluded: bool = False) -> List[Path]:
+    candidates: List[Path] = []
+    hermes_cfg = getattr(app_config, "hermes", None)
+    if hermes_cfg:
         install_dir = str(getattr(hermes_cfg, "install_dir", "") or "").strip()
         install_root = Path(install_dir).expanduser() if install_dir else settings.BASE_DIR / "hermes-agent"
         candidates.extend([
@@ -319,7 +348,18 @@ def hermes_skill_dirs() -> List[Path]:
     if local_app_data:
         candidates.append(Path(local_app_data) / "hermes" / "skills")
 
-    return _distinct_existing_dirs(candidates)
+    resolved = _distinct_existing_dirs(candidates)
+    if include_excluded:
+        return resolved
+
+    excluded_keys = {_normalized_dir_key(item) for item in hermes_excluded_auto_skill_dirs()}
+    if not excluded_keys:
+        return resolved
+    return [path for path in resolved if _normalized_dir_key(path) not in excluded_keys]
+
+
+def hermes_skill_dirs() -> List[Path]:
+    return _distinct_existing_dirs([*hermes_manual_skill_dirs(), *hermes_native_skill_dirs()])
 
 
 def _skill_dir_mtime(skill_dir: Path) -> float:

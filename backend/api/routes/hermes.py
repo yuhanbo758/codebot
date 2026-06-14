@@ -28,7 +28,12 @@ from loguru import logger
 from pydantic import BaseModel
 
 from config import app_config, save_config, settings
-from core.skill_registry import hermes_skill_dirs, opencode_skill_dirs
+from core.skill_registry import (
+    hermes_excluded_auto_skill_dirs,
+    hermes_native_skill_dirs,
+    hermes_skill_dirs,
+    opencode_skill_dirs,
+)
 
 router = APIRouter()
 
@@ -245,7 +250,7 @@ def _manual_skill_dirs() -> List[str]:
     return _dedupe_dir_values(dirs)
 
 
-def _shared_skill_dirs() -> List[str]:
+def _all_auto_shared_skill_dirs() -> List[str]:
     dirs: List[str] = []
     builtin_root = settings.SKILLS_DIR
     if builtin_root.exists():
@@ -254,9 +259,16 @@ def _shared_skill_dirs() -> List[str]:
     # directory set, so "Hermes <-> OpenCode" sharing is actually symmetric:
     # Hermes can see OpenCode skills, and Codebot also preserves Hermes-native
     # skills discovered from install_dir/HERMES_HOME/default runtime locations.
-    dirs.extend(str(path) for path in hermes_skill_dirs())
+    dirs.extend(str(path) for path in hermes_native_skill_dirs(include_excluded=True))
     dirs.extend(str(path) for path in opencode_skill_dirs())
     return _dedupe_dir_values(dirs)
+
+
+def _shared_skill_dirs() -> List[str]:
+    excluded = set(_dedupe_dir_values(hermes_excluded_auto_skill_dirs()))
+    if not excluded:
+        return _all_auto_shared_skill_dirs()
+    return [path for path in _all_auto_shared_skill_dirs() if path not in excluded]
 
 
 def _configured_skill_dirs(selected_skills: Optional[List[str]] = None) -> List[str]:
@@ -1337,7 +1349,9 @@ async def hermes_status():
             "active_chat_model": _model_for_chat_tasks(),
             "background_model": _model_for_background_tasks(),
             "configured_skill_dirs": _manual_skill_dirs(),
-            "hermes_native_skill_dirs": [str(path) for path in hermes_skill_dirs()],
+            "excluded_auto_skill_dirs": _dedupe_dir_values(hermes_excluded_auto_skill_dirs()),
+            "hermes_native_skill_dirs": [str(path) for path in hermes_native_skill_dirs()],
+            "shared_skill_candidates": _all_auto_shared_skill_dirs(),
             "shared_skill_dirs": _shared_skill_dirs(),
             "skill_dirs": _configured_skill_dirs(),
         },

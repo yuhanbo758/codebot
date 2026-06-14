@@ -37,12 +37,21 @@
             <el-icon><Plus /></el-icon>
             添加目录
           </el-button>
-          <div v-if="sharedSkillDirs.length" class="dir-tip">
-            以下目录由 Codebot 自动并入 Hermes 的有效 skill 根目录，包含 Hermes Agent 默认 skill 目录、OpenCode CLI skills，以及 Codebot 内置/自动生成 skills。
+          <div v-if="sharedSkillCandidates.length" class="dir-tip">
+            以下目录由 Codebot 自动并入 Hermes 的有效 skill 根目录。现在支持把自动共享目录加入排除列表，避免开发版/正式版重复扫描同一批 skill。
           </div>
-          <div v-for="dir in sharedSkillDirs" :key="`shared-${dir}`" class="dir-row dir-row--readonly">
+          <div v-for="dir in effectiveSharedSkillDirs" :key="`shared-${dir}`" class="dir-row dir-row--readonly">
             <el-input :model-value="dir" readonly />
             <el-tag type="info">自动共享</el-tag>
+            <el-button type="warning" plain @click="excludeAutoSharedDir(dir)">排除</el-button>
+          </div>
+          <div v-if="excludedSharedSkillDirs.length" class="dir-tip">
+            以下自动共享目录已被排除，不会再并入 Hermes 的有效 skill 根目录。
+          </div>
+          <div v-for="dir in excludedSharedSkillDirs" :key="`excluded-${dir}`" class="dir-row dir-row--readonly">
+            <el-input :model-value="dir" readonly />
+            <el-tag type="warning">已排除</el-tag>
+            <el-button type="primary" plain @click="restoreAutoSharedDir(dir)">恢复</el-button>
           </div>
         </div>
       </el-form-item>
@@ -137,7 +146,8 @@ const form = ref({
   share_models: true,
   share_memory: true,
   share_scheduler: true,
-  skill_dirs: []
+  skill_dirs: [],
+  excluded_auto_skill_dirs: []
 })
 
 const statusText = computed(() => {
@@ -154,12 +164,31 @@ const bridgeText = computed(() => {
 })
 
 const codebotApp = computed(() => status.value?.codebot_app || {})
-const sharedSkillDirs = computed(() => status.value?.shared_skill_dirs || [])
-const effectiveSkillDirs = computed(() => status.value?.skill_dirs || [])
+const normalizeDirKey = (value = '') => value.trim().replace(/\//g, '\\').replace(/[\\\/]+$/, '').toLowerCase()
+const uniqueDirs = (dirs = []) => {
+  const seen = new Set()
+  return dirs
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .filter((item) => {
+      const key = normalizeDirKey(item)
+      if (!key || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+}
+
+const sharedSkillCandidates = computed(() => uniqueDirs(status.value?.shared_skill_candidates || status.value?.shared_skill_dirs || []))
+const excludedAutoSkillDirs = computed(() => uniqueDirs(form.value.excluded_auto_skill_dirs || []))
+const excludedAutoSkillDirKeys = computed(() => new Set(excludedAutoSkillDirs.value.map((item) => normalizeDirKey(item))))
+const effectiveSharedSkillDirs = computed(() => sharedSkillCandidates.value.filter((dir) => !excludedAutoSkillDirKeys.value.has(normalizeDirKey(dir))))
+const excludedSharedSkillDirs = computed(() => sharedSkillCandidates.value.filter((dir) => excludedAutoSkillDirKeys.value.has(normalizeDirKey(dir))))
+const effectiveSkillDirs = computed(() => uniqueDirs([...(form.value.skill_dirs || []), ...effectiveSharedSkillDirs.value]))
 
 const normalizedPayload = () => ({
   ...form.value,
-  skill_dirs: (form.value.skill_dirs || []).map((item) => item.trim()).filter(Boolean)
+  skill_dirs: uniqueDirs(form.value.skill_dirs || []),
+  excluded_auto_skill_dirs: uniqueDirs(form.value.excluded_auto_skill_dirs || [])
 })
 
 const load = async () => {
@@ -170,6 +199,8 @@ const load = async () => {
       axios.get('/api/hermes/status')
     ])
     form.value = { ...form.value, ...(cfgRes.data?.data || {}) }
+    form.value.skill_dirs = form.value.skill_dirs || []
+    form.value.excluded_auto_skill_dirs = form.value.excluded_auto_skill_dirs || []
     status.value = statusRes.data?.data || null
   } catch (error) {
     ElMessage.error('加载 Hermes 设置失败')
@@ -220,6 +251,18 @@ const runAction = async (action) => {
   } finally {
     actionLoading.value = ''
   }
+}
+
+const excludeAutoSharedDir = (dir) => {
+  const current = uniqueDirs(form.value.excluded_auto_skill_dirs || [])
+  if (!current.some((item) => normalizeDirKey(item) === normalizeDirKey(dir))) {
+    form.value.excluded_auto_skill_dirs = [...current, dir]
+  }
+}
+
+const restoreAutoSharedDir = (dir) => {
+  form.value.excluded_auto_skill_dirs = uniqueDirs(form.value.excluded_auto_skill_dirs || [])
+    .filter((item) => normalizeDirKey(item) !== normalizeDirKey(dir))
 }
 
 onMounted(load)

@@ -39,6 +39,7 @@ class HermesConfigUpdateRequest(BaseModel):
     share_memory: Optional[bool] = None
     share_scheduler: Optional[bool] = None
     skill_dirs: Optional[List[str]] = None
+    excluded_auto_skill_dirs: Optional[List[str]] = None
 
 
 class ObsidianKnowledgeBaseRequest(BaseModel):
@@ -202,6 +203,11 @@ async def update_hermes_config(request: HermesConfigUpdateRequest):
             updates["install_dir"] = str(install_dir)
         if "skill_dirs" in updates:
             updates["skill_dirs"] = _validate_abs_dir_list(updates.get("skill_dirs"), "Hermes skill 目录")
+        if "excluded_auto_skill_dirs" in updates:
+            updates["excluded_auto_skill_dirs"] = _validate_abs_dir_list(
+                updates.get("excluded_auto_skill_dirs"),
+                "Hermes 自动共享排除目录",
+            )
         current = app_config.hermes.model_dump()
         current.update(updates)
         app_config.hermes = HermesConfig(**current)

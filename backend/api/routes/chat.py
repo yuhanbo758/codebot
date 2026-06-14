@@ -740,6 +740,11 @@ async def _classify_codebot_schedule_creation_request(message: str, model: Optio
     text = (message or "").strip()
     if not text:
         return False
+    # Most chat turns are not scheduler requests. Fast local heuristics avoid a
+    # blocking pre-classification model call on every send and keep Hermes/OpenCode
+    # routing responsive.
+    if not _looks_like_schedule_message(text) and not _looks_like_codebot_schedule_creation_request(text):
+        return False
 
     prompt = (
         "你是 Codebot 的意图分类器，只判断用户本轮消息是否在请求“创建/添加/设置一个 Codebot 定时任务、提醒或闹钟”。\n"
@@ -2907,6 +2912,14 @@ def _extract_requested_skill(message: str) -> Tuple[Optional[dict], str, bool]:
     return None, text, False
 
 
+def _find_skill_prefer_non_opencode(query: str) -> Optional[Dict[str, Any]]:
+    registry = get_skill_registry()
+    item = registry.find_by_query(query, allow_opencode=False)
+    if item:
+        return item
+    return registry.find_by_query(query, allow_opencode=True)
+
+
 def _build_skill_system_context(skill: dict) -> str:
     source = skill.get("source") or ""
     source_label = skill.get("sourceLabel") or skill.get("source_label") or source
@@ -3048,7 +3061,11 @@ async def _build_opencode_prompt_parts(
         # Obsidian target should actively bias the agent toward the Obsidian
         # skill/toolchain instead of only attaching note snippets as passive
         # context.
-        obsidian_skill = get_skill_registry().find_by_query("obsidian", allow_opencode=True)
+        # Prefer Codebot/Hermes-local Obsidian skills first. Packaged Windows
+        # builds may not have an OpenCode-managed vault-local skill root such as
+        # "<vault>/.opencode/skills/agents", so auto-selecting an OpenCode skill
+        # here can fail even though the builtin Obsidian workflow is available.
+        obsidian_skill = _find_skill_prefer_non_opencode("obsidian")
         if obsidian_skill and not selected_skill:
             selected_skill = obsidian_skill
             opencode_skill_fallback = bool(obsidian_skill.get("source") == OPENCODE)
@@ -3959,14 +3976,14 @@ def _extract_text_from_file(filename: str, content_bytes: bytes) -> Optional[str
         except ImportError:
             pass
         try:
-            import PyPDF2
+            from pypdf import PdfReader
             import io
-            reader = PyPDF2.PdfReader(io.BytesIO(content_bytes))
+            reader = PdfReader(io.BytesIO(content_bytes))
             texts = [page.extract_text() or "" for page in reader.pages]
             text = "\n".join(t for t in texts if t.strip())
             return text if text.strip() else f"[PDF 文件 {filename} 无可提取文本]"
         except ImportError:
-            return f"[PDF 文件 {filename}，需安装 pdfplumber 或 PyPDF2 以提取内容]"
+            return f"[PDF 文件 {filename}，需安装 pdfplumber 或 pypdf 以提取内容]"
         except Exception as e:
             return f"[PDF 文件 {filename} 解析失败: {e}]"
 

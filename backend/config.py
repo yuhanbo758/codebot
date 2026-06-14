@@ -142,6 +142,7 @@ class HermesConfig(BaseModel):
     share_memory: bool = True
     share_scheduler: bool = True
     skill_dirs: List[str] = []
+    excluded_auto_skill_dirs: List[str] = []
     last_action: str = ""
     last_status: str = ""
     last_message: str = ""
