@@ -14,6 +14,17 @@
             <el-icon><Search /></el-icon>
           </template>
         </el-input>
+        <el-select
+          v-model="sourceDetailFilter"
+          style="width: 150px; margin-right: 12px"
+          placeholder="来源细分"
+          clearable
+        >
+          <el-option label="全部来源细分" value="" />
+          <el-option label="运行时" value="runtime" />
+          <el-option label="官方仓库" value="repo" />
+          <el-option label="手动目录" value="manual" />
+        </el-select>
         <div class="header-actions">
           <el-button
             v-if="batchMode"
@@ -61,11 +72,21 @@
         <el-table-column prop="name" label="名称" width="200" />
         <el-table-column prop="description" label="描述" min-width="200" />
         <el-table-column prop="version" label="版本" width="90" />
-        <el-table-column label="来源" width="100">
+        <el-table-column label="来源" width="150">
           <template #default="{ row }">
-            <el-tag size="small" :type="sourceTagType(row.source)">
-              {{ row.sourceLabel || row.source_label || sourceLabel(row) }}
-            </el-tag>
+            <div class="source-tags">
+              <el-tag size="small" :type="sourceTagType(row.source)">
+                {{ row.sourceLabel || row.source_label || sourceLabel(row) }}
+              </el-tag>
+              <el-tag
+                v-if="row.source === 'hermes' && (row.sourceDetailLabel || row.source_detail_label)"
+                size="small"
+                type="info"
+                effect="plain"
+              >
+                {{ row.sourceDetailLabel || row.source_detail_label }}
+              </el-tag>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="90">
@@ -231,6 +252,7 @@ const batchDeleting = ref(false)
 const batchMode = ref(false)
 const selectedIds = ref([])
 const searchQuery = ref('')
+const sourceDetailFilter = ref('')
 
 const showInstallDialog = ref(false)
 const showGenerateDialog = ref(false)
@@ -326,11 +348,13 @@ const openSkillsFolder = async () => {
 
 const filteredSkills = computed(() => {
   const q = searchQuery.value.trim().toLowerCase()
-  if (!q) return skills.value
-  return skills.value.filter(s =>
-    (s.name || '').toLowerCase().includes(q) ||
-    (s.description || '').toLowerCase().includes(q)
-  )
+  const detail = (sourceDetailFilter.value || '').trim()
+  return skills.value.filter((s) => {
+    const matchesQuery = !q || (s.name || '').toLowerCase().includes(q) || (s.description || '').toLowerCase().includes(q)
+    if (!matchesQuery) return false
+    if (!detail) return true
+    return s.source === 'hermes' && (s.sourceDetail || s.source_detail || '') === detail
+  })
 })
 
 const sourceLabel = (row) => {
@@ -564,5 +588,12 @@ onMounted(() => {
   overflow-y: auto;
   padding: 0 20px 20px 20px;
   min-height: 0;
+}
+
+.source-tags {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
 }
 </style>

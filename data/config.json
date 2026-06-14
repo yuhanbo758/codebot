@@ -1,10 +1,15 @@
 {
   "version": "3.0.0",
   "general": {
+    "language": "zh-CN",
+    "compact_mode": false,
+    "opencode_cli_display": true,
     "link_open_mode": "system",
     "file_storage_path": "",
     "file_search_dirs": [],
-    "chat_default_model": ""
+    "chat_default_model": "",
+    "growth_candidate_decision": false,
+    "task_candidate_notification_enabled": true
   },
   "memory": {
     "auto_cleanup_enabled": false,
@@ -53,6 +58,7 @@
   },
   "opencode": {
     "server_url": "http://127.0.0.1:11200",
+    "cli_path": "",
     "auto_install": true,
     "auto_start": true
   },
@@ -70,6 +76,27 @@
   },
   "skills": {
     "custom_skill_dirs": []
+  },
+  "hermes": {
+    "enabled": true,
+    "auto_start": true,
+    "repo_url": "https://github.com/NousResearch/hermes-agent",
+    "install_dir": "",
+    "cli_path": "hermes",
+    "share_models": true,
+    "share_memory": true,
+    "share_scheduler": true,
+    "skill_dirs": [],
+    "excluded_auto_skill_dirs": [],
+    "last_action": "prepare",
+    "last_status": "not_installed",
+    "last_message": "Hermes Agent is not installed yet."
+  },
+  "obsidian": {
+    "enabled": true,
+    "cli_path": "obsidian-cli",
+    "vault_path": "",
+    "knowledge_bases": []
   },
   "sandbox": {
     "execution_mode": "auto",

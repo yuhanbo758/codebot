@@ -2869,12 +2869,15 @@ def _extract_requested_skill(message: str) -> Tuple[Optional[dict], str, bool]:
         cleaned = re.sub(r"\s{2,}", " ", cleaned)
         return cleaned or text
 
-    marker = re.search(r"使用技能\[([^\]]+)\]", text)
+    marker = re.search(
+        r"使用技能\s*@?\[([^\]]+)\](?:\s+[^\n，,。；;:：]+)?",
+        text,
+    )
     if marker:
         skill_id = marker.group(1).strip()
         item = registry.find(skill_id)
-        cleaned = (text[:marker.start()] + text[marker.end():]).strip()
-        return item, cleaned or text, bool(item and item.get("source") == OPENCODE)
+        cleaned = _clean_invocation_text(marker.start(), marker.end())
+        return item, cleaned, bool(item and item.get("source") == OPENCODE)
 
     slash = re.search(r"(?im)^\s*/skill\s+([^\n]+)", text)
     if slash:
@@ -2912,12 +2915,14 @@ def _extract_requested_skill(message: str) -> Tuple[Optional[dict], str, bool]:
     return None, text, False
 
 
-def _find_skill_prefer_non_opencode(query: str) -> Optional[Dict[str, Any]]:
+def _find_skill_prefer_non_opencode(query: str, allow_opencode_fallback: bool = True) -> Optional[Dict[str, Any]]:
     registry = get_skill_registry()
     item = registry.find_by_query(query, allow_opencode=False)
     if item:
         return item
-    return registry.find_by_query(query, allow_opencode=True)
+    if allow_opencode_fallback:
+        return registry.find_by_query(query, allow_opencode=True)
+    return None
 
 
 def _build_skill_system_context(skill: dict) -> str:
@@ -3061,14 +3066,15 @@ async def _build_opencode_prompt_parts(
         # Obsidian target should actively bias the agent toward the Obsidian
         # skill/toolchain instead of only attaching note snippets as passive
         # context.
-        # Prefer Codebot/Hermes-local Obsidian skills first. Packaged Windows
-        # builds may not have an OpenCode-managed vault-local skill root such as
-        # "<vault>/.opencode/skills/agents", so auto-selecting an OpenCode skill
-        # here can fail even though the builtin Obsidian workflow is available.
-        obsidian_skill = _find_skill_prefer_non_opencode("obsidian")
+        # Obsidian target must not fall back to an OpenCode-managed vault-local
+        # skill, because packaged Windows builds may not have
+        # "<vault>/.opencode/skills/agents" at all. Prefer only Codebot/Hermes-
+        # local Obsidian skills here.
+        obsidian_skill = _find_skill_prefer_non_opencode("obsidian", allow_opencode_fallback=False)
         if obsidian_skill and not selected_skill:
             selected_skill = obsidian_skill
-            opencode_skill_fallback = bool(obsidian_skill.get("source") == OPENCODE)
+            if selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, HERMES, OPENCLAW}:
+                system_lines.append(_build_skill_system_context(selected_skill))
         elif obsidian_skill and selected_skill and obsidian_skill.get("id") != selected_skill.get("id"):
             system_lines.append(_build_skill_system_context(obsidian_skill))
         obsidian_context = _build_obsidian_context(cleaned_message or raw_message, knowledge_paths)

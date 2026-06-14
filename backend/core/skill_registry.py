@@ -76,6 +76,8 @@ class SkillEntry:
     compatibility: List[str] = field(default_factory=list)
     source_label: str = ""
     source_dir: str = ""
+    source_detail: str = ""
+    source_detail_label: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
     skill_md_content: str = ""
 
@@ -89,6 +91,10 @@ class SkillEntry:
             "source": self.source,
             "sourceLabel": self.source_label or SOURCE_LABELS.get(self.source, self.source),
             "source_label": self.source_label or SOURCE_LABELS.get(self.source, self.source),
+            "sourceDetail": self.source_detail,
+            "source_detail": self.source_detail,
+            "sourceDetailLabel": self.source_detail_label,
+            "source_detail_label": self.source_detail_label,
             "priority": self.priority,
             "path": str(self.path),
             "skill_md_path": str(self.skill_md_path) if self.skill_md_path else "",
@@ -324,7 +330,7 @@ def hermes_excluded_auto_skill_dirs() -> List[str]:
     return deduped
 
 
-def hermes_native_skill_dirs(include_excluded: bool = False) -> List[Path]:
+def hermes_repo_skill_dirs() -> List[Path]:
     candidates: List[Path] = []
     hermes_cfg = getattr(app_config, "hermes", None)
     if hermes_cfg:
@@ -334,19 +340,21 @@ def hermes_native_skill_dirs(include_excluded: bool = False) -> List[Path]:
             install_root / "skills",
             install_root / "optional-skills",
         ])
+    return _distinct_existing_dirs(candidates)
+
+
+def hermes_native_skill_dirs(include_excluded: bool = False) -> List[Path]:
+    candidates: List[Path] = []
+    # Keep Hermes' runtime skill root enabled by default.
+    candidates.append(settings.DATA_DIR / "hermes" / "home" / "skills")
 
     hermes_home_env = os.environ.get("HERMES_HOME", "").strip()
     if hermes_home_env:
         candidates.append(Path(hermes_home_env) / "skills")
 
-    candidates.extend([
-        settings.DATA_DIR / "hermes" / "home" / "skills",
-        Path.home() / ".hermes" / "skills",
-    ])
-
-    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-    if local_app_data:
-        candidates.append(Path(local_app_data) / "hermes" / "skills")
+    # Also keep the repo-bundled official skill catalogs enabled by default.
+    # Users can still exclude any auto-shared root from Codebot settings.
+    candidates.extend(hermes_repo_skill_dirs())
 
     resolved = _distinct_existing_dirs(candidates)
     if include_excluded:
@@ -360,6 +368,26 @@ def hermes_native_skill_dirs(include_excluded: bool = False) -> List[Path]:
 
 def hermes_skill_dirs() -> List[Path]:
     return _distinct_existing_dirs([*hermes_manual_skill_dirs(), *hermes_native_skill_dirs()])
+
+
+def hermes_source_detail(dir_path: Path | str) -> str:
+    key = _normalized_dir_key(dir_path)
+    if key in {_normalized_dir_key(path) for path in hermes_native_skill_dirs(include_excluded=True)}:
+        return "runtime"
+    if key in {_normalized_dir_key(path) for path in hermes_repo_skill_dirs()}:
+        return "repo"
+    if key in {_normalized_dir_key(path) for path in hermes_manual_skill_dirs()}:
+        return "manual"
+    return ""
+
+
+def hermes_source_detail_label(detail: str) -> str:
+    mapping = {
+        "runtime": "运行时",
+        "repo": "官方仓库",
+        "manual": "手动目录",
+    }
+    return mapping.get((detail or "").strip(), "")
 
 
 def _skill_dir_mtime(skill_dir: Path) -> float:
@@ -744,6 +772,16 @@ class SkillRegistry:
                         version=str(info.get("version") or "1.0.0"),
                         source=source,
                         source_label=SOURCE_LABELS[source],
+                        source_detail=(
+                            hermes_source_detail(dir_path)
+                            if source == HERMES
+                            else ""
+                        ),
+                        source_detail_label=(
+                            hermes_source_detail_label(hermes_source_detail(dir_path))
+                            if source == HERMES
+                            else ""
+                        ),
                         priority=SOURCE_PRIORITY[source],
                         writable=False,
                         path=entry,
@@ -818,16 +856,25 @@ class SkillRegistry:
 
     def _dedupe(self, entries: List[SkillEntry]) -> List[SkillEntry]:
         result: List[SkillEntry] = []
-        seen: set[str] = set()
+        seen_paths: set[str] = set()
+        seen_readonly_slug_keys: set[str] = set()
         for entry in sorted(entries, key=lambda item: item.priority):
             try:
-                key = str(entry.path.resolve()).lower()
+                path_key = str(entry.path.resolve()).lower()
             except Exception:
-                key = f"{entry.source}:{_normalize(entry.slug or entry.name) or entry.id}"
-            if key in seen:
+                path_key = f"{entry.source}:{_normalize(entry.slug or entry.name) or entry.id}"
+            if path_key in seen_paths:
                 logger.debug(f"[skills] skipped duplicate skill {entry.id}")
                 continue
-            seen.add(key)
+            readonly_slug_key = ""
+            if not entry.writable:
+                readonly_slug_key = f"{entry.source}:{_normalize(entry.slug or entry.name)}"
+                if readonly_slug_key in seen_readonly_slug_keys:
+                    logger.debug(f"[skills] skipped duplicate readonly skill by slug {entry.id}")
+                    continue
+            seen_paths.add(path_key)
+            if readonly_slug_key:
+                seen_readonly_slug_keys.add(readonly_slug_key)
             result.append(entry)
         return result
 

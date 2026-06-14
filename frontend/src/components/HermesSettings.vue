@@ -38,7 +38,7 @@
             添加目录
           </el-button>
           <div v-if="sharedSkillCandidates.length" class="dir-tip">
-            以下目录由 Codebot 自动并入 Hermes 的有效 skill 根目录。现在支持把自动共享目录加入排除列表，避免开发版/正式版重复扫描同一批 skill。
+            以下目录由 Codebot 自动并入 Hermes 的有效 skill 根目录。默认会自动共享 Hermes 运行时 `HERMES_HOME/skills`、Hermes 仓库内 `skills/` 和 `optional-skills/`、Codebot skills 以及 OpenCode skills；如果你不需要其中某个目录，可以把它加入排除列表。
           </div>
           <div v-for="dir in effectiveSharedSkillDirs" :key="`shared-${dir}`" class="dir-row dir-row--readonly">
             <el-input :model-value="dir" readonly />

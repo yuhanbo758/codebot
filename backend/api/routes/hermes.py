@@ -29,8 +29,10 @@ from pydantic import BaseModel
 
 from config import app_config, save_config, settings
 from core.skill_registry import (
+    get_skill_registry,
     hermes_excluded_auto_skill_dirs,
     hermes_native_skill_dirs,
+    hermes_repo_skill_dirs,
     hermes_skill_dirs,
     opencode_skill_dirs,
 )
@@ -255,10 +257,9 @@ def _all_auto_shared_skill_dirs() -> List[str]:
     builtin_root = settings.SKILLS_DIR
     if builtin_root.exists():
         dirs.append(str(builtin_root))
-    # Keep Hermes Agent's own discoverable skill roots in the same effective
-    # directory set, so "Hermes <-> OpenCode" sharing is actually symmetric:
-    # Hermes can see OpenCode skills, and Codebot also preserves Hermes-native
-    # skills discovered from install_dir/HERMES_HOME/default runtime locations.
+    # Auto-share both Hermes' runtime skill root and repo-bundled official
+    # skill catalogs by default. Users can exclude any unwanted auto-shared
+    # directory from Codebot settings.
     dirs.extend(str(path) for path in hermes_native_skill_dirs(include_excluded=True))
     dirs.extend(str(path) for path in opencode_skill_dirs())
     return _dedupe_dir_values(dirs)
@@ -276,11 +277,36 @@ def _configured_skill_dirs(selected_skills: Optional[List[str]] = None) -> List[
 
     When the user chooses Hermes, Codebot builtin skills and OpenCode shared
     skills are exposed as Hermes' own external skill directories. Explicit
-    `--skills` still narrows what Hermes is encouraged to call, but it does not
-    alter the shared directory mount model.
+    `--skills` should also narrow which external skill directories are mounted,
+    otherwise Hermes has to rescan every shared root even when the user already
+    pointed to a specific skill.
     """
-    _ = selected_skills
-    return _dedupe_dir_values([*_manual_skill_dirs(), *_shared_skill_dirs()])
+    selected_names = [str(skill).strip() for skill in (selected_skills or []) if str(skill).strip()]
+    if not selected_names:
+        return _dedupe_dir_values([*_manual_skill_dirs(), *_shared_skill_dirs()])
+
+    registry = get_skill_registry()
+    chosen_dirs: List[str] = []
+    for item in registry.list_skills(include_content=True):
+        item_id = str(item.get("id") or "").strip()
+        slug = str(item.get("slug") or "").strip()
+        name = str(item.get("name") or "").strip()
+        skill_dir = str(item.get("path") or "").strip()
+        if not skill_dir:
+            continue
+        if not any(chosen in {item_id, slug, name} for chosen in selected_names):
+            continue
+        # Hermes scans external_dirs recursively with os.walk, so mounting the
+        # exact skill directory keeps the selected skill loadable while avoiding
+        # a full rescan of every shared root.
+        chosen_dirs.append(skill_dir)
+
+    result = _dedupe_dir_values(chosen_dirs)
+    if not result:
+        # Fall back to the legacy full-share behavior if we fail to map the
+        # requested skill name back to a concrete directory.
+        result = _dedupe_dir_values([*_manual_skill_dirs(), *_shared_skill_dirs()])
+    return result
 
 
 def write_bridge_config(chat_model_override: Optional[str] = None, selected_skills: Optional[List[str]] = None) -> Path:
@@ -1351,6 +1377,7 @@ async def hermes_status():
             "configured_skill_dirs": _manual_skill_dirs(),
             "excluded_auto_skill_dirs": _dedupe_dir_values(hermes_excluded_auto_skill_dirs()),
             "hermes_native_skill_dirs": [str(path) for path in hermes_native_skill_dirs()],
+            "hermes_repo_skill_dirs": [str(path) for path in hermes_repo_skill_dirs()],
             "shared_skill_candidates": _all_auto_shared_skill_dirs(),
             "shared_skill_dirs": _shared_skill_dirs(),
             "skill_dirs": _configured_skill_dirs(),
