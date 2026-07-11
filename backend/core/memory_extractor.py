@@ -56,13 +56,13 @@ _EXTRACTION_RULES: List[Tuple[re.Pattern, str]] = [
 # 跳过过短或无意义的提取结果
 _MIN_CONTENT_LEN = 4
 _SKIP_KEYWORDS = {"一下", "这里", "那里", "这个", "那个", "什么", "怎么"}
-_AI_MAX_ITEMS = 5
+_AI_MAX_ITEMS = 2
 _AI_EXTRACT_SYSTEM_PROMPT = """你是记忆抽取助手。请从用户消息中提取"值得长期记住"的信息，规则：
 1) 仅提取稳定或高价值信息：偏好、习惯、身份信息、联系方式、地址、长期计划、明确备忘。
-2) 忽略一次性闲聊、无关寒暄、临时状态。
-3) 分类只允许：habit, preference, profile, note, contact, address。
-4) 返回 JSON 数组，每项为 {"content":"...", "category":"..."}。
-5) 不要输出任何解释文字。
+2) 忽略一次性闲聊、无关寒暄、临时状态、当前任务要求、代码修改细节和 AI 回复中的内容。
+3) 只有未来多次对话仍有帮助、且用户明确表达的内容才可提取；拿不准就返回空数组。
+4) 分类只允许：habit, preference, profile, note, contact, address。
+5) 最多返回 2 条 JSON，每项为 {"content":"...", "category":"..."}；不要输出解释。
 
 分类边界（严格遵守）：
 - preference（偏好）：用户喜欢/不喜欢什么、偏爱的风格/工具/语言/框架/方式。例如"喜欢简洁回复""偏好Python""爱用VSCode"。
@@ -143,9 +143,12 @@ def _dedup_with_existing(
     """简单去重：内容与已有记忆高度重叠则跳过"""
     filtered = []
     for content, category in candidates:
+        from difflib import SequenceMatcher
+        normalized = re.sub(r"[\s，。,.!！?？;；:：]", "", content).lower()
         already = any(
-            content in ex or ex in content
-            for ex in existing_contents
+            content in ex or ex in content or
+            SequenceMatcher(None, normalized, re.sub(r"[\s，。,.!！?？;；:：]", "", ex).lower()).ratio() >= 0.84
+            for ex in existing_contents if ex
         )
         if not already:
             filtered.append((content, category))

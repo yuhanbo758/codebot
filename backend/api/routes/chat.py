@@ -22,6 +22,7 @@ from loguru import logger
 from config import settings, app_config
 from database.init_db import conversations_db
 from core.memory_manager import MemoryManager
+from core.project_versioning import ProjectVersionManager
 from core.opencode_ws import OpenCodeClient, _conversation_current_session, _conversation_current_workspace, is_conversation_running, mark_conversation_running, unmark_conversation_running
 from core.memory_extractor import extract_and_save_background, extract_candidates
 from core.growth import add_candidate, record_chat_growth_candidates
@@ -957,36 +958,26 @@ async def _stage_or_create_schedule_from_message(
     target: Optional[str] = None,
     execution_model: Optional[str] = None,
 ) -> Optional[str]:
-    if _growth_candidate_decision_enabled():
-        task_candidate = await _build_task_growth_candidate_payload(
-            message,
-            conversation_id=conversation_id,
-            target=target,
-            execution_model=execution_model,
-        )
-        if not task_candidate:
-            return None
-        staged = stage_task_growth_candidate(
-            title=task_candidate.get("title") or "待确认定时任务",
-            content=task_candidate.get("content") or message,
-            conversation_id=conversation_id,
-            cron_expression=task_candidate.get("cron_expression") or "",
-            schedule_text=task_candidate.get("schedule_text") or message,
-            run_once=bool(task_candidate.get("run_once")),
-            executor=task_candidate.get("executor") or _task_executor_from_target(target),
-            execution_model=task_candidate.get("execution_model") or _task_execution_model_from_chat_model(execution_model),
-            notify_channels=task_candidate.get("notify_channels") if isinstance(task_candidate.get("notify_channels"), list) else None,
-            evidence=message,
-        )
-        if not staged:
-            return None
-        await notify_task_growth_candidate(staged, conversation_id=conversation_id)
-        return "已生成定时任务候选，可在“成长候选”中编辑后决定是否加入。"
-    return await _try_create_scheduled_task(
-        message,
-        executor=_task_executor_from_target(target),
-        execution_model=_task_execution_model_from_chat_model(execution_model),
+    task_candidate = await _build_task_growth_candidate_payload(
+        message, conversation_id=conversation_id, target=target, execution_model=execution_model,
     )
+    if not task_candidate:
+        return None
+    staged = stage_task_growth_candidate(
+        title=task_candidate.get("title") or "待确认定时任务",
+        content=task_candidate.get("content") or message,
+        conversation_id=conversation_id,
+        cron_expression=task_candidate.get("cron_expression") or "",
+        schedule_text=task_candidate.get("schedule_text") or message,
+        run_once=bool(task_candidate.get("run_once")),
+        executor=task_candidate.get("executor") or _task_executor_from_target(target),
+        execution_model=task_candidate.get("execution_model") or _task_execution_model_from_chat_model(execution_model),
+        notify_channels=task_candidate.get("notify_channels"), evidence=message,
+    )
+    if not staged:
+        return None
+    await notify_task_growth_candidate(staged, conversation_id=conversation_id)
+    return "定时任务已进入“成长候选”，请在右上角确认、编辑或拒绝；接受后才会加入定时任务。"
 
 
 async def _stage_or_materialize_skill(user_message: str, assistant_response: str, conversation_id: Optional[int] = None) -> bool:
@@ -1241,6 +1232,19 @@ def _runtime_finish(conv_id: str, content: str = ""):
         state["content"] = content
     state["running"] = False
     state["updated_at"] = datetime.now()
+
+
+def _prune_finished_chat_runtime(max_age_seconds: int = 3600) -> None:
+    """清理已结束对话的运行态缓存，避免长时间使用后字典和事件列表持续增长。"""
+    cutoff = datetime.now() - timedelta(seconds=max_age_seconds)
+    for key, state in list(_runtime_stream_state.items()):
+        if state.get("running") or state.get("updated_at", datetime.min) >= cutoff:
+            continue
+        _runtime_stream_state.pop(key, None)
+        queue = _task_queues.get(key)
+        if queue is None or queue.empty():
+            _task_queues.pop(key, None)
+            _queue_runners.pop(key, None)
 
 
 def _runtime_snapshot(conv_id: str, since_seq: int = 0) -> Dict[str, Any]:
@@ -2161,6 +2165,12 @@ async def _stream_execute_opencode_with_meta(
         model=model,
     )
     workspace = _resolve_opencode_workspace(project_dir=project_dir, target=target)
+    # 沙箱模式此前只存在设置与测试接口，聊天链从未真正使用。现在将 OpenCode
+    # 的工作区切到隔离目录，使其文件与命令工具实际受工作目录边界约束。
+    if sandbox_manager is not None and _should_use_sandbox(message):
+        await sandbox_manager.initialize()
+        workspace = sandbox_manager.workspace_dir
+        yield {"type": "meta_event", "event_type": "session.status", "message": f"已进入沙箱工作区：{workspace}"}
     # 首先 yield 内部提示词事件，供聊天日志记录
     yield {"type": "internal_prompt", "prompt": f"[system]\n{system_prompt}\n\n[user]\n{user_message}"}
 
@@ -5378,6 +5388,7 @@ def _format_cli_opencode_event(stream_event: dict, seen: set[str]) -> str:
 
 @router.post("/send_stream")
 async def send_to_opencode_stream(request: SendMessageRequest):
+    _prune_finished_chat_runtime()
     conv_id = str(request.conversation_id)
     full_message = request.message
     if request.attached_files:
@@ -5414,9 +5425,21 @@ async def send_to_opencode_stream(request: SendMessageRequest):
 
     async def _run_stream_worker(event_queue: asyncio.Queue):
         _runtime_start(conv_id)
+        version_manager = None
+        version_message_id = None
         try:
             conversations_db.connect()
             memory_manager = MemoryManager()
+            if request.project_dir and request.project_dir.strip():
+                recent = await memory_manager.get_messages(conversation_id=request.conversation_id, limit=1000)
+                user_messages = [item for item in recent if item.get("role") == "user"]
+                if user_messages:
+                    version_message_id = int(user_messages[-1]["id"])
+                    version_manager = ProjectVersionManager(settings.DATA_DIR)
+                    await asyncio.to_thread(
+                        version_manager.snapshot, request.project_dir,
+                        request.conversation_id, version_message_id, "before",
+                    )
             await event_queue.put({"type": "status", "phase": "started"})
             _runtime_append_event(conv_id, {"type": "status", "phase": "started"})
             raw_content = ""
@@ -5593,6 +5616,12 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                         target=request.target,
                         execution_model=request.model,
                     )
+                )
+
+            if version_manager and version_message_id:
+                await asyncio.to_thread(
+                    version_manager.snapshot, request.project_dir,
+                    request.conversation_id, version_message_id, "after",
                 )
 
             # 保存聊天日志（内部提示词 + 推理过程 + 最终回复）
@@ -5787,6 +5816,8 @@ async def _drain_queue(conv_id: str, conversation_id: int):
         try:
             conversations_db.connect()
             memory_manager = MemoryManager()
+            queued_version_manager = None
+            queued_version_message_id = None
 
             # 前端已保存的排队消息不重复入库；直连 API 入队的消息仍在这里保存。
             if not task.get("user_already_saved"):
@@ -5795,6 +5826,18 @@ async def _drain_queue(conv_id: str, conversation_id: int):
                     role="user",
                     content=task["message"]
                 )
+
+            queued_project_dir = str(task.get("project_dir") or "").strip()
+            if queued_project_dir:
+                recent = await memory_manager.get_messages(conversation_id=conversation_id, limit=1000)
+                user_messages = [item for item in recent if item.get("role") == "user"]
+                if user_messages:
+                    queued_version_message_id = int(user_messages[-1]["id"])
+                    queued_version_manager = ProjectVersionManager(settings.DATA_DIR)
+                    await asyncio.to_thread(
+                        queued_version_manager.snapshot, queued_project_dir,
+                        conversation_id, queued_version_message_id, "before",
+                    )
 
             content = await _execute_opencode(
                 task["message"],
@@ -5819,6 +5862,11 @@ async def _drain_queue(conv_id: str, conversation_id: int):
                         target=task.get("target"),
                         execution_model=task.get("model"),
                     )
+                )
+            if queued_version_manager and queued_version_message_id:
+                await asyncio.to_thread(
+                    queued_version_manager.snapshot, queued_project_dir,
+                    conversation_id, queued_version_message_id, "after",
                 )
         except Exception as e:
             logger.error(f"处理排队任务失败: {e}")
@@ -5944,6 +5992,23 @@ async def undo_message(conversation_id: int, request: UndoMessageRequest):
         if target_idx is None:
             raise HTTPException(status_code=404, detail="消息不存在")
 
+        conversation = await memory_manager.get_conversation(conversation_id)
+        project_dir = str((conversation or {}).get("project_dir") or "").strip()
+        restored = False
+        if project_dir:
+            target_message = messages[target_idx]
+            version_message_id = target_message.get("id") if target_message.get("role") == "user" else None
+            if not version_message_id:
+                for previous in reversed(messages[:target_idx]):
+                    if previous.get("role") == "user":
+                        version_message_id = previous.get("id")
+                        break
+            if version_message_id:
+                manager = ProjectVersionManager(settings.DATA_DIR)
+                restored = bool(await asyncio.to_thread(
+                    manager.restore_before, project_dir, conversation_id, int(version_message_id)
+                ))
+
         # 删除该消息及其之后的所有消息
         to_delete = messages[target_idx:]
         deleted_count = 0
@@ -5958,8 +6023,8 @@ async def undo_message(conversation_id: int, request: UndoMessageRequest):
 
         return {
             "success": True,
-            "data": {"deleted_count": deleted_count},
-            "message": f"已撤销 {deleted_count} 条消息"
+            "data": {"deleted_count": deleted_count, "project_restored": restored},
+            "message": f"已撤销 {deleted_count} 条消息" + ("，项目文件已恢复" if restored else "")
         }
     except HTTPException:
         raise

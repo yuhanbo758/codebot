@@ -196,6 +196,11 @@ class SandboxManager:
             "mode_description": "工作目录隔离模式（参考 LobsterAI 本地执行架构）",
         }
 
+    @property
+    def workspace_dir(self) -> str:
+        """返回 OpenCode 可使用的隔离工作目录。"""
+        return str(self._workspace)
+
     async def execute(self, prompt: str, env: Optional[Dict[str, str]] = None) -> SandboxResult:
         """
         在隔离工作目录中执行任务。

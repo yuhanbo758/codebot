@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+from difflib import SequenceMatcher
 
 from loguru import logger
 
@@ -116,6 +117,16 @@ def add_candidate(
                 item["evidence"] = evidence[:1200]
             _save(items)
             return item
+        if kind == "memory" and item.get("kind") == "memory" and item.get("status") == PENDING:
+            old = re.sub(r"[\s，。,.!！?？;；:：]", "", str(item.get("content") or "")).lower()
+            new = re.sub(r"[\s，。,.!！?？;；:：]", "", content).lower()
+            if old and new and (old in new or new in old or SequenceMatcher(None, old, new).ratio() >= 0.82):
+                item["hit_count"] = int(item.get("hit_count") or 1) + 1
+                item["updated_at"] = now
+                item["confidence"] = max(float(item.get("confidence") or 0), float(confidence))
+                item["payload"] = _merge_payload(item.get("payload"), incoming_payload)
+                _save(items)
+                return item
     item = {
         "id": uuid4().hex,
         "kind": kind,

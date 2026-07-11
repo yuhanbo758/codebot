@@ -46,9 +46,9 @@
           </el-menu>
           
           <div class="header-actions">
-            <el-button size="small" @click="openGrowthDialog">
-              成长候选
-            </el-button>
+            <el-badge :value="growthPendingCount" :hidden="growthPendingCount === 0">
+              <el-button size="small" @click="openGrowthDialog">成长候选</el-button>
+            </el-badge>
             <!-- 通知铃铛 -->
             <el-badge :value="unreadCount" :hidden="unreadCount === 0">
               <el-button :icon="Bell" circle @click="showNotifications" />
@@ -264,6 +264,8 @@ const updateState = ref({
 const growthDialogVisible = ref(false)
 const growthLoading = ref(false)
 const growthCandidates = ref([])
+const growthPendingCount = ref(0)
+const growthPollTimer = ref(null)
 const growthEditVisible = ref(false)
 const growthEditLoading = ref(false)
 const growthEditForm = ref({
@@ -449,11 +451,22 @@ const loadGrowthCandidates = async () => {
   try {
     const res = await axios.get('/api/growth/candidates', { params: { status: 'pending', limit: 50 } })
     growthCandidates.value = res.data?.data?.items || []
+    growthPendingCount.value = growthCandidates.value.length
   } catch (err) {
     ElMessage.error('加载成长候选失败')
   } finally {
     growthLoading.value = false
   }
+}
+
+const refreshGrowthCandidateState = async () => {
+  if (document.visibilityState === 'hidden') return
+  try {
+    const res = await axios.get('/api/growth/candidates', { params: { status: 'pending', limit: 50 } })
+    const items = res.data?.data?.items || []
+    growthPendingCount.value = items.length
+    if (growthDialogVisible.value) growthCandidates.value = items
+  } catch {}
 }
 
 const loadGrowthModels = async () => {
@@ -589,6 +602,8 @@ onMounted(() => {
     })
   }
   notificationStore.fetchUnreadCount()
+  refreshGrowthCandidateState()
+  growthPollTimer.value = setInterval(refreshGrowthCandidateState, 2000)
   notificationStore.fetchConfig().then(() => {
     const interval = Math.max(5, Math.min(120, Number(config.value?.poll_interval || 30)))
     if (pollTimer.value) {
@@ -602,6 +617,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (pollTimer.value) clearInterval(pollTimer.value)
+  if (growthPollTimer.value) clearInterval(growthPollTimer.value)
   if (typeof removeUpdateListener === 'function') removeUpdateListener()
   if (typeof removeAccountChangedListener === 'function') removeAccountChangedListener()
   if (typeof removeSkillDownloadListener === 'function') removeSkillDownloadListener()

@@ -2427,8 +2427,11 @@ const selectConversation = async (conversationId) => {
   currentConversationId.value = conversationId
   localStorage.setItem(LAST_CONVERSATION_KEY, String(conversationId))
   try {
-    // 加载对话详情以获取 project_dir
-    const convResponse = await axios.get(`/api/chat/conversations/${conversationId}`)
+    // 对话详情与消息互不依赖，并行请求可显著缩短页面回切等待。
+    const [convResponse, response] = await Promise.all([
+      axios.get(`/api/chat/conversations/${conversationId}`),
+      axios.get(`/api/chat/conversations/${conversationId}/messages`)
+    ])
     const convData = convResponse.data?.data
     currentConversation.value = convData || null
     currentProjectDir.value = convData?.project_dir || ''
@@ -2437,7 +2440,6 @@ const selectConversation = async (conversationId) => {
       await loadMultiAgentMembers()
     }
 
-    const response = await axios.get(`/api/chat/conversations/${conversationId}/messages`)
     const dbMessages = response.data.data.items || []
     // 恢复该对话已缓存的 event 气泡（推理过程），仅在流式传输仍在进行中时
     // 如果 runtimeReloadDone 已为 true，说明流已结束并已做过 DB reload，不需要再注入缓存
@@ -3320,14 +3322,14 @@ const undoFromMessage = async (msg) => {
       '撤销消息',
       { confirmButtonText: '撤销', cancelButtonText: '取消', type: 'warning' }
     )
-    await axios.post(`/api/chat/conversations/${currentConversationId.value}/undo`, {
+    const undoResponse = await axios.post(`/api/chat/conversations/${currentConversationId.value}/undo`, {
       message_id: msg.id,
       conversation_id: currentConversationId.value
     })
     // Reload messages to reflect the deletion
     const response = await axios.get(`/api/chat/conversations/${currentConversationId.value}/messages`)
     messages.value = response.data.data.items || []
-    ElMessage.success('已撤销')
+    ElMessage.success(undoResponse.data?.data?.project_restored ? '已撤销消息并恢复项目文件' : '已撤销消息')
   } catch (error) {
     if (error !== 'cancel') {
       ElMessage.error('撤销失败：消息可能是本地临时消息，请刷新后重试')
@@ -3514,10 +3516,8 @@ const formatDate = (dateStr) => {
 
 onMounted(() => {
   loadConversations(true)
-  loadModels()
-  loadCommands()
-  loadThirdPartyStatus()
-  loadLinkOpenMode()
+  // 非首屏关键数据并行加载，避免从其他页面返回聊天时串行等待。
+  Promise.allSettled([loadModels(), loadCommands(), loadThirdPartyStatus(), loadLinkOpenMode()])
   queueStatusTimer = setInterval(() => {
     if (currentConversationId.value) {
       fetchQueueStatus(currentConversationId.value, { reloadOnFinish: true })

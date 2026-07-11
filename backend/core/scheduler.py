@@ -99,6 +99,7 @@ class TaskScheduler:
         
         self.tasks: Dict[str, ScheduledTask] = {}
         self.running = False
+        self._check_task: Optional[asyncio.Task] = None
         self._db_lock = threading.Lock()
 
         # 初始化数据库
@@ -186,12 +187,20 @@ class TaskScheduler:
         await self._load_tasks()
         
         # 启动检查循环
-        asyncio.create_task(self._check_loop())
+        if self._check_task is None or self._check_task.done():
+            self._check_task = asyncio.create_task(self._check_loop())
         logger.info("定时任务调度器已启动")
     
     async def stop(self):
         """停止调度器"""
         self.running = False
+        if self._check_task and not self._check_task.done():
+            self._check_task.cancel()
+            try:
+                await self._check_task
+            except asyncio.CancelledError:
+                pass
+        self._check_task = None
         logger.info("定时任务调度器已停止")
     
     async def _load_tasks(self):
