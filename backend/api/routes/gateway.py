@@ -17,6 +17,7 @@
     print(resp.choices[0].message.content)
 """
 import json
+import re
 import time
 import uuid
 from typing import Optional, List, Dict, Any
@@ -190,6 +191,119 @@ def _tool_calls_to_text(tool_calls: Optional[List[Dict[str, Any]]]) -> str:
     return json.dumps(tool_calls, ensure_ascii=False, separators=(",", ":"))
 
 
+_SYSTEM_REMINDER_RE = re.compile(
+    r"<system-reminder(?:\s[^>]*)?>.*?</system-reminder\s*>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_USER_INPUT_RE = re.compile(
+    r"<user_input(?:\s[^>]*)?>(.*?)</user_input\s*>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_ide_wrapped_user_content(content: str) -> tuple[str, Optional[str]]:
+    """分离 IDE 注入的内部上下文与用户真正输入的内容。
+
+    Trae 等新版 OpenAI 兼容客户端可能把多个 ``<system-reminder>`` 和
+    ``<user_input>`` 一起放进一条 user 消息。若直接拼接，OpenCode 会把
+    隐藏提示词当成用户正文，模型便可能在回答前复述全部内部上下文。
+
+    返回值为 ``(用户可见问题, 内部上下文)``。普通用户消息不包含这些
+    标签时保持原样，避免影响既有客户端。
+    """
+    if "<system-reminder" not in content.lower():
+        return content, None
+
+    user_inputs = [item.strip() for item in _USER_INPUT_RE.findall(content) if item.strip()]
+    reminder_blocks = _SYSTEM_REMINDER_RE.findall(content)
+
+    # system-reminder 之外仍可能存在普通问题文本，需要与显式 user_input 合并。
+    outside_text = _SYSTEM_REMINDER_RE.sub("", content)
+    # 若上游截断了闭合标签，从未闭合的开始标签起全部视为内部内容。
+    unclosed_index = outside_text.lower().find("<system-reminder")
+    if unclosed_index >= 0:
+        outside_text = outside_text[:unclosed_index]
+    outside_text = _USER_INPUT_RE.sub("", outside_text).strip()
+    visible_parts = [part for part in [outside_text, *user_inputs] if part]
+
+    # 内部上下文继续提供给 OpenCode，但移除其中的 user_input，防止问题重复。
+    internal_parts = []
+    for block in reminder_blocks:
+        cleaned = _USER_INPUT_RE.sub("", block).strip()
+        if cleaned:
+            internal_parts.append(cleaned)
+
+    visible_text = "\n\n".join(visible_parts).strip()
+    internal_context = "\n\n".join(internal_parts).strip() or None
+    return visible_text, internal_context
+
+
+def _sanitize_assistant_content(content: str) -> str:
+    """删除模型意外复述的内部 system-reminder，避免隐藏提示词泄漏。"""
+    if not content:
+        return ""
+    sanitized = _SYSTEM_REMINDER_RE.sub("", content)
+    # 回答被 max_tokens 等限制截断时，未闭合的提醒块同样不能对外返回。
+    unclosed_index = sanitized.lower().find("<system-reminder")
+    if unclosed_index >= 0:
+        sanitized = sanitized[:unclosed_index]
+    return sanitized.lstrip()
+
+
+class _ReminderStreamSanitizer:
+    """跨 SSE 分片过滤 ``<system-reminder>``，同时保持正常内容流式输出。
+
+    标签可能被模型拆成多个 delta，因此不能逐块使用正则。该状态机仅缓存
+    最长标签长度附近的少量文本，不会把整段回答延迟到流结束。
+    """
+
+    _OPEN = "<system-reminder"
+    _CLOSE = "</system-reminder>"
+
+    def __init__(self) -> None:
+        self._pending = ""
+        self._inside_reminder = False
+
+    def feed(self, delta: str, *, final: bool = False) -> str:
+        self._pending += delta
+        visible_parts: List[str] = []
+
+        while self._pending:
+            lowered = self._pending.lower()
+            if self._inside_reminder:
+                close_index = lowered.find(self._CLOSE)
+                if close_index >= 0:
+                    self._pending = self._pending[close_index + len(self._CLOSE):]
+                    self._inside_reminder = False
+                    continue
+                if final:
+                    self._pending = ""
+                else:
+                    # 只保留可能属于闭合标签前缀的尾部，其余隐藏内容立即丢弃。
+                    self._pending = self._pending[-(len(self._CLOSE) - 1):]
+                break
+
+            open_index = lowered.find(self._OPEN)
+            if open_index >= 0:
+                visible_parts.append(self._pending[:open_index])
+                self._pending = self._pending[open_index + len(self._OPEN):]
+                self._inside_reminder = True
+                continue
+
+            if final:
+                visible_parts.append(self._pending)
+                self._pending = ""
+            else:
+                # 开始标签可能横跨两个 delta，保留足够长的尾部等待下一块。
+                keep = min(len(self._pending), len(self._OPEN) - 1)
+                if len(self._pending) > keep:
+                    visible_parts.append(self._pending[:-keep])
+                    self._pending = self._pending[-keep:]
+            break
+
+        return "".join(visible_parts)
+
+
 def _build_user_prompt(messages: List[ChatMessage]) -> tuple[str, Optional[str]]:
     """将 OpenAI 格式的 messages 数组转换为 OpenCode 需要的 prompt + system。
     
@@ -201,6 +315,13 @@ def _build_user_prompt(messages: List[ChatMessage]) -> tuple[str, Optional[str]]
     normalized_messages = []
     for msg in messages:
         content = _content_to_text(msg.content)
+        if msg.role == "user":
+            content, internal_context = _split_ide_wrapped_user_content(content)
+            if internal_context:
+                system_parts.append(internal_context)
+        elif msg.role == "assistant":
+            # 清理历史轮次中可能已经泄漏的提醒，避免它在后续多轮对话中反复传播。
+            content = _sanitize_assistant_content(content)
         normalized_messages.append((msg, content))
         if msg.role in {"system", "developer"}:
             if content:
@@ -368,7 +489,8 @@ async def chat_completions(request: ChatCompletionRequest):
             detail = f"模型不存在或 provider 名称错误: {detail}"
         raise HTTPException(status_code=502, detail=f"AI 调用失败: {detail}")
     
-    content = result.content or ""
+    # 防御性清理：即使底层模型复述了 IDE 内部提醒，也不允许网关返回给用户。
+    content = _sanitize_assistant_content(result.content or "")
     return ChatCompletionResponse(
         id=request_id,
         created=created,
@@ -399,6 +521,7 @@ async def _stream_response(
 ):
     """生成 SSE 流式响应，兼容 OpenAI 流式格式"""
     completion_text = ""
+    reminder_sanitizer = _ReminderStreamSanitizer()
 
     def usage_chunk() -> str:
         """新版 SDK 在 include_usage=true 时需要的末尾用量块。"""
@@ -426,7 +549,8 @@ async def _stream_response(
             event_type = event.get("type", "")
             
             if event_type == "content_delta":
-                delta = event.get("delta", "")
+                raw_delta = event.get("delta", "")
+                delta = reminder_sanitizer.feed(raw_delta) if isinstance(raw_delta, str) else ""
                 if delta:
                     completion_text += delta
                     chunk = {
@@ -443,6 +567,21 @@ async def _stream_response(
                     yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
             
             elif event_type == "done":
+                final_delta = reminder_sanitizer.feed("", final=True)
+                if final_delta:
+                    completion_text += final_delta
+                    chunk = {
+                        "id": request_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": response_model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": final_delta},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                 # 发送结束标记
                 chunk = {
                     "id": request_id,
@@ -461,7 +600,22 @@ async def _stream_response(
                 yield "data: [DONE]\n\n"
                 return
         
-        # 如果流正常结束但没有 done 事件，补发结束标记
+        # 如果流正常结束但没有 done 事件，先刷新过滤器，再补发结束标记。
+        final_delta = reminder_sanitizer.feed("", final=True)
+        if final_delta:
+            completion_text += final_delta
+            chunk = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": response_model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": final_delta},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         chunk = {
             "id": request_id,
             "object": "chat.completion.chunk",

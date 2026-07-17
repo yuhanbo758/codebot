@@ -164,6 +164,8 @@ Codebot 提供 OpenAI 兼容接口：
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
+端口取决于运行方式：正式安装版默认使用 `http://127.0.0.1:15682/v1`；在 `electron/` 目录执行 `npm start` 启动的开发版默认使用 `http://127.0.0.1:18080/v1`。开发版测试脚本不要继续写死正式版的 `15682` 端口。
+
 使用前请先请求 `/v1/models`，从返回结果里的 `id` 选择当前真实可用的模型，不要直接写死一个本机未连接的模型名。
 
 ```python
@@ -213,7 +215,7 @@ response.raise_for_status()
 print(response.json()["choices"][0]["message"]["content"])
 ```
 
-网关兼容 `messages[].content` 的字符串、`null` 和新版内容块数组格式，并接受 `developer`、`tool`、`tool_calls`、`max_completion_tokens`、`stream_options.include_usage` 等新版字段。图片和音频内容块当前会转换成简短的文本引用后交给 OpenCode，文本块可正常透传。
+网关兼容 `messages[].content` 的字符串、`null` 和新版内容块数组格式，并接受 `developer`、`tool`、`tool_calls`、`max_completion_tokens`、`stream_options.include_usage` 等新版字段。Trae 等 IDE 将 `<system-reminder>` 与 `<user_input>` 包装在同一条消息中时，网关会自动分离内部上下文和真实问题，并在非流式、流式响应中阻止内部提示词泄漏。图片和音频内容块当前会转换成简短的文本引用后交给 OpenCode，文本块可正常透传。
 
 如果你直接调用 HTTP 接口而不是 OpenAI SDK，`model` 字段可以省略或填写 `codebot-default`；此时后端会优先使用聊天页默认模型 `chat_default_model`，若未设置则依次回退到记忆自动整理模型 `memory.organize_model`、主模型 `primary_model`，再没有才交给 OpenCode 自行选择默认模型。
 
