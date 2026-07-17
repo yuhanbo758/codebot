@@ -188,7 +188,34 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-如果你直接调用 HTTP 接口而不是 OpenAI SDK，`model` 字段可以省略；此时后端会优先使用记忆自动整理模型 `memory.organize_model`，若未设置则回退到聊天页默认模型 `chat_default_model`、主模型 `primary_model`，再没有才交给 OpenCode 自行选择默认模型。
+也可以完全不安装 OpenAI SDK，直接使用 `requests` 调用：
+
+```python
+import requests
+
+response = requests.post(
+    "http://127.0.0.1:15682/v1/chat/completions",
+    headers={"Authorization": "Bearer codebot"},
+    json={
+        "model": "codebot-default",
+        "messages": [
+            {
+                "role": "user",
+                # 同时兼容旧版字符串和新版 content-part 数组。
+                "content": [{"type": "text", "text": "请介绍一下你自己。"}],
+            }
+        ],
+        "stream": False,
+    },
+    timeout=300,
+)
+response.raise_for_status()
+print(response.json()["choices"][0]["message"]["content"])
+```
+
+网关兼容 `messages[].content` 的字符串、`null` 和新版内容块数组格式，并接受 `developer`、`tool`、`tool_calls`、`max_completion_tokens`、`stream_options.include_usage` 等新版字段。图片和音频内容块当前会转换成简短的文本引用后交给 OpenCode，文本块可正常透传。
+
+如果你直接调用 HTTP 接口而不是 OpenAI SDK，`model` 字段可以省略或填写 `codebot-default`；此时后端会优先使用聊天页默认模型 `chat_default_model`，若未设置则依次回退到记忆自动整理模型 `memory.organize_model`、主模型 `primary_model`，再没有才交给 OpenCode 自行选择默认模型。
 
 ## 📁 项目结构
 

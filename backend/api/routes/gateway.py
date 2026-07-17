@@ -7,7 +7,7 @@
 建议先请求 `GET /v1/models` 获取当前真实可用的模型 ID，
 再发起 `POST /v1/chat/completions`。
 
-用法示例:
+用法示例（既支持 OpenAI SDK，也支持 requests 等普通 HTTP 客户端）:
     from openai import OpenAI
     client = OpenAI(base_url="http://127.0.0.1:15682/v1", api_key="any")
     resp = client.chat.completions.create(
@@ -16,13 +16,14 @@
     )
     print(resp.choices[0].message.content)
 """
+import json
 import time
 import uuid
 from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from loguru import logger
 
 from config import app_config
@@ -51,15 +52,32 @@ opencode_ws: Optional[OpenCodeClient] = None
 # ── 请求/响应模型 ──────────────────────────────────────────────────────────
 
 class ChatMessage(BaseModel):
-    role: str  # "system" | "developer" | "user" | "assistant"
-    content: str
+    """兼容新旧 OpenAI Chat Completions 消息格式。
+
+    新版客户端会把 content 发送为内容块数组，而不是单一字符串；工具调用
+    消息还可能没有 content，因此这里先宽松接收，再由 `_content_to_text()`
+    统一转换为 OpenCode 可以消费的文本。
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    role: str  # system | developer | user | assistant | tool | function
+    content: Any = None
+    name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
 
 class ChatCompletionRequest(BaseModel):
+    # 保留未知字段，兼容新版 SDK 新增的 metadata、parallel_tool_calls 等参数。
+    model_config = ConfigDict(extra="allow")
+
     model: Optional[str] = None
     messages: List[ChatMessage]
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
     stream: Optional[bool] = False
+    stream_options: Optional[Dict[str, Any]] = None
 
 class Usage(BaseModel):
     prompt_tokens: int = 0
@@ -104,6 +122,74 @@ def _get_opencode_client() -> OpenCodeClient:
     return OpenCodeClient(app_config.opencode.server_url)
 
 
+def _short_media_reference(value: Any, media_name: str) -> str:
+    """将无法直接转发的多媒体块转换为安全、简短的文本引用。"""
+    if isinstance(value, dict):
+        value = value.get("url") or value.get("file_id")
+    if not isinstance(value, str) or not value:
+        return f"[{media_name}]"
+    # base64 data URL 可能长达数 MB，不能把它完整拼进文本提示词。
+    if value.startswith("data:"):
+        return f"[{media_name}：内嵌数据]"
+    return f"[{media_name}：{value}]"
+
+
+def _content_to_text(content: Any) -> str:
+    """把 OpenAI 新旧 content 结构统一转换为纯文本。
+
+    支持旧版字符串，以及新版 Chat Completions/Responses 风格的文本内容块。
+    图片、音频等当前 OpenCode 文本网关无法原样传递的块会保留为简短引用，
+    避免静默丢失上下文，也避免将大段 base64 数据塞入提示词。
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise ValueError("messages[].content 必须是字符串、内容块数组或 null")
+
+    parts: List[str] = []
+    for index, part in enumerate(content):
+        if isinstance(part, str):
+            parts.append(part)
+            continue
+        if not isinstance(part, dict):
+            raise ValueError(f"messages[].content[{index}] 必须是字符串或对象")
+
+        part_type = str(part.get("type") or "text").lower()
+        if part_type in {"text", "input_text", "output_text"}:
+            text_value = part.get("text", "")
+            # 少数兼容客户端会使用 {"text": {"value": "..."}}。
+            if isinstance(text_value, dict):
+                text_value = text_value.get("value", "")
+            if not isinstance(text_value, str):
+                raise ValueError(f"messages[].content[{index}].text 必须是字符串")
+            parts.append(text_value)
+        elif part_type in {"image_url", "input_image"}:
+            image_value = part.get("image_url") or part.get("url") or part.get("file_id")
+            parts.append(_short_media_reference(image_value, "图片输入"))
+        elif part_type in {"input_audio", "audio"}:
+            audio_value = part.get("input_audio") or part.get("audio") or part.get("file_id")
+            parts.append(_short_media_reference(audio_value, "音频输入"))
+        elif part_type in {"refusal"}:
+            refusal = part.get("refusal", "")
+            if isinstance(refusal, str):
+                parts.append(refusal)
+        else:
+            # 面向未来字段保持可用：未知块若带有文本就保留文本，否则给出类型标记。
+            fallback_text = part.get("text") or part.get("content")
+            parts.append(fallback_text if isinstance(fallback_text, str) else f"[{part_type} 内容块]")
+
+    return "\n".join(part for part in parts if part)
+
+
+def _tool_calls_to_text(tool_calls: Optional[List[Dict[str, Any]]]) -> str:
+    """将 assistant.tool_calls 保存进多轮文本，避免工具调用上下文丢失。"""
+    if not tool_calls:
+        return ""
+    return json.dumps(tool_calls, ensure_ascii=False, separators=(",", ":"))
+
+
 def _build_user_prompt(messages: List[ChatMessage]) -> tuple[str, Optional[str]]:
     """将 OpenAI 格式的 messages 数组转换为 OpenCode 需要的 prompt + system。
     
@@ -112,20 +198,30 @@ def _build_user_prompt(messages: List[ChatMessage]) -> tuple[str, Optional[str]]
     system_parts = []
     conversation_parts = []
     
+    normalized_messages = []
     for msg in messages:
+        content = _content_to_text(msg.content)
+        normalized_messages.append((msg, content))
         if msg.role in {"system", "developer"}:
-            system_parts.append(msg.content)
+            if content:
+                system_parts.append(content)
         elif msg.role == "user":
-            conversation_parts.append(f"用户: {msg.content}")
+            conversation_parts.append(f"用户: {content}")
         elif msg.role == "assistant":
-            conversation_parts.append(f"助手: {msg.content}")
+            conversation_parts.append(f"助手: {content}")
+            tool_calls_text = _tool_calls_to_text(msg.tool_calls)
+            if tool_calls_text:
+                conversation_parts.append(f"助手工具调用: {tool_calls_text}")
+        elif msg.role in {"tool", "function"}:
+            tool_name = msg.name or msg.tool_call_id or "未命名工具"
+            conversation_parts.append(f"工具结果({tool_name}): {content}")
     
     system = "\n\n".join(system_parts) if system_parts else None
     
     # 如果只有一条用户消息，直接使用其内容
-    user_messages = [m for m in messages if m.role == "user"]
+    user_messages = [(m, content) for m, content in normalized_messages if m.role == "user"]
     if len(user_messages) == 1 and len([m for m in messages if m.role == "assistant"]) == 0:
-        prompt = user_messages[-1].content
+        prompt = user_messages[-1][1]
     else:
         # 多轮对话：拼接所有非 system 消息
         prompt = "\n".join(conversation_parts)
@@ -226,7 +322,13 @@ async def chat_completions(request: ChatCompletionRequest):
     
     model = await _resolve_model(request.model, client)
     await _validate_model_if_needed(model, client)
-    prompt, system = _build_user_prompt(request.messages)
+    try:
+        prompt, system = _build_user_prompt(request.messages)
+    except ValueError as exc:
+        # 使用 400 返回清晰的兼容格式错误，而不是让 Pydantic 提前抛出难读的 422。
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not prompt.strip():
+        raise HTTPException(status_code=400, detail="messages 中没有可处理的用户内容")
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
     # 用于响应体中的 model 字段（不能为 None）
@@ -234,7 +336,16 @@ async def chat_completions(request: ChatCompletionRequest):
     
     if request.stream:
         return StreamingResponse(
-            _stream_response(client, prompt, model, system, request_id, created, response_model),
+            _stream_response(
+                client,
+                prompt,
+                model,
+                system,
+                request_id,
+                created,
+                response_model,
+                include_usage=bool((request.stream_options or {}).get("include_usage")),
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -284,10 +395,27 @@ async def _stream_response(
     request_id: str,
     created: int,
     response_model: str = "default",
+    include_usage: bool = False,
 ):
     """生成 SSE 流式响应，兼容 OpenAI 流式格式"""
-    import json
-    
+    completion_text = ""
+
+    def usage_chunk() -> str:
+        """新版 SDK 在 include_usage=true 时需要的末尾用量块。"""
+        payload = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": response_model,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": len(prompt) // 4,
+                "completion_tokens": len(completion_text) // 4,
+                "total_tokens": (len(prompt) + len(completion_text)) // 4,
+            },
+        }
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
     try:
         async for event in client.execute_task_stream(
             prompt=prompt,
@@ -300,6 +428,7 @@ async def _stream_response(
             if event_type == "content_delta":
                 delta = event.get("delta", "")
                 if delta:
+                    completion_text += delta
                     chunk = {
                         "id": request_id,
                         "object": "chat.completion.chunk",
@@ -327,6 +456,8 @@ async def _stream_response(
                     }]
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                if include_usage:
+                    yield usage_chunk()
                 yield "data: [DONE]\n\n"
                 return
         
@@ -343,6 +474,8 @@ async def _stream_response(
             }]
         }
         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        if include_usage:
+            yield usage_chunk()
         yield "data: [DONE]\n\n"
         
     except Exception as e:
