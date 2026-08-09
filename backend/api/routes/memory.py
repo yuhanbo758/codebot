@@ -8,6 +8,7 @@ from datetime import datetime
 
 from config import settings, MemoryConfig
 from core.memory_manager import MemoryManager
+from utils.background_tasks import create_background_task
 
 router = APIRouter()
 memory_manager: Optional[MemoryManager] = None
@@ -489,7 +490,7 @@ async def trigger_organize():
         organize_model = None
 
     manager = _get_memory_manager()
-    asyncio.create_task(organize_memories(manager, ws, model=organize_model))
+    create_background_task(organize_memories(manager, ws, model=organize_model), name="memory-organize-manual")
 
     return {
         "success": True,

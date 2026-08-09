@@ -152,6 +152,19 @@ def _bridge_config_path() -> Path:
     return settings.DATA_DIR / "hermes" / "codebot_bridge.json"
 
 
+def _installed_hermes_config_version() -> Optional[int]:
+    """读取当前安装版 Hermes 的配置 schema 版本，避免升级后反复提示迁移。"""
+    defaults_path = _default_install_dir() / "hermes_cli" / "config_defaults.py"
+    try:
+        content = defaults_path.read_text(encoding="utf-8", errors="ignore")
+        match = re.search(r'["\']_config_version["\']\s*:\s*(\d+)', content)
+        if match:
+            return int(match.group(1))
+    except Exception:
+        pass
+    return None
+
+
 def _hermes_venv_dir(install_dir: Path) -> Path:
     return install_dir / ".venv"
 
@@ -438,6 +451,9 @@ def _write_hermes_home_config(
             "scheduler_enabled": bool(app_config.hermes.share_scheduler),
         },
     }
+    config_version = _installed_hermes_config_version()
+    if config_version is not None:
+        config["_config_version"] = config_version
     config_path = home / "config.yaml"
     config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -632,8 +648,21 @@ async def _ensure_repo(install_dir: Path, update: bool = False) -> Dict[str, Any
     repo_url = (app_config.hermes.repo_url or "https://github.com/NousResearch/hermes-agent").strip()
     if not _has_repo_checkout(install_dir):
         install_dir.parent.mkdir(parents=True, exist_ok=True)
-        return await _run_command(["git", "clone", repo_url, str(install_dir)], timeout=900)
+        # Hermes 上游历史较大，首次安装只需要当前代码。浅克隆能显著缩短
+        # Windows 桌面端的一键安装时间；后续更新仍通过 fetch + ff-only pull。
+        return await _run_command(["git", "clone", "--depth", "1", repo_url, str(install_dir)], timeout=900)
     if update and (install_dir / ".git").exists():
+        dirty = await _run_command(["git", "status", "--porcelain"], cwd=install_dir, timeout=60)
+        if dirty.get("returncode") != 0:
+            return dirty
+        if (dirty.get("output") or "").strip():
+            return {
+                "returncode": 1,
+                "output": "Hermes 安装目录存在本地修改，已停止更新以避免覆盖。请先提交、暂存或清理该目录。",
+            }
+        fetch = await _run_command(["git", "fetch", "--depth", "1", "origin", "main"], cwd=install_dir, timeout=600)
+        if fetch.get("returncode") != 0:
+            return fetch
         return await _run_command(["git", "pull", "--ff-only"], cwd=install_dir, timeout=600)
     return {"returncode": 0, "output": "Hermes repository already exists"}
 
@@ -716,7 +745,9 @@ def _build_cli_args(message: str, model: Optional[str], skills: Optional[List[st
     # --oneshot/-z. Hermes documents --oneshot as "stdout = final response only"
     # and it bypasses cli.py entirely, which does not match Codebot's need to
     # mirror real CLI behavior and stream the actual terminal session.
-    args = ["--cli", "chat", "-q", message.strip(), "--yolo", "--accept-hooks"]
+    # 当前 Hermes 官方入口为 `hermes chat -q`。`--cli` 是可选的界面覆盖参数，
+    # 不能放在子命令前假设所有版本都接受；单次 query 本身不会进入交互 TUI。
+    args = ["chat", "-q", message.strip(), "--yolo", "--accept-hooks"]
     effective_model = _model_for_chat_tasks(model)
     if effective_model:
         args.extend(["--provider", "custom", "--model", effective_model])
@@ -738,6 +769,33 @@ def _last_nonempty_line(text: str) -> str:
     return lines[-1] if lines else (text or "").strip()
 
 
+def _strip_hermes_prompt_echo(output: str, message: str) -> str:
+    """移除 Hermes v0.20 单次查询模式偶发回显的原始用户提示。"""
+    value = str(output or "")
+    prompt = str(message or "").strip()
+    if not prompt:
+        return value
+    # 只处理输出开头的首次完整回显，避免误删回答正文中正常引用的用户内容。
+    leading = len(value) - len(value.lstrip())
+    prefix = value[:leading]
+    remainder = value[leading:]
+    for candidate in (prompt, f"> {prompt}"):
+        if remainder.startswith(candidate):
+            remainder = remainder[len(candidate):].lstrip(" \t\r\n")
+            return f"{prefix}{remainder}" if remainder else ""
+    return value
+
+
+def _append_clean_hermes_output(current: str, delta: str, message: str) -> tuple[str, str]:
+    """追加清洗后的输出，并返回适合流式发送的增量。"""
+    previous = str(current or "")
+    combined = _strip_hermes_prompt_echo(f"{previous}{delta or ''}", message)
+    if combined == previous:
+        return combined, ""
+    emitted = combined[len(previous):] if combined.startswith(previous) else combined
+    return combined, emitted
+
+
 def _clean_hermes_terminal_line(line: str) -> Optional[str]:
     text = _ANSI_ESCAPE_RE.sub("", str(line or "").replace("\r", ""))
     text = _CONTROL_CHAR_RE.sub("", text).rstrip()
@@ -750,6 +808,8 @@ def _clean_hermes_terminal_line(line: str) -> Optional[str]:
         return ""
     lowered = stripped.lower()
     if lowered.startswith("initializing agent"):
+        return None
+    if "context file" in lowered and "truncated" in lowered:
         return None
     if lowered.startswith("resume this session with"):
         return None
@@ -1052,6 +1112,7 @@ async def run_hermes_oneshot_stream(
     last_idle_notice_at = 0.0
     last_idle_debug_at = 0.0
     stdout_debugged = False
+    context_warning_emitted = False
     startup_restart_count = 0
     idle_timeout = int(os.environ.get("CODEBOT_HERMES_IDLE_TIMEOUT", "300") or "300")
     startup_no_output_restart_seconds = int(
@@ -1293,15 +1354,29 @@ async def run_hermes_oneshot_stream(
                     {"pid": process.pid, "chunk_len": len(delta), "preview": delta[:400]},
                 )
                 # #endregion
+            if (
+                not context_warning_emitted
+                and re.search(r"Context file .+ TRUNCATED", visible_output[-4000:], flags=re.IGNORECASE)
+            ):
+                context_warning_emitted = True
+                yield {
+                    "type": "event",
+                    "event": _progress_status_event(
+                        event_type="session.warning",
+                        summary="Hermes 已截断过长的项目上下文文件",
+                        detail="项目 AGENTS.md 超过 Hermes 当前模型的单文件上下文上限；正文不会混入最终回答。可精简该文件或在 Hermes 配置中调整 context_file_max_chars。",
+                    ),
+                }
             stream_buffer = f"{stream_buffer}{delta}"
             clean_delta, stream_buffer = _consume_hermes_terminal_stream(stream_buffer, flush=False)
             if clean_delta:
-                clean_output = f"{clean_output}{clean_delta}"
+                clean_output, emitted_delta = _append_clean_hermes_output(clean_output, clean_delta, message)
                 last_visible_output_at = loop.time()
-                trace_events = _trace_events_from_delta(clean_delta)
+                trace_events = _trace_events_from_delta(emitted_delta)
                 if trace_events:
                     last_visible_line = str(trace_events[-1].get("summary") or last_visible_line)
-                yield {"type": "stdout", "delta": clean_delta, "content": clean_output[-12000:]}
+                if emitted_delta:
+                    yield {"type": "stdout", "delta": emitted_delta, "content": clean_output[-12000:]}
                 for trace_event in trace_events:
                     yield {"type": "event", "event": trace_event}
 
@@ -1350,12 +1425,13 @@ async def run_hermes_oneshot_stream(
             stream_buffer = f"{stream_buffer}{flush_tail}"
         final_delta, stream_buffer = _consume_hermes_terminal_stream(stream_buffer, flush=True)
         if final_delta:
-            clean_output = f"{clean_output}{final_delta}"
+            clean_output, emitted_delta = _append_clean_hermes_output(clean_output, final_delta, message)
             last_visible_output_at = loop.time()
-            trace_events = _trace_events_from_delta(final_delta)
+            trace_events = _trace_events_from_delta(emitted_delta)
             if trace_events:
                 last_visible_line = str(trace_events[-1].get("summary") or last_visible_line)
-            yield {"type": "stdout", "delta": final_delta, "content": clean_output[-12000:]}
+            if emitted_delta:
+                yield {"type": "stdout", "delta": emitted_delta, "content": clean_output[-12000:]}
             for trace_event in trace_events:
                 yield {"type": "event", "event": trace_event}
 
@@ -1433,7 +1509,7 @@ async def _run_oneshot_collect(message: str, model: str = "", conversation_id: O
             raise HTTPException(status_code=int(event.get("status_code") or 502), detail=event.get("message") or "Hermes CLI 调用失败")
         elif event_type == "interaction":
             raise HTTPException(status_code=409, detail="Hermes CLI 需要人工输入，定时/非流式任务无法继续。请在聊天窗口中运行该任务。")
-    content = (output or "").strip()
+    content = _strip_hermes_prompt_echo(output, message).strip()
     if not content:
         raise HTTPException(status_code=502, detail="Hermes CLI 没有返回可显示内容")
     return content

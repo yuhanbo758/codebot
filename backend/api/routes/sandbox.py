@@ -1,6 +1,6 @@
 """
 沙箱 API 路由
-提供沙箱（工作目录隔离模式）的管理接口。
+提供 Windows Sandbox 隔离执行与显式本地执行的管理接口。
 
 端点：
   GET  /api/sandbox/status          — 运行状态
@@ -14,13 +14,14 @@
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from loguru import logger
 from pydantic import BaseModel
 
 from config import app_config, save_config
+from utils.background_tasks import create_background_task
 
 router = APIRouter()
 
@@ -31,7 +32,8 @@ sandbox_manager = None  # type: Optional[object]
 # ── 请求/响应模型 ─────────────────────────────────────────────────────────────
 
 class SandboxConfigPatch(BaseModel):
-    execution_mode: Optional[str] = None
+    isolation_backend: Optional[Literal["none", "windows_sandbox"]] = None
+    execution_mode: Optional[Literal["auto", "local", "sandbox"]] = None
     enabled: Optional[bool] = None
     exec_timeout: Optional[int] = None
     network_enabled: Optional[bool] = None
@@ -64,14 +66,17 @@ async def get_sandbox_status():
                 "state": "idle",
                 "vm_running": False,
                 "enabled": app_config.sandbox.enabled,
-                "runtime_ready": True,
+                "isolation_backend": app_config.sandbox.isolation_backend,
+                "backend_selected": app_config.sandbox.isolation_backend != "none",
+                "runtime_ready": False,
                 "qemu_available": False,
                 "image_available": False,
                 "downloading": False,
                 "download_progress": 0.0,
-                "ready": True,
-                "mode": "local_isolation",
-                "mode_description": "工作目录隔离模式（参考 LobsterAI 本地执行架构）",
+                "ready": False,
+                "mode": "not_configured",
+                "mode_description": "未选择强隔离后端；Windows Sandbox 是可选项",
+                "network_isolated": False,
                 "platform": _detect_platform(),
             }
         }
@@ -83,8 +88,7 @@ async def get_sandbox_status():
 @router.post("/prepare")
 async def prepare_sandbox():
     """
-    初始化沙箱工作目录（幂等操作）。
-    本地模式下只需确保工作目录存在。
+    初始化工作目录并探测 Windows Sandbox（幂等操作）。
     """
     if sandbox_manager is None:
         raise HTTPException(status_code=503, detail="沙箱管理器未初始化")
@@ -97,19 +101,19 @@ async def prepare_sandbox():
         except Exception as e:
             logger.error(f"沙箱初始化失败: {e}")
 
-    asyncio.create_task(_do_prepare())
-    return {"success": True, "message": "沙箱工作目录已就绪（本地隔离模式，无需下载）"}
+    create_background_task(_do_prepare(), name="sandbox-prepare")
+    status = sandbox_manager.get_status()
+    return {"success": True, "data": status, "message": status.get("mode_description", "隔离运行时状态已刷新")}
 
 
 @router.post("/install-qemu")
 async def install_qemu():
     """
-    兼容接口。本地隔离模式不需要 QEMU，直接返回成功。
-    保留此端点以兼容旧版前端。
+    兼容接口。Codebot 不再下载不受控镜像，改为使用 Windows 可选功能 Sandbox。
     """
     return {
-        "success": True,
-        "message": "当前使用工作目录隔离模式，无需安装 QEMU。"
+        "success": False,
+        "message": "Codebot 不会自动安装隔离后端。Windows Sandbox 是可选项；仅在你主动选择它后，才需要通过 Windows 可选功能启用。"
     }
 
 
@@ -155,9 +159,13 @@ async def start_sandbox_vm():
     """
     if sandbox_manager is None:
         raise HTTPException(status_code=503, detail="沙箱管理器未初始化")
-    # 本地模式下确保工作目录存在即可
+    if app_config.sandbox.isolation_backend != "windows_sandbox":
+        raise HTTPException(status_code=400, detail="未选择 Windows Sandbox 后端；它是可选项，不会被自动探测或启动")
     await sandbox_manager.initialize()
-    return {"success": True, "message": "沙箱已就绪（工作目录隔离模式）"}
+    status = sandbox_manager.get_status()
+    if not status.get("runtime_ready"):
+        raise HTTPException(status_code=503, detail=status.get("mode_description"))
+    return {"success": True, "data": status, "message": "Windows Sandbox 隔离运行时已就绪"}
 
 
 @router.post("/stop")
@@ -217,7 +225,7 @@ async def test_sandbox(request: SandboxTestRequest):
                 "content": "",
                 "error": str(e),
                 "exit_code": 1,
-                "execution_mode": "local",
+                "execution_mode": "isolation_unavailable",
             },
             "message": f"沙箱测试异常: {e}",
         }

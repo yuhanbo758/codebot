@@ -23,6 +23,7 @@ from core.opencode_ws import OpenCodeClient
 from api.routes import scheduler as scheduler_router
 from api.routes import gateway as gateway_router
 from api.routes import skills as skills_router
+from utils.secrets import merge_masked_secrets, redact_secrets
 
 router = APIRouter()
 
@@ -160,7 +161,7 @@ def _validate_create(req: McpServerCreateRequest):
 async def list_mcp_servers():
     """列出所有 MCP Server"""
     try:
-        items = _read_all()
+        items = redact_secrets(_read_all())
         return {
             "success": True,
             "data": {
@@ -196,7 +197,7 @@ async def add_mcp_server(request: McpServerCreateRequest):
         _write_all(servers)
         return {
             "success": True,
-            "data": server,
+            "data": redact_secrets(server),
             "message": f"MCP Server「{server['name']}」已添加"
         }
     except HTTPException:
@@ -212,7 +213,7 @@ async def get_mcp_server(server_id: str):
     server = _find_by_id(servers, server_id)
     if not server:
         raise HTTPException(status_code=404, detail="MCP Server 不存在")
-    return {"success": True, "data": server}
+    return {"success": True, "data": redact_secrets(server)}
 
 
 @router.patch("/{server_id}")
@@ -223,7 +224,7 @@ async def update_mcp_server(server_id: str, request: McpServerUpdateRequest):
     if not server:
         raise HTTPException(status_code=404, detail="MCP Server 不存在")
     updates = request.model_dump(exclude_unset=True)
-    server.update(updates)
+    server.update(merge_masked_secrets(server, updates))
     # 校验更新后的 transport
     transport = server.get("transport", "stdio")
     if transport not in ("stdio", "sse"):
@@ -231,7 +232,7 @@ async def update_mcp_server(server_id: str, request: McpServerUpdateRequest):
     _write_all(servers)
     return {
         "success": True,
-        "data": server,
+        "data": redact_secrets(server),
         "message": f"MCP Server「{server['name']}」已更新"
     }
 
@@ -541,7 +542,7 @@ async def toggle_mcp_server(server_id: str):
     state = "已启用" if server["enabled"] else "已禁用"
     return {
         "success": True,
-        "data": server,
+        "data": redact_secrets(server),
         "message": f"MCP Server「{server['name']}」{state}"
     }
 
@@ -663,7 +664,7 @@ async def import_modelscope_service(request: ModelScopeImportRequest):
     _write_all(servers)
     return {
         "success": True,
-        "data": server,
+        "data": redact_secrets(server),
         "message": f"ModelScope MCP「{server['name']}」已导入"
     }
 
@@ -930,7 +931,9 @@ async def opencode_sync_status():
     proxy_tools = await _list_external_proxy_tool_definitions()
     has_opencode = _opencode_config_path().exists()
     codebot_bridge = get_codebot_remote_mcp_status()
-    only_in_oc = [{"name": k, "entry": v} for k, v in oc_mcp.items() if k != CODEBOT_REMOTE_MCP_KEY]
+    only_in_oc = redact_secrets(
+        [{"name": k, "entry": v} for k, v in oc_mcp.items() if k != CODEBOT_REMOTE_MCP_KEY]
+    )
     direct_entries_in_opencode = [item for item in only_in_oc if isinstance(item.get("entry"), dict)]
     bridge_registered = bool(codebot_bridge.get("registered", False))
     in_sync = bool(has_opencode and bridge_registered and not direct_entries_in_opencode)
@@ -1582,7 +1585,7 @@ async def _call_codebot_tool(name: str, arguments: dict) -> dict:
         return {"content": [{"type": "text", "text": content}]}
 
     if name == "codebot_list_mcp_servers":
-        items = _read_all()
+        items = redact_secrets(_read_all())
         if bool(args.get("enabled_only", False)):
             items = [item for item in items if item.get("enabled", True)]
         payload = {

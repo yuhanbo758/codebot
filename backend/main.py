@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from loguru import logger
@@ -27,9 +27,11 @@ from core.scheduler import TaskScheduler
 from core.sandbox import SandboxManager
 from services.notification import NotificationService
 from utils.installer import check_and_install_opencode, start_opencode_server, stop_opencode_server
+from utils.background_tasks import create_background_task, cancel_background_tasks
+from core.lan_auth import path_is_auth_exempt, request_is_authenticated
 
 # 导入 API 路由
-from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router, growth as growth_router, hermes as hermes_router
+from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router, growth as growth_router, hermes as hermes_router, security as security_router
 
 
 # 全局组件实例
@@ -233,7 +235,7 @@ async def lifespan(app: FastAPI):
     chat.sandbox_manager = sandbox_manager
     if app_config.sandbox.enabled:
         logger.info("沙箱功能已启用，正在初始化运行时...")
-        asyncio.create_task(sandbox_manager.initialize())
+        create_background_task(sandbox_manager.initialize(), name="sandbox-initialize")
     else:
         logger.info("沙箱功能未启用（sandbox.enabled=false）")
     
@@ -292,7 +294,7 @@ async def lifespan(app: FastAPI):
             logger.warning(f"无法连接到 OpenCode Server: {e}")
             logger.warning("请确保 OpenCode Server 已启动")
     
-    asyncio.create_task(connect_opencode())
+    create_background_task(connect_opencode(), name="opencode-connect")
 
     # 8b. 启动时全量同步 MCP 到 opencode（Skills 不同步，由用户自主管理）
     async def sync_to_opencode():
@@ -308,7 +310,7 @@ async def lifespan(app: FastAPI):
         except Exception as _e:
             logger.warning(f"[Startup] MCP 同步到 opencode 失败: {_e}")
 
-    asyncio.create_task(sync_to_opencode())
+    create_background_task(sync_to_opencode(), name="opencode-mcp-sync")
 
     # Prepare Hermes CLI with Codebot so Hermes chat handoff is warm.
     if app_config.hermes.enabled and app_config.hermes.auto_start:
@@ -324,7 +326,7 @@ async def lifespan(app: FastAPI):
             except Exception as exc:
                 logger.warning(f"Hermes CLI prepare failed: {exc}")
 
-        asyncio.create_task(prepare_hermes_cli())
+        create_background_task(prepare_hermes_cli(), name="hermes-prepare")
 
     # 9. 启动记忆自动整理循环
     global _organize_loop_task
@@ -386,6 +388,8 @@ async def lifespan(app: FastAPI):
 
     if scheduler_router.scheduler:
         await scheduler_router.scheduler.stop()
+
+    await cancel_background_tasks()
     
     if sandbox_manager:
         await sandbox_manager.shutdown()
@@ -443,14 +447,63 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS 配置 (支持局域网访问)
+# CORS 只用于本机前端开发服务器；正式版和局域网访问均为同源，不需要通配符。
+cors_origins = {
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+}
+cors_origins.update(
+    item.strip().rstrip("/")
+    for item in os.environ.get("CODEBOT_CORS_ORIGINS", "").split(",")
+    if item.strip()
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=sorted(cors_origins),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _origin_is_allowed(request: Request) -> bool:
+    """阻止第三方网页跨站调用本机/LAN 上具有文件和命令能力的 API。"""
+    origin = (request.headers.get("origin") or "").strip().rstrip("/")
+    if not origin:
+        # CLI、Electron 主进程、VS Code 扩展等非浏览器客户端通常没有 Origin。
+        return True
+    if origin in cors_origins:
+        return True
+    try:
+        parsed = urlparse(origin)
+        request_host = (request.url.hostname or "").lower()
+        return parsed.scheme in {"http", "https"} and (parsed.hostname or "").lower() == request_host
+    except Exception:
+        return False
+
+
+@app.middleware("http")
+async def protect_local_api(request: Request, call_next):
+    if request.url.path.startswith(("/api/", "/v1/")) and not _origin_is_allowed(request):
+        return PlainTextResponse("Forbidden origin", status_code=403)
+    if (
+        request.method != "OPTIONS"
+        and request.url.path.startswith(("/api/", "/v1/"))
+        and not path_is_auth_exempt(request.url.path)
+        and not request_is_authenticated(request)
+    ):
+        return JSONResponse(
+            {"detail": "该局域网设备尚未与 Codebot 配对"},
+            status_code=401,
+            headers={"X-Codebot-Pairing-Required": "1", "Cache-Control": "no-store"},
+        )
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path.startswith(("/api/", "/v1/")):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 # 注册 API 路由
 app.include_router(chat.router, prefix="/api/chat", tags=["聊天"])
@@ -462,6 +515,7 @@ app.include_router(config_router.router, prefix="/api/config", tags=["配置"])
 app.include_router(notifications.router, prefix="/api/notifications", tags=["通知"])
 app.include_router(lark.router, prefix="/api/lark", tags=["飞书"])
 app.include_router(sandbox_router.router, prefix="/api/sandbox", tags=["沙箱"])
+app.include_router(security_router.router, prefix="/api/security", tags=["安全与配对"])
 app.include_router(growth_router.router, prefix="/api/growth", tags=["成长沉淀"])
 app.include_router(hermes_router.router, prefix="/api/hermes", tags=["Hermes"])
 app.include_router(gateway_router.router, prefix="/v1", tags=["模型网关"])

@@ -6,7 +6,7 @@ import sqlite3
 import json
 import threading
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from types import SimpleNamespace
 from croniter import croniter
 from loguru import logger
@@ -45,6 +45,15 @@ class ScheduledTask:
         archived: bool = False,
         executor: str = "opencode",
         execution_model: str = "",
+        timeout_seconds: int = 1800,
+        max_retries: int = 1,
+        retry_delay_seconds: int = 30,
+        misfire_grace_seconds: int = 900,
+        overlap_policy: str = "skip",
+        last_status: str = "",
+        last_error: str = "",
+        last_duration_ms: int = 0,
+        consecutive_failures: int = 0,
     ):
         self.id = id
         self.name = name
@@ -59,15 +68,24 @@ class ScheduledTask:
         self.archived = archived
         self.executor = normalize_task_executor(executor)
         self.execution_model = normalize_task_execution_model(execution_model)
+        self.timeout_seconds = max(30, int(timeout_seconds or 1800))
+        self.max_retries = max(0, min(5, int(max_retries or 0)))
+        self.retry_delay_seconds = max(1, int(retry_delay_seconds or 30))
+        self.misfire_grace_seconds = max(0, int(misfire_grace_seconds or 0))
+        self.overlap_policy = overlap_policy if overlap_policy in {"skip", "parallel"} else "skip"
+        self.last_status = last_status or ""
+        self.last_error = last_error or ""
+        self.last_duration_ms = max(0, int(last_duration_ms or 0))
+        self.consecutive_failures = max(0, int(consecutive_failures or 0))
     
-    def calculate_next_run(self) -> datetime:
+    def calculate_next_run(self, base_time: Optional[datetime] = None) -> datetime:
         """计算下次运行时间"""
         try:
-            cron = croniter(self.cron_expression, datetime.now())
+            cron = croniter(self.cron_expression, base_time or datetime.now())
             return cron.get_next(datetime)
         except Exception as e:
             logger.error(f"计算下次运行时间失败：{e}")
-            return datetime.now()
+            raise ValueError(f"无效的 Cron 表达式：{self.cron_expression}") from e
     
     def to_dict(self) -> Dict:
         """转换为字典"""
@@ -85,14 +103,23 @@ class ScheduledTask:
             "archived": self.archived,
             "executor": self.executor,
             "execution_model": self.execution_model,
+            "timeout_seconds": self.timeout_seconds,
+            "max_retries": self.max_retries,
+            "retry_delay_seconds": self.retry_delay_seconds,
+            "misfire_grace_seconds": self.misfire_grace_seconds,
+            "overlap_policy": self.overlap_policy,
+            "last_status": self.last_status,
+            "last_error": self.last_error,
+            "last_duration_ms": self.last_duration_ms,
+            "consecutive_failures": self.consecutive_failures,
         }
 
 
 class TaskScheduler:
     """定时任务调度器"""
     
-    def __init__(self, opencode_ws=None, memory_manager=None, notification_service=None):
-        self.db_path = str(settings.DATA_DIR / "scheduled_tasks.db")
+    def __init__(self, opencode_ws=None, memory_manager=None, notification_service=None, db_path: Optional[str] = None, check_interval_seconds: float = 5.0, max_concurrent_tasks: int = 2):
+        self.db_path = str(db_path or (settings.DATA_DIR / "scheduled_tasks.db"))
         self.opencode_ws = opencode_ws
         self.memory_manager = memory_manager
         self.notification_service = notification_service
@@ -101,6 +128,11 @@ class TaskScheduler:
         self.running = False
         self._check_task: Optional[asyncio.Task] = None
         self._db_lock = threading.Lock()
+        self._check_interval_seconds = max(1.0, float(check_interval_seconds))
+        self._execution_slots = asyncio.Semaphore(max(1, int(max_concurrent_tasks)))
+        # 必须保存后台 Task 的强引用，否则事件循环可能在任务结束前回收它。
+        self._background_tasks: Set[asyncio.Task] = set()
+        self._active_task_ids: Set[str] = set()
 
         # 初始化数据库
         self._init_db()
@@ -142,6 +174,20 @@ class TaskScheduler:
             cursor.execute("ALTER TABLE scheduled_tasks ADD COLUMN executor TEXT DEFAULT 'opencode'")
         if "execution_model" not in existing_cols:
             cursor.execute("ALTER TABLE scheduled_tasks ADD COLUMN execution_model TEXT DEFAULT ''")
+        task_column_defaults = {
+            "timeout_seconds": "INTEGER DEFAULT 1800",
+            "max_retries": "INTEGER DEFAULT 1",
+            "retry_delay_seconds": "INTEGER DEFAULT 30",
+            "misfire_grace_seconds": "INTEGER DEFAULT 900",
+            "overlap_policy": "TEXT DEFAULT 'skip'",
+            "last_status": "TEXT DEFAULT ''",
+            "last_error": "TEXT DEFAULT ''",
+            "last_duration_ms": "INTEGER DEFAULT 0",
+            "consecutive_failures": "INTEGER DEFAULT 0",
+        }
+        for column, definition in task_column_defaults.items():
+            if column not in existing_cols:
+                cursor.execute(f"ALTER TABLE scheduled_tasks ADD COLUMN {column} {definition}")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS task_logs (
@@ -157,6 +203,15 @@ class TaskScheduler:
                 FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id) ON DELETE CASCADE
             )
         """)
+        log_cols = {row[1] for row in cursor.execute("PRAGMA table_info(task_logs)")}
+        for column, definition in {
+            "scheduled_for": "TIMESTAMP",
+            "trigger_type": "TEXT DEFAULT 'schedule'",
+            "attempts": "INTEGER DEFAULT 1",
+            "duration_ms": "INTEGER DEFAULT 0",
+        }.items():
+            if column not in log_cols:
+                cursor.execute(f"ALTER TABLE task_logs ADD COLUMN {column} {definition}")
 
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_tasks_enabled 
@@ -184,6 +239,7 @@ class TaskScheduler:
     async def start(self):
         """启动调度器"""
         self.running = True
+        self._recover_interrupted_runs()
         await self._load_tasks()
         
         # 启动检查循环
@@ -201,7 +257,27 @@ class TaskScheduler:
             except asyncio.CancelledError:
                 pass
         self._check_task = None
+        pending = list(self._background_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         logger.info("定时任务调度器已停止")
+
+    def _recover_interrupted_runs(self):
+        """应用异常退出后，将没有完成时间的运行记录标记为已中断。"""
+        with self._db_lock:
+            conn = self._get_conn()
+            try:
+                conn.execute(
+                    """UPDATE task_logs SET status = 'interrupted', completed_at = ?,
+                       error = COALESCE(NULLIF(error, ''), '应用重启前任务未正常结束')
+                       WHERE status = 'running' AND completed_at IS NULL""",
+                    (datetime.now().isoformat(),),
+                )
+                conn.commit()
+            finally:
+                conn.close()
     
     async def _load_tasks(self):
         """从数据库加载任务（加载所有非归档任务，包括 enabled=0 的禁用任务）"""
@@ -226,13 +302,20 @@ class TaskScheduler:
                 archived=bool(row["archived"]) if row["archived"] is not None else False,
                 executor=row["executor"] if "executor" in row.keys() else "opencode",
                 execution_model=row["execution_model"] if "execution_model" in row.keys() else "",
+                timeout_seconds=row["timeout_seconds"] if "timeout_seconds" in row.keys() else 1800,
+                max_retries=row["max_retries"] if "max_retries" in row.keys() else 1,
+                retry_delay_seconds=row["retry_delay_seconds"] if "retry_delay_seconds" in row.keys() else 30,
+                misfire_grace_seconds=row["misfire_grace_seconds"] if "misfire_grace_seconds" in row.keys() else 900,
+                overlap_policy=row["overlap_policy"] if "overlap_policy" in row.keys() else "skip",
+                last_status=row["last_status"] if "last_status" in row.keys() else "",
+                last_error=row["last_error"] if "last_error" in row.keys() else "",
+                last_duration_ms=row["last_duration_ms"] if "last_duration_ms" in row.keys() else 0,
+                consecutive_failures=row["consecutive_failures"] if "consecutive_failures" in row.keys() else 0,
             )
 
-            # Bug4 修复：重启后 next_run 若已过期，重新基于当前时间计算下次执行时间
-            # 对于周期性任务（非一次性），过期的 next_run 应推进到未来
-            is_run_once = task.run_once or (task.task_prompt or "").startswith("__RUN_ONCE__")
             if task.enabled:
-                if not task.next_run or (not is_run_once and task.next_run < datetime.now()):
+                # 过期的 next_run 不能在加载时静默丢弃，由检查循环按 misfire 策略记录并补跑/跳过。
+                if not task.next_run:
                     task.next_run = task.calculate_next_run()
                     # 同步回数据库
                     conn.execute(
@@ -247,27 +330,71 @@ class TaskScheduler:
         logger.info(f"加载了 {len(self.tasks)} 个定时任务")
     
     async def _check_loop(self):
-        """每分钟检查是否有任务需要执行"""
+        """短周期检查到期任务；到期任务后台并发运行，慢任务不阻塞其他任务。"""
         while self.running:
             now = datetime.now()
 
             for task in list(self.tasks.values()):
-                if task.enabled and task.next_run:
-                    if now >= task.next_run:
-                        logger.info(f"执行定时任务：{task.name}")
-                        await self._execute_task(task)
+                if task.enabled and task.next_run and now >= task.next_run:
+                    self._claim_and_schedule(task, now)
 
-                        # Bug2 修复：无论执行成功/失败都必须更新 next_run，
-                        # 否则下一分钟循环会再次触发同一任务
-                        task.last_run = now
-                        if task.enabled:
-                            # 仍启用（非一次性/执行失败的一次性）：推进到下次
-                            task.next_run = task.calculate_next_run()
-                        self._save_task(task)
+            await asyncio.sleep(self._check_interval_seconds)
 
-            await asyncio.sleep(60)  # 每分钟检查一次
+    def _track_background_task(self, coroutine) -> asyncio.Task:
+        background = asyncio.create_task(coroutine)
+        self._background_tasks.add(background)
+        background.add_done_callback(self._background_tasks.discard)
+        return background
+
+    def _claim_and_schedule(self, task: ScheduledTask, now: datetime):
+        """先持久化推进时间再执行，避免检查循环重复触发同一时刻。"""
+        scheduled_for = task.next_run
+        run_once = task.run_once or (task.task_prompt or "").startswith("__RUN_ONCE__")
+        delay_seconds = max(0, int((now - scheduled_for).total_seconds()))
+
+        if run_once:
+            task.enabled = False
+            task.next_run = None
+        else:
+            # coalesce：直接以当前时间计算下一次，不逐个遍历停机期间可能成千上万次的触发点。
+            task.next_run = task.calculate_next_run(now)
+        self._save_task(task)
+
+        if delay_seconds > task.misfire_grace_seconds:
+            task.last_status = "skipped"
+            task.last_error = f"错过计划时间 {delay_seconds} 秒，超过宽限期 {task.misfire_grace_seconds} 秒"
+            self._save_task(task)
+            self._track_background_task(self._record_skipped_run(task, scheduled_for, task.last_error))
+            return
+
+        if task.overlap_policy == "skip" and task.id in self._active_task_ids:
+            reason = "上一次运行尚未结束，已按防重入策略跳过"
+            task.last_status = "skipped"
+            task.last_error = reason
+            self._save_task(task)
+            self._track_background_task(self._record_skipped_run(task, scheduled_for, reason))
+            return
+
+        self._track_background_task(self._run_claimed_task(task, scheduled_for, "schedule"))
+
+    async def _record_skipped_run(self, task: ScheduledTask, scheduled_for: datetime, reason: str):
+        log_id = f"log_{task.id}_{datetime.now().timestamp()}"
+        await self._create_task_log(log_id, task.id, task.name, scheduled_for, "schedule")
+        await self._complete_task_log(log_id, "skipped", error=reason, attempts=0)
+
+    async def _run_claimed_task(self, task: ScheduledTask, scheduled_for: Optional[datetime], trigger_type: str, preclaimed: bool = False):
+        if not preclaimed and task.overlap_policy == "skip" and task.id in self._active_task_ids:
+            await self._record_skipped_run(task, scheduled_for or datetime.now(), "上一次运行尚未结束，已按防重入策略跳过")
+            return
+        if not preclaimed:
+            self._active_task_ids.add(task.id)
+        try:
+            async with self._execution_slots:
+                await self._execute_task(task, scheduled_for=scheduled_for, trigger_type=trigger_type)
+        finally:
+            self._active_task_ids.discard(task.id)
     
-    async def _execute_task(self, task: ScheduledTask):
+    async def _execute_task(self, task: ScheduledTask, scheduled_for: Optional[datetime] = None, trigger_type: str = "schedule"):
         """执行定时任务
 
         执行逻辑：
@@ -294,14 +421,22 @@ class TaskScheduler:
         is_reminder = reminder_payload is not None
 
         # 创建任务日志
-        log_id = f"log_{datetime.now().timestamp()}"
+        started_at = datetime.now()
+        log_id = f"log_{task.id}_{started_at.timestamp()}"
         await self._create_task_log(
             log_id=log_id,
             task_id=task.id,
-            task_name=task.name
+            task_name=task.name,
+            scheduled_for=scheduled_for,
+            trigger_type=trigger_type,
         )
 
-        try:
+        final_result = None
+        final_error = ""
+        attempts = 0
+        for attempt in range(task.max_retries + 1):
+          attempts = attempt + 1
+          try:
             execution_model = None
             model_notice = ""
             result = None
@@ -314,12 +449,18 @@ class TaskScheduler:
             if result is not None:
                 pass
             elif normalize_task_executor(getattr(task, "executor", "opencode")) == "hermes":
-                result = await self._execute_hermes_task(task, raw_prompt, model=execution_model)
+                result = await asyncio.wait_for(
+                    self._execute_hermes_task(task, raw_prompt, model=execution_model),
+                    timeout=task.timeout_seconds,
+                )
             elif self.opencode_ws:
                 # 像聊天一样通过 opencode cli 执行任务
                 # raw_prompt 此时是纯任务内容（已去除时间前缀）
                 logger.info(f"通过 OpenCode 执行任务：{task.name}，model={execution_model or 'default'}，prompt：{raw_prompt[:100]}...")
-                result = await self.opencode_ws.execute_task(raw_prompt, model=execution_model or None)
+                result = await asyncio.wait_for(
+                    self.opencode_ws.execute_task(raw_prompt, model=execution_model or None),
+                    timeout=task.timeout_seconds,
+                )
             else:
                 raise RuntimeError("OpenCode 客户端未初始化，无法执行该定时任务")
 
@@ -342,48 +483,61 @@ class TaskScheduler:
                         tokens_used=getattr(result, "tokens_used", 0)
                     )
             
-            # 更新日志
+            if result and result.success:
+                final_result = result
+                final_error = ""
+                break
+            final_error = str(getattr(result, "error", "任务返回失败") or "任务返回失败")
+          except asyncio.CancelledError:
+            duration_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+            task.last_run = datetime.now()
+            task.last_status = "interrupted"
+            task.last_error = "应用关闭或任务被取消"
+            task.last_duration_ms = duration_ms
+            self._save_task(task)
             await self._complete_task_log(
-                log_id=log_id,
-                status="success" if result.success else "failed",
-                result=result.content if result.success else None,
-                error=result.error if not result.success else None,
-                tokens_used=result.tokens_used
+                log_id, "interrupted", error=task.last_error,
+                attempts=attempts, duration_ms=duration_ms,
             )
-            
-            # 发送通知
-            if self.notification_service:
-                await self.notification_service.send_task_notification(
-                    task=task,
-                    result=result,
-                    is_error=not result.success
-                )
+            raise
+          except asyncio.TimeoutError:
+            final_error = f"执行超过 {task.timeout_seconds} 秒，已超时终止"
+          except Exception as e:
+            final_error = str(e)
+          if attempt < task.max_retries:
+            logger.warning(f"定时任务执行失败，{task.retry_delay_seconds} 秒后重试：{task.name}，{final_error}")
+            await asyncio.sleep(task.retry_delay_seconds)
 
-            if run_once:
-                # Bug3 修复：无论执行成功/失败，一次性任务都应禁用，避免重复触发
-                task.enabled = False
-                self._save_task(task)
-            elif result and result.success:
-                pass  # 周期性任务正常成功，next_run 已在 _check_loop 中更新
-            
-        except Exception as e:
-            logger.error(f"定时任务执行失败：{e}")
-            
-            # 更新日志
-            await self._complete_task_log(
-                log_id=log_id,
-                status="failed",
-                error=str(e)
-            )
-            
-            # 发送错误通知
-            if self.notification_service:
+        duration_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+        success = bool(final_result and final_result.success)
+        task.last_run = datetime.now()
+        task.last_status = "success" if success else "failed"
+        task.last_error = "" if success else final_error
+        task.last_duration_ms = duration_ms
+        task.consecutive_failures = 0 if success else task.consecutive_failures + 1
+        self._save_task(task)
+        await self._complete_task_log(
+            log_id=log_id,
+            status=task.last_status,
+            result=final_result.content if success else None,
+            error=None if success else final_error,
+            tokens_used=getattr(final_result, "tokens_used", 0) if final_result else 0,
+            attempts=attempts,
+            duration_ms=duration_ms,
+        )
+
+        # 通知失败不能反向覆盖真实执行结果。
+        if self.notification_service:
+            try:
                 await self.notification_service.send_task_notification(
                     task=task,
-                    result=None,
-                    is_error=True,
-                    error_message=str(e)
+                    result=final_result,
+                    is_error=not success,
+                    error_message=final_error if not success else None,
                 )
+            except Exception as notify_error:
+                logger.error(f"定时任务通知发送失败：{notify_error}")
+        return success
 
     def _fallback_execution_model(self) -> str:
         return (
@@ -531,16 +685,17 @@ class TaskScheduler:
         except Exception:
             return None
 
-    async def _create_task_log(self, log_id: str, task_id: str, task_name: str):
+    async def _create_task_log(self, log_id: str, task_id: str, task_name: str, scheduled_for: Optional[datetime] = None, trigger_type: str = "schedule"):
         """创建任务日志"""
         with self._db_lock:
             conn = self._get_conn()
             try:
                 conn.execute(
-                    """INSERT OR REPLACE INTO task_logs 
-                       (id, task_id, task_name, started_at, status)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (log_id, task_id, task_name, datetime.now().isoformat(), "running")
+                    """INSERT OR REPLACE INTO task_logs
+                       (id, task_id, task_name, started_at, status, scheduled_for, trigger_type)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (log_id, task_id, task_name, datetime.now().isoformat(), "running",
+                     scheduled_for.isoformat() if scheduled_for else None, trigger_type)
                 )
                 conn.commit()
             finally:
@@ -552,7 +707,9 @@ class TaskScheduler:
         status: str,
         result: str = None,
         error: str = None,
-        tokens_used: int = 0
+        tokens_used: int = 0,
+        attempts: int = 1,
+        duration_ms: int = 0,
     ):
         """完成日志记录"""
         with self._db_lock:
@@ -561,7 +718,7 @@ class TaskScheduler:
                 conn.execute(
                     """UPDATE task_logs 
                        SET completed_at = ?, status = ?, result = ?, 
-                           error = ?, tokens_used = ?
+                           error = ?, tokens_used = ?, attempts = ?, duration_ms = ?
                        WHERE id = ?""",
                     (
                         datetime.now().isoformat(),
@@ -569,6 +726,8 @@ class TaskScheduler:
                         result,
                         error,
                         tokens_used,
+                        attempts,
+                        duration_ms,
                         log_id
                     )
                 )
@@ -585,8 +744,11 @@ class TaskScheduler:
                     """INSERT OR REPLACE INTO scheduled_tasks 
                        (id, name, cron_expression, task_prompt, enabled, 
                         last_run, next_run, notify_channels, created_at,
-                        run_once, archived, executor, execution_model)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        run_once, archived, executor, execution_model,
+                        timeout_seconds, max_retries, retry_delay_seconds,
+                        misfire_grace_seconds, overlap_policy, last_status,
+                        last_error, last_duration_ms, consecutive_failures)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         task.id,
                         task.name,
@@ -601,6 +763,15 @@ class TaskScheduler:
                         task.archived,
                         task.executor,
                         task.execution_model,
+                        task.timeout_seconds,
+                        task.max_retries,
+                        task.retry_delay_seconds,
+                        task.misfire_grace_seconds,
+                        task.overlap_policy,
+                        task.last_status,
+                        task.last_error,
+                        task.last_duration_ms,
+                        task.consecutive_failures,
                     )
                 )
                 conn.commit()
@@ -616,6 +787,11 @@ class TaskScheduler:
         run_once: bool = False,
         executor: str = "opencode",
         execution_model: str = "",
+        timeout_seconds: int = 1800,
+        max_retries: int = 1,
+        retry_delay_seconds: int = 30,
+        misfire_grace_seconds: int = 900,
+        overlap_policy: str = "skip",
     ) -> ScheduledTask:
         """创建新任务"""
         task = ScheduledTask(
@@ -629,6 +805,11 @@ class TaskScheduler:
             archived=False,
             executor=executor,
             execution_model=execution_model,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            retry_delay_seconds=retry_delay_seconds,
+            misfire_grace_seconds=misfire_grace_seconds,
+            overlap_policy=overlap_policy,
         )
         
         # 计算下次运行时间
@@ -654,6 +835,16 @@ class TaskScheduler:
                     value = normalize_task_executor(value)
                 elif key == "execution_model":
                     value = normalize_task_execution_model(value)
+                elif key == "timeout_seconds":
+                    value = max(30, int(value or 1800))
+                elif key == "max_retries":
+                    value = max(0, min(5, int(value or 0)))
+                elif key == "retry_delay_seconds":
+                    value = max(1, int(value or 30))
+                elif key == "misfire_grace_seconds":
+                    value = max(0, int(value or 0))
+                elif key == "overlap_policy":
+                    value = value if value in {"skip", "parallel"} else "skip"
                 setattr(task, key, value)
         
         # 如果 cron 表达式改变，重新计算下次运行时间
@@ -743,6 +934,15 @@ class TaskScheduler:
                         archived=True,
                         executor=row["executor"] if "executor" in row.keys() else "opencode",
                         execution_model=row["execution_model"] if "execution_model" in row.keys() else "",
+                        timeout_seconds=row["timeout_seconds"] if "timeout_seconds" in row.keys() else 1800,
+                        max_retries=row["max_retries"] if "max_retries" in row.keys() else 1,
+                        retry_delay_seconds=row["retry_delay_seconds"] if "retry_delay_seconds" in row.keys() else 30,
+                        misfire_grace_seconds=row["misfire_grace_seconds"] if "misfire_grace_seconds" in row.keys() else 900,
+                        overlap_policy=row["overlap_policy"] if "overlap_policy" in row.keys() else "skip",
+                        last_status=row["last_status"] if "last_status" in row.keys() else "",
+                        last_error=row["last_error"] if "last_error" in row.keys() else "",
+                        last_duration_ms=row["last_duration_ms"] if "last_duration_ms" in row.keys() else 0,
+                        consecutive_failures=row["consecutive_failures"] if "consecutive_failures" in row.keys() else 0,
                     )
                     result.append(t.to_dict())
                 return result
@@ -756,7 +956,23 @@ class TaskScheduler:
             logger.error(f"任务不存在：{task_id}")
             return False
         
-        # 异步执行
-        asyncio.create_task(self._execute_task(task))
+        if task.overlap_policy == "skip" and task.id in self._active_task_ids:
+            logger.warning(f"任务正在运行，拒绝重复启动：{task.name}")
+            return False
+
+        # 保留后台任务强引用；手动运行不改变原定的下一次计划时间。
+        if task.overlap_policy == "skip":
+            self._active_task_ids.add(task.id)
+        self._track_background_task(self._run_claimed_task(task, datetime.now(), "manual", preclaimed=task.overlap_policy == "skip"))
         logger.info(f"立即执行任务：{task.name}")
         return True
+
+    def runtime_status(self) -> Dict:
+        """返回调度器实时状态，供 UI/健康检查观察。"""
+        return {
+            "running": self.running,
+            "check_interval_seconds": self._check_interval_seconds,
+            "active_task_ids": sorted(self._active_task_ids),
+            "background_task_count": len(self._background_tasks),
+            "enabled_task_count": sum(1 for task in self.tasks.values() if task.enabled),
+        }

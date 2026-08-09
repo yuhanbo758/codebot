@@ -5,6 +5,7 @@ python-multipart==0.0.6
 
 # Database
 chromadb==0.4.22
+posthog>=2.4.0,<6
 
 # Cron
 croniter==2.0.1

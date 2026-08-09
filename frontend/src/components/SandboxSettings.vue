@@ -9,8 +9,10 @@
 
       <el-descriptions :column="2" border size="small">
         <el-descriptions-item label="模式">
-          <el-tag type="success" size="small">工作目录隔离</el-tag>
-          <span style="margin-left:8px;font-size:12px;color:#888">参考 LobsterAI 本地执行架构，无需 QEMU</span>
+          <el-tag :type="backendStatusType" size="small">
+            {{ backendStatusLabel }}
+          </el-tag>
+          <span style="margin-left:8px;font-size:12px;color:#888">Windows Sandbox 为可选后端；未选择时不会探测或启动</span>
         </el-descriptions-item>
         <el-descriptions-item label="平台">{{ status.platform || '—' }}</el-descriptions-item>
         <el-descriptions-item label="沙箱状态">
@@ -40,6 +42,24 @@
         :closable="false"
         show-icon
       />
+      <el-alert
+        v-if="!status.backend_selected"
+        style="margin-top:12px"
+        type="info"
+        title="当前未选择强隔离后端"
+        description="这是默认配置，不要求安装 Windows Sandbox，也不影响未启用沙箱路由的普通可信任务。启用沙箱路由后，需要强隔离的任务会失败关闭，不会偷降级到宿主机。"
+        :closable="false"
+        show-icon
+      />
+      <el-alert
+        v-else
+        style="margin-top:12px"
+        :type="status.runtime_ready ? 'success' : 'warning'"
+        :title="status.runtime_ready ? 'Windows Sandbox 已提供虚拟化隔离' : '已选择 Windows Sandbox，但系统运行时不可用'"
+        :description="status.runtime_ready ? '默认禁用网络、剪贴板、打印机、音视频输入，仅映射专用工作目录。' : '如需使用该可选后端，请在 Windows 可选功能中启用 Windows Sandbox 并重启；在此之前需要隔离的任务会被拒绝。'"
+        :closable="false"
+        show-icon
+      />
 
       <!-- 操作按钮 -->
       <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
@@ -53,7 +73,7 @@
         <el-button
           size="small"
           :loading="testing"
-          :disabled="saving || testing || !form.enabled"
+          :disabled="saving || testing || !form.enabled || form.isolation_backend !== 'windows_sandbox'"
           @click="runTest"
         >
           {{ testing ? '测试中...' : '冒烟测试' }}
@@ -83,18 +103,28 @@
         <el-form-item label="启用沙箱">
           <el-switch v-model="form.enabled" />
           <span style="margin-left:10px;font-size:12px;color:#888">
-            启用后聊天任务可在隔离工作目录中执行
+            启用后高风险任务要求系统级隔离；无法隔离时拒绝执行
+          </span>
+        </el-form-item>
+
+        <el-form-item label="强隔离后端">
+          <el-select v-model="form.isolation_backend" style="width:260px">
+            <el-option label="不启用强隔离（默认）" value="none" />
+            <el-option label="Windows Sandbox（可选）" value="windows_sandbox" />
+          </el-select>
+          <span style="margin-left:10px;font-size:12px;color:#888">
+            只有主动选择 Windows Sandbox 后，Codebot 才会探测并使用它
           </span>
         </el-form-item>
 
         <el-form-item label="执行模式">
           <el-select v-model="form.execution_mode" style="width:200px">
-            <el-option label="自动（auto）" value="auto" />
-            <el-option label="始终本地（local）" value="local" />
-            <el-option label="始终沙箱（sandbox）" value="sandbox" />
+            <el-option label="自动隔离高风险任务（auto）" value="auto" />
+            <el-option label="始终本地，仅可信任务（local）" value="local" />
+            <el-option label="强制所选隔离后端（sandbox）" value="sandbox" />
           </el-select>
           <span style="margin-left:10px;font-size:12px;color:#888">
-            auto：包含高风险操作时自动路由到隔离目录
+            auto：高风险任务必须隔离；当前 OpenCode Agent 尚不能装入 Sandbox 时会安全拒绝
           </span>
         </el-form-item>
 
@@ -103,9 +133,9 @@
         </el-form-item>
 
         <el-form-item label="允许网络访问">
-          <el-switch v-model="form.network_enabled" />
+          <el-switch v-model="form.network_enabled" :disabled="form.isolation_backend !== 'windows_sandbox'" />
           <span style="margin-left:10px;font-size:12px;color:#888">
-            本地模式下始终允许（此设置预留未来扩展）
+            仅影响 Windows Sandbox；建议保持关闭
           </span>
         </el-form-item>
 
@@ -116,7 +146,7 @@
             style="width:420px"
           />
           <div style="font-size:12px;color:#888;margin-top:4px">
-            所有沙箱任务在此目录内执行，实现文件操作范围隔离
+            该目录会作为唯一可写工作目录映射到 Windows Sandbox
           </div>
         </el-form-item>
 
@@ -138,16 +168,16 @@
 
     <!-- 说明卡片 -->
     <el-card shadow="never" style="margin-top:16px">
-      <template #header><span>关于工作目录隔离模式</span></template>
+      <template #header><span>关于 Windows Sandbox 隔离模式</span></template>
       <el-descriptions :column="1" border size="small">
         <el-descriptions-item label="实现方式">
-          所有沙箱任务在独立工作目录（sandbox_workspace/）中执行，文件操作限制在该目录内
+          每次命令启动一次性 Windows Sandbox，仅映射工作目录和临时结果目录
         </el-descriptions-item>
         <el-descriptions-item label="优点">
-          无需安装 QEMU，无需下载镜像，立即可用，兼容所有平台
+          提供虚拟化文件系统边界，可关闭网络、剪贴板、打印机和音视频输入
         </el-descriptions-item>
         <el-descriptions-item label="参考来源">
-          基于 LobsterAI（NetEase Youdao）的本地执行架构（CoworkRunner local 模式）
+          使用 Windows 官方 Windows Sandbox 可选功能；Codebot 不会自动安装或要求启用
         </el-descriptions-item>
         <el-descriptions-item label="超时控制">
           任务执行超过设定秒数后自动终止，防止卡死
@@ -165,9 +195,10 @@ import axios from 'axios'
 const status = ref({})
 const form = ref({
   enabled: false,
+  isolation_backend: 'none',
   execution_mode: 'auto',
   exec_timeout: 300,
-  network_enabled: true,
+  network_enabled: false,
   workspace_dir: '',
 })
 const saving = ref(false)
@@ -188,6 +219,16 @@ const sandboxStateTagType = computed(() => {
   return 'success'
 })
 
+const backendStatusLabel = computed(() => {
+  if (!status.value.backend_selected) return '未选择强隔离'
+  return status.value.runtime_ready ? 'Windows Sandbox' : '所选后端不可用'
+})
+
+const backendStatusType = computed(() => {
+  if (!status.value.backend_selected) return 'info'
+  return status.value.runtime_ready ? 'success' : 'danger'
+})
+
 const executionModeLabel = computed(() => {
   const mode = form.value.execution_mode || status.value.execution_mode || 'auto'
   const map = { auto: '自动', local: '本地', sandbox: '沙箱' }
@@ -196,9 +237,10 @@ const executionModeLabel = computed(() => {
 
 const snapshotConfig = (source = {}) => ({
   enabled: source.enabled ?? false,
+  isolation_backend: source.isolation_backend ?? 'none',
   execution_mode: source.execution_mode ?? 'auto',
   exec_timeout: source.exec_timeout ?? 300,
-  network_enabled: source.network_enabled ?? true,
+  network_enabled: source.network_enabled ?? false,
   workspace_dir: source.workspace_dir ?? '',
 })
 

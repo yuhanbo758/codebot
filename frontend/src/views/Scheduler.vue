@@ -6,6 +6,9 @@
         新建定时任务
       </el-button>
       <div class="candidate-notify-switch">
+        <el-tag size="small" :type="schedulerRuntime.running ? 'success' : 'danger'">
+          {{ schedulerRuntime.running ? `调度器运行中${schedulerRuntime.active_task_ids?.length ? ` · ${schedulerRuntime.active_task_ids.length} 个任务执行中` : ''}` : '调度器未运行' }}
+        </el-tag>
         <span>开启通知</span>
         <el-switch
           v-model="candidateNotificationEnabled"
@@ -40,6 +43,18 @@
       </el-table-column>
       <el-table-column prop="last_run" label="上次运行" width="170">
         <template #default="{ row }">{{ formatTime(row.last_run) }}</template>
+      </el-table-column>
+      <el-table-column label="上次结果" width="110">
+        <template #default="{ row }">
+          <template v-if="row.last_status">
+            <el-tooltip :content="row.last_error || `耗时 ${row.last_duration_ms || 0} ms`">
+              <el-tag size="small" :type="statusType(row.last_status)">
+                {{ statusLabel(row.last_status) }}<span v-if="row.consecutive_failures"> ×{{ row.consecutive_failures }}</span>
+              </el-tag>
+            </el-tooltip>
+          </template>
+          <span v-else>-</span>
+        </template>
       </el-table-column>
       <el-table-column label="通知渠道" width="180">
         <template #default="{ row }">
@@ -172,6 +187,30 @@
           <el-switch v-model="newTask.run_once" />
           <span style="color:#909399;font-size:12px;margin-left:8px">执行完成后自动关闭并归档</span>
         </el-form-item>
+        <el-collapse class="reliability-settings">
+          <el-collapse-item title="可靠性设置（不常用）" name="reliability">
+            <el-form-item label="执行超时">
+              <el-input-number v-model="newTask.timeout_seconds" :min="30" :max="86400" :step="30" />
+              <span class="field-hint">秒，超时后终止本次执行</span>
+            </el-form-item>
+            <el-form-item label="失败重试">
+              <el-input-number v-model="newTask.max_retries" :min="0" :max="5" />
+              <span class="field-hint">次，间隔</span>
+              <el-input-number v-model="newTask.retry_delay_seconds" :min="1" :max="3600" />
+              <span class="field-hint">秒</span>
+            </el-form-item>
+            <el-form-item label="错过宽限期">
+              <el-input-number v-model="newTask.misfire_grace_seconds" :min="0" :max="86400" :step="60" />
+              <span class="field-hint">秒；重启后在宽限期内合并补跑一次</span>
+            </el-form-item>
+            <el-form-item label="重复执行">
+              <el-select v-model="newTask.overlap_policy" style="width:220px">
+                <el-option label="跳过（推荐）" value="skip" />
+                <el-option label="允许并行" value="parallel" />
+              </el-select>
+            </el-form-item>
+          </el-collapse-item>
+        </el-collapse>
       </el-form>
       <template #footer>
         <el-button @click="showCreateDialog = false">取消</el-button>
@@ -182,7 +221,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import axios from 'axios'
@@ -199,6 +238,11 @@ const newTask = ref({
   run_once: false,
   executor: 'opencode',
   execution_model: '',
+  timeout_seconds: 1800,
+  max_retries: 1,
+  retry_delay_seconds: 30,
+  misfire_grace_seconds: 900,
+  overlap_policy: 'skip',
 })
 const aiPrompt = ref('')
 const aiLoading = ref(false)
@@ -206,6 +250,8 @@ const availableModels = ref([])
 const modelsLoading = ref(false)
 const candidateNotificationEnabled = ref(true)
 const candidateNotificationSaving = ref(false)
+const schedulerRuntime = ref({ running: false, active_task_ids: [] })
+let refreshTimer = null
 
 const CHANNEL_LABELS = {
   app: '应用内',
@@ -221,6 +267,17 @@ const modelLabel = (modelId) => {
   if (!id) return '记忆整理备用模型'
   const found = availableModels.value.find((model) => model.id === id)
   return found?.name || id
+}
+const statusLabel = (status) => ({ success: '成功', failed: '失败', skipped: '已跳过', interrupted: '已中断' }[status] || status)
+const statusType = (status) => ({ success: 'success', failed: 'danger', skipped: 'warning', interrupted: 'warning' }[status] || 'info')
+
+const loadSchedulerStatus = async () => {
+  try {
+    const response = await axios.get('/api/scheduler/status')
+    schedulerRuntime.value = response.data?.data || { running: false, active_task_ids: [] }
+  } catch {
+    schedulerRuntime.value = { running: false, active_task_ids: [] }
+  }
 }
 
 const loadModels = async () => {
@@ -302,6 +359,11 @@ const openCreateDialog = () => {
     run_once: false,
     executor: 'opencode',
     execution_model: '',
+    timeout_seconds: 1800,
+    max_retries: 1,
+    retry_delay_seconds: 30,
+    misfire_grace_seconds: 900,
+    overlap_policy: 'skip',
   }
   aiPrompt.value = ''
   showCreateDialog.value = true
@@ -316,9 +378,10 @@ const generateWithAI = async () => {
     })
     const result = response.data.data
     newTask.value.cron_expression = result.cron
+    newTask.value.run_once = Boolean(result.run_once)
     ElMessage.success(`AI 生成：${result.description}`)
-  } catch {
-    ElMessage.error('AI 生成失败')
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || 'AI 生成失败')
   } finally {
     aiLoading.value = false
   }
@@ -336,6 +399,11 @@ const saveTask = async () => {
         run_once: newTask.value.run_once,
         executor: newTask.value.executor || 'opencode',
         execution_model: newTask.value.execution_model || '',
+        timeout_seconds: newTask.value.timeout_seconds,
+        max_retries: newTask.value.max_retries,
+        retry_delay_seconds: newTask.value.retry_delay_seconds,
+        misfire_grace_seconds: newTask.value.misfire_grace_seconds,
+        overlap_policy: newTask.value.overlap_policy,
       })
       ElMessage.success('任务已更新')
     } else {
@@ -354,8 +422,8 @@ const runTaskNow = async (task) => {
   try {
     await axios.post(`/api/scheduler/tasks/${task.id}/run`)
     ElMessage.success('任务执行中')
-  } catch {
-    ElMessage.error('执行失败')
+  } catch (error) {
+    ElMessage.error(error.response?.data?.detail || '执行失败')
   }
 }
 
@@ -403,7 +471,12 @@ const editTask = (task) => {
     ...task,
     executor: task.executor || 'opencode',
     execution_model: task.execution_model || '',
-    notify_channels: [...(task.notify_channels || [])]
+    notify_channels: [...(task.notify_channels || [])],
+    timeout_seconds: task.timeout_seconds || 1800,
+    max_retries: task.max_retries ?? 1,
+    retry_delay_seconds: task.retry_delay_seconds || 30,
+    misfire_grace_seconds: task.misfire_grace_seconds ?? 900,
+    overlap_policy: task.overlap_policy || 'skip',
   }
   aiPrompt.value = ''
   showCreateDialog.value = true
@@ -415,6 +488,15 @@ onMounted(() => {
   loadArchivedTasks()
   loadModels()
   loadCandidateNotificationSetting()
+  loadSchedulerStatus()
+  refreshTimer = window.setInterval(() => {
+    loadTasks()
+    loadSchedulerStatus()
+  }, 5000)
+})
+
+onUnmounted(() => {
+  if (refreshTimer) window.clearInterval(refreshTimer)
 })
 </script>
 
@@ -444,6 +526,16 @@ onMounted(() => {
 }
 
 .candidate-notify-hint {
+  color: #909399;
+  font-size: 12px;
+}
+
+.reliability-settings {
+  margin: 4px 0 14px;
+}
+
+.field-hint {
+  margin-left: 8px;
   color: #909399;
   font-size: 12px;
 }

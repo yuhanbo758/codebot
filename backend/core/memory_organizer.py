@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from loguru import logger
 from core.memory_extractor import extract_and_save, extract_candidates
+from utils.background_tasks import create_background_task
 
 
 MAX_BATCH_SIZE = 30   # 每批最多处理的记忆条数
@@ -591,7 +592,7 @@ async def run_organize_loop(get_memory_manager_fn, get_opencode_ws_fn, get_confi
             mm = get_memory_manager_fn()
             ws = get_opencode_ws_fn()
             organize_model = getattr(mem_cfg, "organize_model", None) or None
-            asyncio.create_task(organize_memories(mm, ws, model=organize_model))
+            create_background_task(organize_memories(mm, ws, model=organize_model), name="memory-organize-scheduled")
 
         except asyncio.CancelledError:
             logger.info("[memory_organizer] 自动整理循环已停止")
