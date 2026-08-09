@@ -65,8 +65,8 @@
 2. **中危 — 自动更新/发布产物完整性依赖发布渠道**
    当前 Electron 更新链主要依赖 GitHub Release/HTTPS，仓库未配置稳定的 Windows 代码签名证书和应用层独立摘要校验。建议为正式安装包配置代码签名，并在自定义下载路径校验服务端签名或固定摘要。
 
-3. **待 CI 核验 — Python 依赖 CVE**
-   发布流水线已增加 Python 3.11 `pip-audit` 门禁、OSV 服务和明确超时，并让发布准备任务依赖审计成功。本机审计曾因外部服务长时间无响应而终止，因此在 GitHub Actions 实际成功前仍不能标记为通过。
+3. **已修复 — Python 运行时依赖 CVE**
+   首次 CI 门禁实际发现旧版 FastAPI/Starlette、python-multipart、python-dotenv，以及未使用的 aiosmtplib、python-jose/ecdsa 等依赖漏洞。现升级实际运行依赖，删除源码未导入的认证和异步邮件死依赖及对应 PyInstaller hidden imports；CI 改为直接审计 `backend/requirements.txt`，不再把 pip-audit 自身环境中的 setuptools 等包误算为应用运行时依赖。
 
 ## 验证记录
 
@@ -77,4 +77,4 @@
 - `electron npm audit`：0 vulnerabilities。
 - `node --check electron/main.js`、`node --check electron/preload.js`：通过。
 - `electron-builder --dir --win`：通过，成功生成 Windows x64 目录包。
-- Python `pip-audit`：未完成，见“尚存风险与建议”。
+- Python `pip-audit --requirement backend/requirements.txt`：修复后在项目虚拟环境复验为 `No known vulnerabilities found`；最终发布结果同时以对应 GitHub Actions 为准。
