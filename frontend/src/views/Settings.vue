@@ -28,6 +28,9 @@
       <el-tab-pane label="集成配置" name="integration">
         <IntegrationSettings />
       </el-tab-pane>
+      <el-tab-pane label="访问安全" name="security">
+        <SecuritySettings />
+      </el-tab-pane>
       <el-tab-pane label="沙箱配置" name="sandbox">
         <SandboxSettings />
       </el-tab-pane>
@@ -50,11 +53,12 @@ import EmailSettings from '@/components/EmailSettings.vue'
 import SkillsSettings from '@/components/SkillsSettings.vue'
 import BackupSettings from '@/components/BackupSettings.vue'
 import IntegrationSettings from '@/components/IntegrationSettings.vue'
+import SecuritySettings from '@/components/SecuritySettings.vue'
 import SandboxSettings from '@/components/SandboxSettings.vue'
 import Docs from '@/views/Docs.vue'
 
 const route = useRoute()
-const tabNames = new Set(['general', 'hermes', 'obsidian', 'notification', 'lark', 'email', 'skills', 'backup', 'integration', 'sandbox', 'docs'])
+const tabNames = new Set(['general', 'hermes', 'obsidian', 'notification', 'lark', 'email', 'skills', 'backup', 'integration', 'security', 'sandbox', 'docs'])
 const initialTab = typeof route.query.tab === 'string' && tabNames.has(route.query.tab) ? route.query.tab : 'general'
 const activeTab = ref(initialTab)
 </script>

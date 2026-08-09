@@ -2,7 +2,7 @@
 定时任务 API 路由
 """
 from fastapi import APIRouter, HTTPException, Body
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
 import re
@@ -22,10 +22,15 @@ class CreateTaskRequest(BaseModel):
     name: str
     cron_expression: str
     task_prompt: str
-    notify_channels: List[str] = []
+    notify_channels: List[str] = Field(default_factory=list)
     run_once: bool = False
     executor: str = "opencode"
     execution_model: str = ""
+    timeout_seconds: int = 1800
+    max_retries: int = 1
+    retry_delay_seconds: int = 30
+    misfire_grace_seconds: int = 900
+    overlap_policy: str = "skip"
 
 
 class UpdateTaskRequest(BaseModel):
@@ -38,6 +43,11 @@ class UpdateTaskRequest(BaseModel):
     run_once: Optional[bool] = None
     executor: Optional[str] = None
     execution_model: Optional[str] = None
+    timeout_seconds: Optional[int] = None
+    max_retries: Optional[int] = None
+    retry_delay_seconds: Optional[int] = None
+    misfire_grace_seconds: Optional[int] = None
+    overlap_policy: Optional[str] = None
 
 
 @router.get("/tasks")
@@ -52,6 +62,14 @@ async def list_tasks():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/status")
+async def scheduler_status():
+    """调度器健康状态：用于判断循环是否运行、当前有哪些任务正在执行。"""
+    if not scheduler:
+        return {"success": True, "data": {"running": False, "active_task_ids": []}}
+    return {"success": True, "data": scheduler.runtime_status()}
 
 
 @router.post("/tasks")
@@ -86,6 +104,11 @@ async def create_task(request: CreateTaskRequest):
             run_once=request.run_once,
             executor=normalize_task_executor(request.executor),
             execution_model=request.execution_model,
+            timeout_seconds=request.timeout_seconds,
+            max_retries=request.max_retries,
+            retry_delay_seconds=request.retry_delay_seconds,
+            misfire_grace_seconds=request.misfire_grace_seconds,
+            overlap_policy=request.overlap_policy,
         )
         
         return {
@@ -174,6 +197,8 @@ async def run_task_now(task_id: str):
         success = await scheduler.run_task_now(task_id)
         
         if not success:
+            if scheduler and scheduler.get_task(task_id):
+                raise HTTPException(409, detail="任务正在运行，已阻止重复执行")
             raise HTTPException(404, detail="任务不存在")
         
         return {
@@ -324,6 +349,7 @@ async def generate_cron_from_text(prompt: str) -> dict:
 
     cron_expression = None
     description = None
+    is_one_time = bool(re.search(r"(?:\d+\s*(?:分钟|小时|天)\s*(?:后|之后|以后)|半小时\s*(?:后|之后|以后)|今天|明天|后天)", prompt or ""))
 
     if scheduler and scheduler.opencode_ws:
         ai_prompt = (
@@ -350,8 +376,8 @@ async def generate_cron_from_text(prompt: str) -> dict:
     if not cron_expression:
         cron_expression, description = _guess_cron_from_prompt(prompt)
     if not cron_expression:
-        cron_expression = "0 9 * * *"
-        description = "每天 09:00 执行"
+        # 无法识别时不能擅自创建每天 09:00 的任务，否则用户会得到一个完全不同的周期任务。
+        raise ValueError("无法从描述中确定执行时间，请明确写出频率和时间，例如“每天 9:00”或“30 分钟后”")
 
     _croniter(cron_expression)  # 验证合法性
     next_run = _croniter(cron_expression, datetime.now()).get_next(datetime)
@@ -359,6 +385,7 @@ async def generate_cron_from_text(prompt: str) -> dict:
         "cron": cron_expression,
         "description": description,
         "nextRun": next_run.isoformat(),
+        "run_once": is_one_time,
     }
 
 
@@ -374,5 +401,7 @@ async def ai_generate_cron(prompt: str = Body(..., embed=True)):
     try:
         data = await generate_cron_from_text(prompt)
         return {"success": True, "data": data}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

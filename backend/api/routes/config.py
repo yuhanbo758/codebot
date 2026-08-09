@@ -17,6 +17,7 @@ from config import (
     settings,
     AppConfig,
 )
+from utils.secrets import merge_masked_secrets, redact_secrets
 
 router = APIRouter()
 
@@ -125,7 +126,7 @@ async def get_integration_config():
     """获取第三方集成配置"""
     return {
         "success": True,
-        "data": app_config.integration.model_dump()
+        "data": redact_secrets(app_config.integration.model_dump())
     }
 
 
@@ -133,14 +134,17 @@ async def get_integration_config():
 async def update_integration_config(request: IntegrationUpdateRequest):
     """更新第三方集成配置"""
     try:
-        updates = request.model_dump(exclude_unset=True)
+        updates = merge_masked_secrets(
+            app_config.integration.model_dump(),
+            request.model_dump(exclude_unset=True),
+        )
         for k, v in updates.items():
             if hasattr(app_config.integration, k):
                 setattr(app_config.integration, k, v)
         save_config(app_config)
         return {
             "success": True,
-            "data": app_config.integration.model_dump(),
+            "data": redact_secrets(app_config.integration.model_dump()),
             "message": "集成配置已保存"
         }
     except Exception as e:

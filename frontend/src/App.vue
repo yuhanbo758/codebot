@@ -234,6 +234,36 @@
         <el-button type="primary" @click="saveGrowthEdit" :loading="growthEditLoading">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog
+      v-model="lanPairDialogVisible"
+      title="连接 Codebot"
+      width="420px"
+      :close-on-click-modal="false"
+      :close-on-press-escape="false"
+      :show-close="false"
+    >
+      <el-alert
+        type="warning"
+        title="此局域网设备尚未配对"
+        description="请在运行 Codebot 的电脑上打开“设置 → 访问安全”，生成 6 位配对码后输入。"
+        :closable="false"
+        show-icon
+      />
+      <el-input
+        v-model="lanPairCode"
+        style="margin-top:16px"
+        maxlength="6"
+        inputmode="numeric"
+        placeholder="请输入 6 位配对码"
+        @keyup.enter="pairLanDevice"
+      />
+      <template #footer>
+        <el-button type="primary" :loading="lanPairLoading" :disabled="lanPairCode.length !== 6" @click="pairLanDevice">
+          配对并继续
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -288,6 +318,9 @@ const growthEditForm = ref({
 })
 const growthAvailableModels = ref([])
 const growthModelsLoading = ref(false)
+const lanPairDialogVisible = ref(false)
+const lanPairCode = ref('')
+const lanPairLoading = ref(false)
 let removeUpdateListener = null
 let removeAccountChangedListener = null
 let removeSkillDownloadListener = null
@@ -581,7 +614,30 @@ const formatDate = (dateStr) => {
   return date.toLocaleString('zh-CN')
 }
 
+const showLanPairing = () => {
+  lanPairDialogVisible.value = true
+}
+
+const pairLanDevice = async () => {
+  if (!/^\d{6}$/.test(lanPairCode.value)) {
+    ElMessage.warning('请输入 6 位数字配对码')
+    return
+  }
+  lanPairLoading.value = true
+  try {
+    await axios.post('/api/security/pair', { code: lanPairCode.value })
+    lanPairDialogVisible.value = false
+    ElMessage.success('设备配对成功')
+    window.location.reload()
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || '配对失败')
+  } finally {
+    lanPairLoading.value = false
+  }
+}
+
 onMounted(() => {
+  window.addEventListener('codebot-auth-required', showLanPairing)
   loadAccount()
   if (electronApi()?.onUpdateStatus) {
     removeUpdateListener = electronApi().onUpdateStatus(handleUpdateStatus)
@@ -616,6 +672,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('codebot-auth-required', showLanPairing)
   if (pollTimer.value) clearInterval(pollTimer.value)
   if (growthPollTimer.value) clearInterval(growthPollTimer.value)
   if (typeof removeUpdateListener === 'function') removeUpdateListener()

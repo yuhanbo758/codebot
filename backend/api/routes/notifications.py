@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from config import settings, app_config, NotificationConfig, save_config
+from utils.secrets import merge_masked_secrets, redact_secrets
 
 router = APIRouter()
 notification_service = None
@@ -111,7 +112,7 @@ async def clear_notifications():
 @router.get("/config")
 async def get_notification_config():
     try:
-        return {"success": True, "data": app_config.notification.model_dump()}
+        return {"success": True, "data": redact_secrets(app_config.notification.model_dump())}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -121,7 +122,7 @@ async def update_notification_config(request: NotificationConfigUpdate):
     try:
         updates = request.model_dump(exclude_unset=True)
         current = app_config.notification.model_dump()
-        current.update(updates)
+        current = merge_masked_secrets(current, updates)
         app_config.notification = NotificationConfig(**current)
         save_config(app_config)
         if notification_service:

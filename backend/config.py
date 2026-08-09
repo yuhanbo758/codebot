@@ -3,8 +3,9 @@ Codebot 配置管理
 """
 import os
 import json
+import secrets
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Literal
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
@@ -121,6 +122,15 @@ class NetworkConfig(BaseModel):
     port: int = 15682
 
 
+class SecurityConfig(BaseModel):
+    """局域网访问认证配置；本机回环请求始终保持免认证。"""
+    lan_auth_enabled: bool = True
+    # 仅驻留内存；持久化到 data/.lan_api_token，绝不进入 config.json。
+    lan_api_token: str = Field(default="", exclude=True)
+    pairing_code_ttl_seconds: int = Field(default=300, ge=60, le=1800)
+    session_hours: int = Field(default=720, ge=1, le=24 * 365)
+
+
 class IntegrationConfig(BaseModel):
     """第三方集成配置"""
     modelscope_api_key: str = ""
@@ -167,22 +177,26 @@ class ObsidianConfig(BaseModel):
 
 class SandboxConfig(BaseModel):
     """
-    沙箱配置（工作目录隔离模式）
-    参考 LobsterAI 的本地执行架构，不依赖 QEMU/VM。
+    沙箱配置。
+
+    Windows Sandbox 是显式可选的强隔离后端，默认既不选择、也不探测或启动。
+    本地模式只适用于用户明确信任的命令；需要强隔离但未选择可用后端时失败关闭。
     """
+    # 强隔离后端：none | windows_sandbox
+    isolation_backend: Literal["none", "windows_sandbox"] = "none"
     # 执行模式：auto | local | sandbox
-    # auto    — 包含高风险操作时使用隔离工作目录执行，否则本地执行
-    # local   — 始终本地执行（不使用隔离工作目录）
-    # sandbox — 始终使用隔离工作目录执行
-    execution_mode: str = "auto"
-    # 是否启用沙箱功能（启用后使用隔离工作目录）
+    # auto    — 高风险操作要求所选强隔离后端，否则拒绝执行
+    # local   — 始终在宿主机的受控工作目录执行，仅适用于可信任务
+    # sandbox — 始终要求所选强隔离后端，否则拒绝执行
+    execution_mode: Literal["auto", "local", "sandbox"] = "auto"
+    # 是否启用沙箱路由；默认关闭，不影响普通可信项目工作流
     enabled: bool = False
     # 工作目录（为空则自动在数据目录下创建 sandbox_workspace/）
     workspace_dir: str = ""
     # 沙箱执行超时（秒）
     exec_timeout: int = 300
-    # 网络访问：是否允许沙箱访问互联网（本地模式下始终允许）
-    network_enabled: bool = True
+    # 网络访问：Windows Sandbox 默认禁网；仅在用户明确需要时开启。
+    network_enabled: bool = False
     # 以下字段保留以兼容旧配置文件，不再使用
     runtime_binary: str = ""
     image_path: str = ""
@@ -207,6 +221,7 @@ class AppConfig(BaseModel):
     opencode: OpenCodeConfig = OpenCodeConfig()
     models: ModelConfig = ModelConfig()
     network: NetworkConfig = NetworkConfig()
+    security: SecurityConfig = SecurityConfig()
     integration: IntegrationConfig = IntegrationConfig()
     skills: SkillsConfig = SkillsConfig()
     hermes: HermesConfig = HermesConfig()
@@ -258,6 +273,26 @@ class Settings(BaseSettings):
 settings = Settings()
 
 
+def load_or_create_lan_api_token(*, rotate: bool = False) -> str:
+    """从独立密钥文件读取 LAN Token；环境变量优先且不会写盘。"""
+    env_token = os.environ.get("CODEBOT_LAN_API_TOKEN", "").strip()
+    if env_token and not rotate:
+        return env_token
+    token_path = settings.DATA_DIR / ".lan_api_token"
+    if token_path.exists() and not rotate:
+        token = token_path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    token = secrets.token_urlsafe(32)
+    settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(token, encoding="utf-8")
+    try:
+        token_path.chmod(0o600)
+    except OSError:
+        pass
+    return token
+
+
 def load_config() -> AppConfig:
     """加载配置文件"""
     config_path = settings.DATA_DIR / "config.json"
@@ -266,13 +301,18 @@ def load_config() -> AppConfig:
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
             config = AppConfig(**data)
+            config.security.lan_api_token = load_or_create_lan_api_token()
+            needs_save = False
             if int(getattr(config.network, "port", 0) or 0) == 8080:
                 config.network.port = 15682
+                needs_save = True
+            if needs_save:
                 save_config(config)
             return config
     else:
         # 创建默认配置
         config = AppConfig()
+        config.security.lan_api_token = load_or_create_lan_api_token()
         save_config(config)
         return config
 

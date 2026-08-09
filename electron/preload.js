@@ -29,6 +29,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 选择文件夹（用于项目目录选择等）
   selectFolder: (options) => ipcRenderer.invoke('dialog:selectFolder', toPlainValue(options)),
 
+  // 使用 VS Code 打开当前项目。路径校验与进程启动都在主进程完成。
+  openProjectInVSCode: (projectPath) => ipcRenderer.invoke('vscode:open-project', projectPath),
+
   // 系统信息
   getPlatform: () => require('process').platform,
   getVersion: () => ipcRenderer.invoke('get-version'),

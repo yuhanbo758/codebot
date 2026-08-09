@@ -1,6 +1,6 @@
 ---
 name: expert-agents
-description: "Complete persona definitions for 14 world-class expert AI agents (Bezos, Munger, DHH, Vogels, Norman, Duarte, Cooper, Bach, Hightower, Godin, Graham, Ross, Campbell, Thompson). Load this skill to get full expert personas for multi-perspective analysis, product evaluation, or team assembly."
+description: "Select a small set of role-based expert lenses for high-impact architecture, product, testing, risk, or business decisions. Use only when multiple genuinely different perspectives improve the decision; do not trigger for ordinary coding or simple questions."
 ---
 
 # Expert Agent Personas
@@ -8,6 +8,14 @@ description: "Complete persona definitions for 14 world-class expert AI agents (
 Complete persona definitions for 14 AI expert agents. Each agent embodies the thinking model of a world-class expert in their domain. Use these personas when you need deep domain expertise via the Task tool.
 
 ## How to Use
+
+### Codebot execution rules
+
+- Pick one primary role and at most two supporting roles. More roles increase repetition and context cost without guaranteeing better analysis.
+- If the user is in a Codebot multi-Agent hub, delegate through the hub's actual member conversations. Otherwise analyze the selected lenses in one response; never claim that a separate agent ran when no delegation tool was used.
+- Treat the named people below as shorthand for decision frameworks, not as impersonation. Attribute conclusions to the role (for example, "architecture lens"), not to a fabricated quote or personal endorsement.
+- Every lens must contribute a distinct decision, risk, or test. Merge overlapping observations and end with one accountable recommendation.
+- Do not load the complete persona catalog into every Agent-mode request. Load this skill only when the task calls for multi-perspective analysis.
 
 When you need an expert perspective, use the Task tool with `subagent_type: "general"` and inject the relevant persona into the prompt:
 
@@ -20,6 +28,8 @@ Task({
 ```
 
 You can spawn multiple experts in parallel for multi-perspective analysis.
+
+The `Task` example is compatibility guidance for runtimes that expose that tool. In Codebot, use its multi-Agent hub or the current runtime's real delegation capability instead.
 
 ---
 

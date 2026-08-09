@@ -38,6 +38,30 @@
           </div>
         </div>
 
+        <!-- 多 Agent 是低频协作入口，与普通对话分区并默认折叠。 -->
+        <div v-if="multiAgentHubConversation" class="multi-agent-entry">
+          <button
+            type="button"
+            class="multi-agent-entry-toggle"
+            :aria-expanded="multiAgentEntryExpanded"
+            @click="multiAgentEntryExpanded = !multiAgentEntryExpanded"
+          >
+            <span>多Agent群聊</span>
+            <span class="multi-agent-entry-meta">{{ multiAgentMembers.length }} 位成员 {{ multiAgentEntryExpanded ? '▴' : '▾' }}</span>
+          </button>
+          <div v-if="multiAgentEntryExpanded" class="multi-agent-entry-body">
+            <button
+              type="button"
+              class="multi-agent-hub-link"
+              :class="{ active: currentConversationId === multiAgentHubConversation.id }"
+              @click="selectConversation(multiAgentHubConversation)"
+            >
+              <span class="multi-agent-hub-title">{{ multiAgentHubConversation.title || '多Agent群聊' }}</span>
+              <span class="conversation-time">{{ formatDate(multiAgentHubConversation.updated_at) }}</span>
+            </button>
+          </div>
+        </div>
+
         <!-- 对话搜索框 -->
         <div class="conversation-search">
           <el-input
@@ -684,6 +708,11 @@
                 <el-button :type="obsidianEnabled ? 'primary' : 'default'" @click="toggleObsidianMode">
                   Obsidian
                 </el-button>
+                <el-tooltip content="在 VS Code 中打开当前项目，并使用 Codebot Chat 扩展继续对话" placement="top">
+                  <el-button :disabled="!currentProjectDir" @click="openCurrentProjectInVSCode">
+                    VS Code
+                  </el-button>
+                </el-tooltip>
                 <el-tag
                   v-for="kb in selectedKnowledgeBases"
                   :key="kb.id || kb.path"
@@ -1012,6 +1041,8 @@ const patchConversation = (conversationId, patch) => {
 }
 
 const isMultiAgentHub = (conv) => conv?.conversation_type === 'multi_agent_hub'
+const multiAgentEntryExpanded = ref(false)
+const multiAgentHubConversation = computed(() => conversations.value.find(isMultiAgentHub) || null)
 
 const refreshConversationTitleOnce = async (conversationId) => {
   const response = await axios.get(`/api/chat/conversations/${conversationId}`)
@@ -1062,11 +1093,12 @@ const scheduleConversationTitleRefresh = (conversationId, attempts = 20, delay =
 const conversationSearchQuery = ref('')
 const filteredConversations = computed(() => {
   const q = conversationSearchQuery.value.trim()
-  if (!q) return conversations.value
+  const normalConversations = conversations.value.filter(conv => !isMultiAgentHub(conv))
+  if (!q) return normalConversations
   // 按空格分词（支持中英文），所有词必须同时匹配标题（AND 逻辑）
   const tokens = q.split(/[\s\u3000]+/).filter(Boolean).map(t => t.toLowerCase())
-  if (tokens.length === 0) return conversations.value
-  return conversations.value.filter(conv => {
+  if (tokens.length === 0) return normalConversations
+  return normalConversations.filter(conv => {
     const title = (conv.title || '').toLowerCase()
     return tokens.every(tok => title.includes(tok))
   })
@@ -1481,6 +1513,23 @@ const toggleHermesMode = () => {
 const toggleObsidianMode = () => {
   obsidianEnabled.value = !obsidianEnabled.value
   saveCurrentConversationTargetState()
+}
+
+const openCurrentProjectInVSCode = async () => {
+  if (!currentProjectDir.value) {
+    ElMessage.warning('请先选择项目文件夹')
+    return
+  }
+  if (!window.electronAPI?.openProjectInVSCode) {
+    ElMessage.warning('“在 VS Code 中打开”仅在 Codebot 桌面版可用')
+    return
+  }
+  try {
+    await window.electronAPI.openProjectInVSCode(currentProjectDir.value)
+    ElMessage.success('已在 VS Code 中打开当前项目')
+  } catch (error) {
+    ElMessage.error(error?.message || '打开 VS Code 失败')
+  }
 }
 
 const searchKnowledgeBases = async (query) => {
@@ -3689,6 +3738,64 @@ onUnmounted(() => {
 .conversation-search {
   padding: 8px 12px;
   border-bottom: 1px solid #e4e7ed;
+}
+
+.multi-agent-entry {
+  margin: 8px 12px 0;
+  border: 1px solid #dcdfe6;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #f8fafc;
+}
+
+.multi-agent-entry-toggle,
+.multi-agent-hub-link {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: #303133;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.multi-agent-entry-toggle {
+  min-height: 36px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+}
+
+.multi-agent-entry-meta {
+  color: #909399;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.multi-agent-entry-body {
+  padding: 0 6px 6px;
+}
+
+.multi-agent-hub-link {
+  padding: 8px;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.multi-agent-hub-link:hover,
+.multi-agent-hub-link.active {
+  background: #ecf5ff;
+  color: #409eff;
+}
+
+.multi-agent-hub-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .conversation-list {

@@ -1,6 +1,6 @@
 # Codebot
 
-> 项目对话说明：选择“项目”后，每轮发送都会由 Codebot 在自身数据目录创建独立 Git 快照；聊天中的“撤销”会同时恢复该轮修改前的项目文件。未选择项目的普通对话不会创建版本快照。沙箱启用后，符合执行条件的 OpenCode 请求会使用独立沙箱工作目录。
+> 项目对话说明：选择“项目”后，每轮发送都会由 Codebot 在自身数据目录创建独立 Git 快照；聊天中的“撤销”会同时恢复该轮修改前的项目文件。未选择项目的普通对话不会创建版本快照。Windows Sandbox 是默认不选择的可选隔离后端；只有用户主动选择后才会探测和使用。
 
 > 成长候选说明：聊天识别到定时任务创建意图后，会先生成可编辑的成长候选，只有用户接受后才加入调度器。顶部按钮会显示待审数量并自动更新；记忆候选会过滤临时任务信息并合并重复或近义内容。
 
@@ -27,7 +27,13 @@
 - 🛠️ **第三方技能系统**: `skills/` 中的 SKILL.md 会同步到 OpenCode 的技能目录，作为第三方技能直接被调用
 - 🔌 **第三方 MCP 支持**: Codebot 会聚合并代理外部 MCP 服务器（尤其是魔搭 ModelScope MCP），再通过自身 MCP SSE 入口统一暴露给 OpenCode 调用
 - 📚 **使用文档入口**: 设置页里的“文档”会直接读取本项目 `README.md`，作为 Codebot 的用户手册与上手入口
-- 🏖️ **沙箱执行**: 工作目录隔离执行环境，AI 生成的代码在独立 `sandbox_workspace/` 目录中运行，无需 QEMU/Docker，开箱即用
+- 🏖️ **可选强隔离**: 可显式选择 Windows Sandbox 隔离独立命令，默认不探测、不安装、不启动；未配置时需要隔离的任务失败关闭，不会降级到宿主机
+
+### 与 Codex / WorkBuddy 的功能取向
+
+Codebot 保持现有主界面和本地可控架构，不复制第三方产品界面。本项目已吸收的核心交互原则包括：项目化连续对话、模型/Agent/Skill 按需选择、工具过程可见、Git 快照撤销、可审阅的定时任务结果、多 Agent 任务拆分，以及 MCP/知识库扩展。与依赖第三方账号的托管产品不同，Codebot 的聊天、记忆、任务和技能数据仍由本机后端管理。
+
+本轮整体审计进一步补齐了：定时任务错过执行记录、超时/重试/并发控制，多 Agent 同步骤并行和按需提示词，后台任务异常回收，聊天队列与附件限额，配置密钥脱敏，以及 Electron 下载、外链、权限和技能压缩包校验。界面结构保持不变，多 Agent 群聊仅移到搜索框上方并默认折叠。
 
 ## 🚀 快速开始
 
@@ -139,12 +145,14 @@ npm start
 开发模式下（从源码运行），Electron 默认使用 `venv\\Scripts\\python.exe`（若存在）启动 `backend\\main.py`，以确保后端代码变更立即生效；如需强制使用 `backend\\dist\\codebot-backend.exe`，可设置环境变量 `CODEBOT_BACKEND_MODE=exe`。
 Electron 会优先使用应用内置的 `opencode` 可执行文件（`electron/vendor/opencode` 或打包后的 `resources/opencode`）自动拉起 `opencode serve`；若内置文件不可用或不可执行，会自动回退到系统 PATH 中的 `opencode`。桌面端会强制开启 OpenCode 自动拉起，并统一优先尝试 `127.0.0.1:11200`；如果系统里已经有 OpenCode 桌面端或 `opencode serve` 在运行，Codebot 会直接复用现有健康服务并跳过额外安装检查，避免启动阶段被 OpenCode 检测卡住。
 
-### Windows 沙箱现状
+### Windows 隔离后端现状
 
-- 沙箱已重构为**工作目录隔离**模式，移除 QEMU 依赖，开箱即用，无需安装任何额外软件
-- AI 生成的代码默认在独立的 `data/sandbox_workspace/` 目录中执行；如设置了 `sandbox.workspace_dir`，则改用自定义目录，通过 `asyncio` 子进程运行，带超时控制
-- 执行结果实时返回，支持 `stdout`/`stderr`/`exit_code` 完整输出
-- 旧版 QEMU 相关端点（`/install-qemu`、`/start`、`/stop`）保留但返回本地模式说明，保持 API 向后兼容
+- **Windows Sandbox 是显式可选后端**：默认 `isolation_backend=none`，Codebot 不会探测、安装或启动 Windows Sandbox，也不影响未启用沙箱路由的普通可信任务
+- 用户在“设置 → 沙箱”主动选择 `Windows Sandbox（可选）` 后，Codebot 才检查系统运行时；每次命令使用一次性 Sandbox，只映射专用工作目录和临时结果目录
+- Windows Sandbox 默认禁用网络、剪贴板、打印机、音频及视频输入；执行结果支持 `stdout`、`stderr`、`exit_code` 和超时控制
+- `auto`/`sandbox` 模式需要强隔离但未选择或无法使用后端时，会**失败关闭**，不会降级到宿主机；`local` 仅用于用户明确信任的本地命令
+- 当前 Windows Sandbox 后端支持独立命令隔离；完整 OpenCode Agent 尚未装入 Sandbox，因此需要完整 Agent 强隔离的聊天任务仍会安全拒绝
+- 旧版 QEMU 端点保留用于 API 兼容，但不会下载 QEMU 或自动安装任何隔离运行时
 
 ### 访问
 
@@ -305,12 +313,12 @@ codebot/
 - 所有消息统一交给 OpenCode 处理，Codebot 不再充当主代理，只负责提供第三方能力和结果展示
 - 查看历史对话记录；进入"聊天"自动打开最近对话
 - 支持多对话并行处理，多个对话可同时发送并后台执行
-- **多Agent群聊**: 左侧置顶“多Agent群聊”工作台，普通对话可加入为前端/后端/数据库/测试等成员 Agent，总任务会按串行/并行步骤分派到成员对话并汇总过程与结果
+- **多Agent群聊**: 在左侧“搜索对话”上方提供独立且默认折叠的“多Agent群聊”工作台，不再混入普通对话列表。普通对话可加入为前端/后端/数据库/测试等成员 Agent；同一步骤会真实并行执行，跨步骤按依赖串行推进，并只向依赖者传递有长度上限的上游产物，减少无关提示词和 token 支出
 - **对话分享**: 生成局域网分享链接（`share_id`），可供同一局域网内他人通过浏览器只读查看
 - 支持在聊天中创建定时任务（如"每天8点写一个故事并保存到D盘""每天8:10提醒我喝水"，可在定时任务中查看）
 - 支持在聊天中保存记忆（如"帮我记住 广东揭阳普宁船埔 这个地址""10月2日是姐姐的生日"，可在记忆中查看）
 - **意图分类**: 消息自动分类为"定时任务/保存记忆/普通对话"，避免误判
-- **Agent 模式**: 支持 `plan`（结构化规划）和 `build`（直接执行）两种模式
+- **运行模式**: 支持 `build`（直接执行）、`plan`（结构化规划）和 `agent`（自主拆解、执行与验证）。Agent 模式只按需加载 `self-improving`、`expert-agents`、`ai-company` 的能力索引，不再每轮注入多份完整人设或虚构子代理执行结果
 - **对话级状态**: 每个普通对话会独立保存当前模式、模型、Hermes/Obsidian 目标和已选知识库；在 B 对话切换模型或处理目标，不会覆盖 A 对话原来的选择。新建对话仍会沿用最近主动选择的全局默认模型，创建后再形成自己的独立状态
 - 消息一键复制（Electron 使用系统剪贴板）
 - 支持文件附件上传；多模态模型支持图片分析
@@ -335,7 +343,7 @@ codebot/
 
 #### 多Agent群聊功能怎么使用
 
-聊天页左侧会固定显示“多Agent群聊”，它是系统级协作工作台，不能删除，只能清空消息内容。普通对话可以加入这个群聊，作为不同职责的 Agent 成员。
+聊天页左侧“搜索对话”上方会显示默认折叠的“多Agent群聊”独立入口，它是系统级协作工作台，不能删除，只能清空消息内容。普通对话可以加入这个群聊，作为不同职责的 Agent 成员。
 
 使用步骤：
 
@@ -378,10 +386,12 @@ codebot/
 - `backend/core/tool_dispatcher.py` 已收敛为桥接辅助模块，仅负责技能发现与 MCP 协议适配，不再承担聊天主链路上的工具调度
 - 前端聊天页只展示 OpenCode 的流式步骤与最终结果，并提示当前第三方桥接状态
 
-### 1.2 Hermes / Obsidian / 文档入口
+### 1.2 Hermes / Obsidian / VS Code / 文档入口
 
-- **Hermes 模式**: 在聊天页点击 `Hermes` 后，当前消息默认会交给 Codebot 管理目录中的 Hermes Agent CLI 处理。设置页中的 `Hermes` 标签位于“通用设置”右侧，提供“一键安装 / 一键修复 / 一键更新”，默认把 Hermes 安装到 Codebot 根目录下的 `hermes-agent/`。Codebot 只作为薄适配层：写入共享配置（模型网关、记忆库、定时任务库、技能目录和 Obsidian 路径），启动 Hermes CLI 子进程，把终端输出持续追加到当前聊天气泡；当 CLI 明确要求确认、继续、密码、密钥或输入时，会在聊天页显示交互面板，并把用户回答写回 Hermes stdin。若 CLI 长时间暂时没有正文输出，Codebot 会在聊天窗口中持续映射 Hermes 运行状态：包括 `session.status` 启动状态、`session.trace` 运行轨迹，以及非阻塞的 `session.idle` 后台心跳，明确告诉用户当前仍在处理、已静默多久、以及最后一条可见输出，避免出现“后台到底卡住还是正在处理”的黑箱感。为了更接近 OpenCode CLI 的可读性，Codebot 现在还会把明显像“加载 skill / 调用 tool / 扫描资源 / 运行步骤”的 Hermes 行优先归类成可见的“工具调用”事件，其余普通说明继续归类为“运行轨迹”，让中间过程和最终正文更清楚地区分。针对开发态排查中发现的“启动后长时间 0 输出但同消息重试可成功”的间歇性卡死，Codebot 现在会在 Hermes 启动后连续 45 秒仍无任何 stdout 时自动重试 1 次，仅针对尚未产生任何输出的启动阶段，不影响已经开始正常输出的长任务。重构后的 Hermes 接入不再导入 Hermes 内部 Agent 类，也不再依赖自定义 runner；聊天执行入口也已从顶层 `hermes -z/--oneshot` 切换为 Hermes 官方 `--cli chat -q` 单次查询路径，避免继续走 `oneshot` 那条“只输出最终结果并绕过 `cli.py`”的旁路。Hermes 的 skill 共享模型现在统一收敛为“目录共享”而不是“执行委派”：Codebot 会把 **Hermes 运行时 `HERMES_HOME/skills`**、**Hermes 仓库内 `skills/` 与 `optional-skills/`**、**用户手动配置的 Hermes Skill 目录**、**Codebot 内置/自动生成 skills 目录**、以及 **OpenCode CLI skill roots** 一起并入 Hermes 的有效 `skills.external_dirs` / 共享上下文。也就是说，仓库 bundled/optional skill 现在默认就会被导入；如果用户不需要其中某个目录，可在设置页把它加入自动共享排除列表。设置页中的“Hermes Skill 目录”除了手动目录外，还会展示自动共享目录，并支持把其中任意目录加入排除列表；技能页对同源同 slug 的 Hermes 只读 skill 也会自动折叠去重，避免开发版/正式版或多套 Hermes 安装同时暴露同名 skill 时出现多条重复记录。对于“显式点名且来源于 OpenCode 共享目录”的 skill，Codebot 现在会先检测 Hermes 兼容分流：运行时证据表明某些 OpenCode-shared skill 会在 Hermes 子进程中长期静默卡住，因此这类请求会透明切换到 OpenCode 原生执行链，并在聊天中显示 `session.compat` 说明，避免暗箱等待。模型方面，Hermes 不要求用户单独配置模型：聊天主模型跟随当前聊天模型，后台辅助模型跟随“记忆 → 配置 → 自动整理 → 整理使用模型”，因此 Codebot 能调用的 OpenCode 模型，Hermes 也会共用同一套 `/v1` 网关。为避免开发版 Windows 环境下的中文乱码和终端样式污染，Codebot 现在会对 Hermes stdout 使用增量 UTF-8 解码，并过滤 ANSI 控制序列、Rich 边框、`Resume this session` / `session_id` / `Session` 等终端辅助行，只把更接近正文的内容映射到聊天消息。Hermes 执行超时按“空闲无输出/无交互”计算；终止按钮会结束当前 Hermes 进程。Hermes 模式下沉淀或创建的定时任务会记录 `executor=hermes`，后续到点触发时继续由 Hermes CLI 执行；OpenCode 模式创建的任务则记录 `executor=opencode`
+- **Hermes 模式**: 在聊天页点击 `Hermes` 后，当前消息默认会交给 Codebot 管理目录中的 Hermes Agent CLI 处理。设置页中的 `Hermes` 标签位于“通用设置”右侧，提供“一键安装 / 一键修复 / 一键更新”，默认把 Hermes 浅克隆到 Codebot 根目录下的 `hermes-agent/`；更新前若发现该目录存在未提交修改会安全停止，不覆盖本地改动。Codebot 只作为薄适配层：写入共享配置（模型网关、记忆库、定时任务库、技能目录和 Obsidian 路径），通过当前官方 `hermes chat -q` 单次查询入口启动 CLI 子进程，把终端输出持续追加到当前聊天气泡。配置文件版本会从已安装 Hermes 的源码动态读取，避免 Hermes 升级后继续写入过期版本号。Hermes 明确要求确认、密码或输入时，聊天页会显示交互面板；长时间无正文时会显示状态、轨迹和心跳，启动后 45 秒仍完全无 stdout 时自动重试一次。stdout 使用增量 UTF-8 解码，并过滤 ANSI、Rich 边框、会话辅助行、用户提示词回显与项目上下文截断警告；截断只作为 `session.warning` 事件展示，不污染最终正文。Hermes 的技能目录、模型网关、记忆、任务和 Obsidian 配置继续与 Codebot 共享；显式选择 skill 时只挂载能解析它的必要目录。Hermes 异常退出、空内容、空闲超时或连续 180 秒没有可显示输出时会返回明确错误。Hermes 模式创建的定时任务记录 `executor=hermes`，OpenCode 模式则记录 `executor=opencode`
 - **Obsidian 模式**: 设置页中的 `Obsidian` 标签支持配置默认 Vault 路径与多个知识库路径；聊天页通过 `#` 可多选知识库。Codebot 会把这些 Markdown 知识库当成原生 Obsidian wiki 结构直接处理，优先引导调用 `obsidian-cli` 与相关 Obsidian skill 去完成检索、模板调用、读取、写入、移动与 wiki-link 安全操作，不会把知识库先转成向量库。桌面正式版在 `Obsidian` 目标下只会选择 Codebot/Hermes 本地可用的 Obsidian skill，不再回退到 Vault 内部的 OpenCode skill 路径；发送给 OpenCode 的 session workspace 会固定到 Codebot 可写数据目录，而不是 Vault 目录。整库扫描 Markdown 时会跳过 `.opencode`、`.obsidian` 等工具目录并忽略坏目录，因此即使 `<vault>/.opencode/skills/agents` 不存在，也不应再因此导致发送失败
+- **VS Code 按钮**: 输入框下方、`Obsidian` 右侧新增 `VS Code`。选择项目目录后点击，会通过 Electron 主进程验证绝对路径并使用本机 VS Code 打开该目录；浏览器版不会尝试直接启动本机程序
+- **VS Code 扩展**: `vscode-extension/` 提供独立的 Codebot Chat 侧栏并使用 Codebot 原生机器人图标。输入区固定在底部，消息区独立滚动；模式、目标和模型直接显示在输入框下方、“终端选区”左侧，知识库不再常驻显示为复选框。扩展支持历史对话续接、Editor / Build / Plan / Agent、模型、`/` 命令、`@` Skill、`#` 知识库、Codebot / Hermes / Obsidian / Hermes + Obsidian。编辑器选中代码并停止调整后会就地出现“加入 Codebot 对话”。由于 VS Code 会屏蔽资源管理器到 Webview 输入框的拖放事件，且修饰键不可由扩展自定义，Codebot 侧栏改为提供原生“拖放文件到对话”TreeView；从资源管理器直接拖到该区域无需按键，放下后会将文件加入聊天输入上下文。输入框下方“文件”按钮和资源管理器右键“Codebot: 将文件加入对话”继续作为可靠入口。终端因 VS Code 稳定 API 不提供选区变化事件，保留输入框下方“终端选区”和终端右键菜单作为可靠入口。Editor 模式默认基于当前工作区做精确、最小且可验证的源码修改；`Enter` 发送，`Ctrl+Enter` 换行。运行 `cd vscode-extension && npm ci && npm run package` 可生成 VSIX；GitHub Release 也会附带 VSIX。扩展默认依次探测开发端口 `18080` 和正式端口 `15682`，也可通过 `codebot.backendUrl` 指定地址。扩展会显示工具调用、会话状态、空闲用时和真实模型/API 错误；重新加载后从后端恢复运行态，阻止旧任务仍在执行时重复发送。消息支持逐条复制，顶部可复制整个对话；发送按钮在运行中切换为“停止”。用户消息支持撤销：删除该轮及之后的对话，并通过 Codebot 独立 Git 快照把关联工作区恢复到该轮修改前
 - **Hermes + Obsidian 双选**: 聊天页同时点亮 `Hermes` 和 `Obsidian` 时，前端会发送组合目标 `hermes_obsidian`，后端会同时走 Hermes CLI 执行链和 Obsidian Markdown 上下文构建链。此模式会固定加载 Hermes 原生 Obsidian skill `note-taking/obsidian`，并把 Hermes `skills.external_dirs` 收窄到能解析该 skill 的根目录，避免正式版因多个 Obsidian skill 同名或目录重复而静默卡住
 - **Hermes 错误处理**: Hermes CLI 异常退出、返回空内容、空闲超时，或连续 180 秒没有任何可显示输出时，聊天流会立即返回明确错误，包含退出码和最后输出片段；不会再只持续显示 `session.idle` 心跳让用户猜后台是否已经报错
 - **首响优化**: 聊天发送后，Codebot 只会在消息明显像“创建定时任务/提醒/闹钟”时才调用额外的意图分类；普通 Hermes / OpenCode / Obsidian 对话现在直接进入对应执行链，减少发送后前十几秒无响应的情况
@@ -391,7 +401,7 @@ codebot/
 - **Hermes 共享修复**: 当用户在聊天里显式选中 Hermes skill 时，Codebot 现在会把 Hermes `skills.external_dirs` 从“全量共享根目录”收窄为“能解析所选 skill 的根目录集合”；未显式选中 skill 时，仍保持默认全量共享。这样可以避免 Hermes 在调用单个 skill 时继续扫描整包共享 roots，减少“CLI 已启动但长时间静默”的情况
 - **命令搜索**: 聊天输入框中的 `/` 会搜索 OpenCode CLI 命令，并支持按描述、单词和多词进行匹配
 - **文档入口**: 设置页里的“文档”会直接渲染本 README，文档右上角可刷新，适合在改动配置、功能或使用方式后重新查看
-- **使用顺序**: 建议先看“快速开始”和“访问”，再看这里的使用说明；真正上手时，优先用聊天页底部的 `项目`、`生成技能`、`Hermes`、`Obsidian` 按钮切换处理目标
+- **使用顺序**: 建议先看“快速开始”和“访问”，再看这里的使用说明；真正上手时，优先用聊天页底部的 `项目`、`生成技能`、`Hermes`、`Obsidian`、`VS Code` 按钮切换处理目标
 
 ### 2. 记忆系统
 
@@ -430,6 +440,9 @@ codebot/
 - **调度边界**: 聊天中的定时任务创建意图由 AI 结构化分类器判断；只有判断为“创建/添加/设置 Codebot 定时任务、提醒或闹钟”时，Codebot 才会写入内置定时任务系统或成长候选。普通排错、日志分析和文件处理会继续交给 OpenCode/Hermes CLI，不会被误创建为任务；Codebot 也不会让 CLI 立即创建 PowerShell 后台作业、Windows `schtasks`、cron/systemd/launchd 等系统级定时器
 - **提醒任务**: 带 `__REMINDER__` 标志的纯提醒任务不依赖 Hermes/OpenCode 也能按计划触发通知；AI 类任务（生成内容/写文件等）按任务执行器要求对应运行时可用
 - **像聊天一样执行**: 定时任务到达执行时间时，系统会按任务执行器像对应聊天入口一样处理任务内容，充分利用 AI 的代码生成与文件写入能力
+- **可靠执行**: 调度循环默认每 5 秒检查一次，到期任务先持久化认领再后台执行；慢任务不会阻塞其他任务。应用重启后会识别错过的计划时间，在宽限期内合并补跑一次，超期则明确记录“已跳过”，不再静默丢失
+- **超时与重试**: 每个任务可独立设置执行超时、失败重试次数与间隔；默认同一任务禁止重入，手动重复执行返回明确提示。通知失败与任务执行结果相互隔离
+- **运行可见性**: 定时任务页显示调度器是否运行、当前执行数量、上次结果、耗时和连续失败次数；日志额外记录计划时间、触发类型、尝试次数与耗时。AI 无法识别自然语言时间时会要求补充说明，不再擅自回退为“每天 09:00”
 - **一次性任务**: 未强调重复性的任务（如"5分钟后"、"明天"）自动标记为一次性，执行完成后不再重复触发
 
 示例：
@@ -466,14 +479,15 @@ codebot/
 - SSE 模式的 MCP 工具由 `tool_dispatcher.py` 自动调用：当用户提示词匹配到工具描述时，后端自动发起工具调用并将结果注入上下文
 - 完整 CRUD 管理界面（`/mcp` 页面）及 REST API（`/api/mcp`）
 
-### 7. 沙箱执行
+### 7. 受控工作区执行
 
-- 工作目录隔离执行环境，AI 生成的代码在独立 `data/sandbox/workspace/` 目录中运行
+- AI 生成的命令从独立 `data/sandbox_workspace/` 工作目录启动
 - **无需安装额外软件**：移除 QEMU/Docker 依赖，开箱即用
-- 基于 `asyncio.create_subprocess_shell` 执行命令，支持超时控制
+- 基于 `asyncio.create_subprocess_shell` 执行命令，支持超时和单任务互斥控制
 - 完整输出捕获：`stdout`、`stderr`、`exit_code`
-- 执行模式：`local`（工作目录隔离）
+- 执行模式：`workspace_guard`（本地进程，不是 VM/容器）
 - 可配置执行超时（秒，默认 300）
+- 工作目录不是文件系统权限边界，当前也不隔离网络；请仅运行可信任务
 
 ## 🧩 常见问题
 
@@ -546,14 +560,16 @@ codebot/
 
 无 OpenCode 连接时降级为规则模式（仅去重完全相同的条目）。每批最多处理 30 条，避免超出模型上下文窗口。活跃记忆永远不会被整理删除，只会被归档或更新内容。可在记忆配置中指定专用整理模型，与日常聊天模型解耦，便于灵活控制成本。
 
-### 沙箱配置
+### 沙箱与可选隔离后端配置
 
 在设置页面沙箱标签页可以配置：
 
-- **启用沙箱**: 开启后 AI 生成的代码在工作目录隔离环境中执行
+- **启用沙箱**: 控制聊天是否把高风险任务路由到隔离链路，默认关闭
+- **强隔离后端**: 默认“不启用强隔离”；可由用户主动选择 Windows Sandbox，未选择时不会探测系统能力
+- **执行模式**: `auto` 仅对高风险任务要求隔离，`sandbox` 始终要求隔离，`local` 仅运行明确可信的宿主机命令
 - **执行超时**: 单次命令执行超时（秒，默认 300）
-- 无需安装 QEMU 或 Docker，所有执行均在本机  目录中进行
-- 切换启用沙箱后，点击冒烟测试立即验证执行环境是否正常
+- 无需安装 QEMU 或 Docker；选择 Windows Sandbox 时由 Windows 官方可选功能提供虚拟化隔离，Codebot 不会自动安装
+- 只有选择并启用 Windows Sandbox 后，才可点击冒烟测试验证映射目录、输出和超时链路
 
 ### MCP 服务器配置
 
@@ -761,10 +777,10 @@ npm run build
 - `POST /api/sandbox/prepare` - 初始化沙箱工作目录
 - `GET /api/sandbox/config` - 获取沙箱配置
 - `PATCH /api/sandbox/config` - 更新沙箱配置
-- `POST /api/sandbox/start` - 兼容接口，确保本地隔离模式已就绪
-- `POST /api/sandbox/stop` - 兼容接口，停止本地模式沙箱状态
+- `POST /api/sandbox/start` - 兼容接口；仅在显式选择 Windows Sandbox 后检查运行时
+- `POST /api/sandbox/stop` - 兼容接口，停止沙箱状态
 - `POST /api/sandbox/test` - 执行沙箱冒烟测试
-- `POST /api/sandbox/install-qemu` - 兼容接口，本地模式下返回说明
+- `POST /api/sandbox/install-qemu` - 兼容接口；不会安装 QEMU，并说明 Windows Sandbox 为可选后端
 
 ### 日志 API
 

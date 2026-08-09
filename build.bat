@@ -11,7 +11,7 @@ set "ROOT=%~dp0"
 set "VENV=%ROOT%venv"
 set "PYTHON=%VENV%\Scripts\python.exe"
 
-echo [0/5] Releasing build artifacts...
+echo [0/6] Releasing build artifacts...
 taskkill /F /IM codebot-backend.exe >nul 2>&1
 taskkill /F /IM Codebot.exe >nul 2>&1
 if exist "%ROOT%backend\dist\codebot-backend" rmdir /s /q "%ROOT%backend\dist\codebot-backend"
@@ -21,7 +21,7 @@ if exist "%ROOT%electron\dist\electron_new\win-unpacked" rmdir /s /q "%ROOT%elec
 :: ---------------------------------------------------------------
 :: Step 1 - Create venv (if not already present)
 :: ---------------------------------------------------------------
-echo [1/5] Checking Python virtual environment...
+echo [1/6] Checking Python virtual environment...
 if not exist "%PYTHON%" (
     echo      venv not found, creating at %VENV% ...
     python -m venv "%VENV%"
@@ -38,7 +38,7 @@ if not exist "%PYTHON%" (
 :: Step 2 - Install Python dependencies
 :: ---------------------------------------------------------------
 echo.
-echo [2/5] Installing Python dependencies into venv...
+echo [2/6] Installing Python dependencies into venv...
 "%PYTHON%" -m pip install --disable-pip-version-check pyinstaller --quiet
 "%PYTHON%" -m pip install --disable-pip-version-check -r "%ROOT%backend\requirements.txt" --quiet
 if errorlevel 1 (
@@ -56,7 +56,7 @@ echo      Dependencies installed.
 :: Step 3 - Build Python backend with PyInstaller
 :: ---------------------------------------------------------------
 echo.
-echo [3/5] Building Python backend with PyInstaller...
+echo [3/6] Building Python backend with PyInstaller...
 pushd "%ROOT%backend"
 if exist "%ROOT%backend\dist_build\codebot-backend" rmdir /s /q "%ROOT%backend\dist_build\codebot-backend"
 if exist "%ROOT%backend\build_tmp2\codebot-backend" rmdir /s /q "%ROOT%backend\build_tmp2\codebot-backend"
@@ -80,7 +80,7 @@ echo      Backend built: backend\dist\codebot-backend\
 :: Step 4 - Build Vue frontend
 :: ---------------------------------------------------------------
 echo.
-echo [4/5] Building Vue frontend...
+echo [4/6] Building Vue frontend...
 pushd "%ROOT%frontend"
 call npm install --silent
 if errorlevel 1 (
@@ -98,10 +98,37 @@ popd
 echo      Frontend built: frontend\dist\
 
 :: ---------------------------------------------------------------
-:: Step 5 - Package Electron app with electron-builder
+:: Step 5 - Package VS Code extension
 :: ---------------------------------------------------------------
 echo.
-echo [5/5] Packaging Electron app...
+echo [5/6] Packaging VS Code extension...
+pushd "%ROOT%vscode-extension"
+call npm install --silent
+if errorlevel 1 (
+    popd
+    echo ERROR: npm install VS Code extension failed.
+    exit /b 1
+)
+call npm run check
+if errorlevel 1 (
+    popd
+    echo ERROR: VS Code extension syntax check failed.
+    exit /b 1
+)
+call npm run package
+if errorlevel 1 (
+    popd
+    echo ERROR: VS Code extension packaging failed.
+    exit /b 1
+)
+popd
+echo      VS Code extension built: vscode-extension\*.vsix
+
+:: ---------------------------------------------------------------
+:: Step 6 - Package Electron app with electron-builder
+:: ---------------------------------------------------------------
+echo.
+echo [6/6] Packaging Electron app...
 pushd "%ROOT%electron"
 set "CSC_IDENTITY_AUTO_DISCOVERY=false"
 call npm install --silent

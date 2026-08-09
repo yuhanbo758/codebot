@@ -74,7 +74,8 @@ function isShopDomain(domain) {
 
 function isShopUrl(rawUrl) {
   try {
-    return isShopDomain(new URL(rawUrl).hostname);
+    const parsed = new URL(rawUrl);
+    return parsed.protocol === 'https:' && isShopDomain(parsed.hostname);
   } catch (_) {
     return false;
   }
@@ -82,8 +83,9 @@ function isShopUrl(rawUrl) {
 
 function isSkillDownloadUrl(rawUrl) {
   try {
-    const hostname = new URL(rawUrl).hostname.toLowerCase();
-    return isShopDomain(hostname) || hostname === SHOP_DOWNLOAD_HOSTNAME;
+    const parsed = new URL(rawUrl);
+    const hostname = parsed.hostname.toLowerCase();
+    return parsed.protocol === 'https:' && (isShopDomain(hostname) || hostname === SHOP_DOWNLOAD_HOSTNAME);
   } catch (_) {
     return false;
   }
@@ -179,7 +181,38 @@ function copyDirectoryContents(sourceDir, targetDir) {
   fs.cpSync(sourceDir, targetDir, { recursive: true, force: true });
 }
 
-function extractArchive(archivePath, destinationDir) {
+function captureCommand(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('error', reject);
+    child.on('exit', (code) => code === 0 ? resolve(stdout) : reject(new Error(stderr.trim() || `命令退出码 ${code}`)));
+  });
+}
+
+async function validateArchiveEntries(archivePath) {
+  // Windows 10+ 与 macOS/Linux 均提供 bsdtar。解压前先校验路径和链接类型，避免 Zip Slip。
+  const names = await captureCommand('tar', ['-tf', archivePath]);
+  const verbose = await captureCommand('tar', ['-tvf', archivePath]);
+  const entries = names.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+  if (entries.length > 2000) throw new Error('技能压缩包文件数量超过 2000 个');
+  for (const entry of entries) {
+    const normalized = entry.replace(/\\/g, '/');
+    const segments = normalized.split('/').filter(Boolean);
+    if (path.isAbsolute(entry) || /^[a-zA-Z]:/.test(normalized) || segments.includes('..') || normalized.includes('\0')) {
+      throw new Error(`技能压缩包包含不安全路径：${entry}`);
+    }
+  }
+  if (verbose.split(/\r?\n/).some((line) => /^[lh]/i.test(line.trim()))) {
+    throw new Error('技能压缩包包含符号链接或硬链接，已拒绝安装');
+  }
+}
+
+async function extractArchive(archivePath, destinationDir) {
+  await validateArchiveEntries(archivePath);
   ensureDir(destinationDir);
   return new Promise((resolve, reject) => {
     const isWindows = process.platform === 'win32';
@@ -344,11 +377,15 @@ function bindBuiltinSessionEvents() {
   if (builtinSessionEventsBound) return;
   builtinSessionEventsBound = true;
   const builtinSession = getBuiltinSession();
+  // 内置网页不应获得摄像头、麦克风、地理位置、USB 等桌面权限。
+  builtinSession.setPermissionCheckHandler(() => false);
+  builtinSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
 
   builtinSession.on('will-download', (event, item, webContents) => {
     const sourceUrl = item.getURL() || webContents?.getURL() || '';
     const fileName = sanitizeFileName(item.getFilename());
-    if (!isSkillDownloadUrl(sourceUrl) && !isSupportedSkillDownload(fileName)) return;
+    // 只有可信下载域名且扩展名受支持时才自动安装，防止普通网页的同名 ZIP 触发 Skill 安装。
+    if (!isSkillDownloadUrl(sourceUrl) || !isSupportedSkillDownload(fileName)) return;
     const downloadsDir = ensureDir(path.join(codebotSkillsDir(), '.downloads'));
     const savePath = uniquePath(path.join(downloadsDir, fileName));
     item.setSavePath(savePath);
@@ -369,10 +406,34 @@ function bindBuiltinSessionEvents() {
 }
 
 function isInternalAppUrl(url) {
-  return url.startsWith(BACKEND_URL)
-    || url.startsWith(`http://localhost:${backendPort}`)
-    || url.startsWith(FRONTEND_DEV_URL)
-    || url.startsWith('http://localhost:3000');
+  try {
+    const origin = new URL(url).origin;
+    return new Set([
+      BACKEND_URL,
+      `http://localhost:${backendPort}`,
+      FRONTEND_DEV_URL,
+      'http://localhost:3000',
+    ]).has(origin);
+  } catch (_) {
+    return false;
+  }
+}
+
+function isSafeExternalUrl(rawUrl) {
+  try {
+    const protocol = new URL(rawUrl).protocol.toLowerCase();
+    return ['https:', 'http:', 'mailto:'].includes(protocol);
+  } catch (_) {
+    return false;
+  }
+}
+
+function isHttpExternalUrl(rawUrl) {
+  try {
+    return ['https:', 'http:'].includes(new URL(rawUrl).protocol.toLowerCase());
+  } catch (_) {
+    return false;
+  }
 }
 
 // 显式隔离 Electron 的会话数据目录，避免开发态和打包态混用缓存数据。
@@ -392,7 +453,6 @@ let linkOpenMode = 'system';
 app.commandLine.appendSwitch('disable-http-cache');
 // 防止与其他 Electron 应用（如 OpenCode 桌面端）同时运行时
 // Chromium 出现 "Network service crashed, restarting service" 错误
-app.commandLine.appendSwitch('disable-gpu-sandbox');
 
 ipcMain.handle('clipboard-copy', (_event, text) => {
   if (typeof text !== 'string') {
@@ -404,7 +464,7 @@ ipcMain.handle('clipboard-copy', (_event, text) => {
 
 // 用系统默认浏览器打开外部链接
 ipcMain.handle('open-external', async (_event, url) => {
-  if (typeof url !== 'string') return false;
+  if (typeof url !== 'string' || !isSafeExternalUrl(url)) return false;
   try {
     await shell.openExternal(url);
     return true;
@@ -423,7 +483,7 @@ ipcMain.handle('set-link-open-mode', (_event, mode) => {
 
 // 在 Electron 内置浏览器窗口中打开链接
 ipcMain.handle('open-builtin', (_event, url) => {
-  if (typeof url !== 'string') return false;
+  if (typeof url !== 'string' || !isHttpExternalUrl(url)) return false;
   try {
     openBuiltinBrowserWindow(url);
     return true;
@@ -441,6 +501,69 @@ ipcMain.handle('dialog:selectFolder', async (_event, options) => {
   });
   if (result.canceled || !result.filePaths.length) return null;
   return result.filePaths[0];
+});
+
+function findVSCodeCommands() {
+  if (process.platform !== 'win32') return ['code'];
+  const commands = [];
+  const addExecutable = (value) => {
+    if (!value || commands.includes(value) || !fs.existsSync(value)) return;
+    commands.push(value);
+  };
+  // VS Code 的 PATH 入口通常是 bin/code.cmd；它不能在 shell:false 下直接
+  // spawn，因此由其所在目录反推真正的 Code.exe。
+  for (const entry of String(process.env.PATH || '').split(path.delimiter)) {
+    const binDir = entry.replace(/^"|"$/g, '').trim();
+    if (!binDir) continue;
+    if (fs.existsSync(path.join(binDir, 'code.cmd'))) {
+      addExecutable(path.resolve(binDir, '..', 'Code.exe'));
+    }
+    addExecutable(path.join(binDir, 'Code.exe'));
+  }
+  if (process.env.LOCALAPPDATA) addExecutable(path.join(process.env.LOCALAPPDATA, 'Programs', 'Microsoft VS Code', 'Code.exe'));
+  if (process.env.ProgramFiles) addExecutable(path.join(process.env.ProgramFiles, 'Microsoft VS Code', 'Code.exe'));
+  if (process.env['ProgramFiles(x86)']) addExecutable(path.join(process.env['ProgramFiles(x86)'], 'Microsoft VS Code', 'Code.exe'));
+  return commands;
+}
+
+// 使用 VS Code CLI 打开当前项目目录。只接受已存在的绝对目录，避免把任意参数
+// 透传给 shell；spawn 始终使用参数数组，并明确关闭 shell。
+ipcMain.handle('vscode:open-project', async (_event, projectPath) => {
+  if (typeof projectPath !== 'string' || !path.isAbsolute(projectPath)) {
+    throw new Error('请先在 Codebot 中选择有效的项目文件夹');
+  }
+  const resolvedPath = path.resolve(projectPath);
+  let stats;
+  try {
+    stats = fs.statSync(resolvedPath);
+  } catch {
+    throw new Error(`项目目录不存在：${resolvedPath}`);
+  }
+  if (!stats.isDirectory()) {
+    throw new Error(`项目路径不是文件夹：${resolvedPath}`);
+  }
+
+  const candidates = findVSCodeCommands();
+  let lastError = null;
+  for (const command of candidates) {
+    try {
+      const child = spawn(command, ['--reuse-window', resolvedPath], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+        shell: false,
+      });
+      await new Promise((resolve, reject) => {
+        child.once('spawn', resolve);
+        child.once('error', reject);
+      });
+      child.unref();
+      return { success: true, path: resolvedPath, command };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(`未找到 VS Code 可执行文件。请安装 VS Code 并将 code 命令加入 PATH。${lastError ? ` ${lastError.message}` : ''}`);
 });
 
 ipcMain.handle('get-version', () => app.getVersion());
@@ -531,6 +654,9 @@ ipcMain.handle('update:install', async () => {
 // 创建内置浏览器窗口的辅助函数
 // 使用 persist:builtin-browser 命名持久化 session，确保 Cookie 跨窗口关闭后保留
 function openBuiltinBrowserWindow(url) {
+  if (!isHttpExternalUrl(url)) {
+    throw new Error('内置浏览器只允许打开 HTTP/HTTPS 地址');
+  }
   const builtinSession = getBuiltinSession();
   const browserWin = new BrowserWindow({
     width: 1100,
@@ -541,6 +667,7 @@ function openBuiltinBrowserWindow(url) {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: true,
       session: builtinSession,
     },
   });
@@ -552,9 +679,14 @@ function openBuiltinBrowserWindow(url) {
   browserWin.webContents.on('did-navigate-in-page', syncAccountState);
   browserWin.webContents.on('did-navigate', syncAccountState);
   browserWin.webContents.on('will-navigate', (event, targetUrl) => {
-    if (!isSkillDownloadUrl(targetUrl)) return;
-    event.preventDefault();
-    browserWin.webContents.downloadURL(targetUrl);
+    if (isSkillDownloadUrl(targetUrl)) {
+      event.preventDefault();
+      browserWin.webContents.downloadURL(targetUrl);
+      return;
+    }
+    if (!isHttpExternalUrl(targetUrl)) {
+      event.preventDefault();
+    }
   });
   // 内置浏览器窗口内部的新窗口也在同一内置浏览器中打开（同一 session，复用 cookie）
   browserWin.webContents.setWindowOpenHandler(({ url: newUrl }) => {
@@ -562,7 +694,9 @@ function openBuiltinBrowserWindow(url) {
       browserWin.webContents.downloadURL(newUrl);
       return { action: 'deny' };
     }
-    openBuiltinBrowserWindow(newUrl);
+    if (isHttpExternalUrl(newUrl)) {
+      openBuiltinBrowserWindow(newUrl);
+    }
     return { action: 'deny' };
   });
   // 同步标题
@@ -1014,6 +1148,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
+      sandbox: true,
     },
     icon: path.join(__dirname, '..', 'logo.ico'),
   });
@@ -1074,18 +1209,20 @@ function createWindow() {
     }
     event.preventDefault();
     if (linkOpenMode === 'builtin') {
-      openBuiltinBrowserWindow(url);
+      if (isHttpExternalUrl(url)) openBuiltinBrowserWindow(url);
+      else if (isSafeExternalUrl(url)) shell.openExternal(url);
     } else {
-      shell.openExternal(url);
+      if (isSafeExternalUrl(url)) shell.openExternal(url);
     }
   });
 
   // 拦截 window.open() 和 target="_blank" 链接
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (linkOpenMode === 'builtin') {
-      openBuiltinBrowserWindow(url);
+      if (isHttpExternalUrl(url)) openBuiltinBrowserWindow(url);
+      else if (isSafeExternalUrl(url)) shell.openExternal(url);
     } else {
-      shell.openExternal(url);
+      if (isSafeExternalUrl(url)) shell.openExternal(url);
     }
     return { action: 'deny' };
   });

@@ -1,0 +1,124 @@
+{
+  "name": "codebot-chat",
+  "displayName": "Codebot Chat",
+  "description": "在 VS Code 中复用 Codebot 的模型、Agent、Skill、Hermes 与 Obsidian 知识库能力。",
+  "version": "1.4.0",
+  "publisher": "codebot",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yuhanbo758/codebot.git",
+    "directory": "vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "icon": "resources/codebot.png",
+  "main": "./extension.js",
+  "activationEvents": [
+    "onView:codebot.chatView",
+    "onView:codebot.fileDropView",
+    "onCommand:codebot.openChat",
+    "onCommand:codebot.newConversation",
+    "onCommand:codebot.addEditorSelection",
+    "onCommand:codebot.addTerminalSelection",
+    "onCommand:codebot.attachFiles",
+    "onCommand:codebot.addResourceFiles"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "codebot.openChat",
+        "title": "Codebot: 打开聊天"
+      },
+      {
+        "command": "codebot.newConversation",
+        "title": "Codebot: 新建对话"
+      },
+      {
+        "command": "codebot.addEditorSelection",
+        "title": "Codebot: 将编辑器选区加入对话"
+      },
+      {
+        "command": "codebot.addTerminalSelection",
+        "title": "Codebot: 将终端选区加入对话"
+      },
+      {
+        "command": "codebot.attachFiles",
+        "title": "Codebot: 添加文件到对话"
+      },
+      {
+        "command": "codebot.addResourceFiles",
+        "title": "Codebot: 将文件加入对话"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codebot",
+          "title": "Codebot",
+          "icon": "resources/codebot.svg"
+        }
+      ]
+    },
+    "views": {
+      "codebot": [
+        {
+          "type": "webview",
+          "id": "codebot.chatView",
+          "name": "Chat",
+          "initialSize": 8
+        },
+        {
+          "id": "codebot.fileDropView",
+          "name": "拖放文件到对话",
+          "initialSize": 1
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codebot.addEditorSelection",
+          "when": "editorHasSelection",
+          "group": "navigation@90"
+        }
+      ],
+      "terminal/context": [
+        {
+          "command": "codebot.addTerminalSelection",
+          "when": "terminalFocus",
+          "group": "navigation@90"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "codebot.addResourceFiles",
+          "when": "resourceScheme == file",
+          "group": "navigation@90"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Codebot",
+      "properties": {
+        "codebot.backendUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Codebot 后端地址。留空时自动尝试开发端口 18080 和正式端口 15682。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "node --check extension.js",
+    "package": "npx --yes @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.6.0"
+  }
+}

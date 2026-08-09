@@ -10,6 +10,8 @@ from config import app_config, LarkBotConfig, save_config
 from core.memory_manager import MemoryManager
 from services.lark_bot import LarkBotService
 from api.routes import chat
+from utils.background_tasks import create_background_task
+from utils.secrets import merge_masked_secrets, redact_secrets
 
 router = APIRouter()
 memory_manager: Optional[MemoryManager] = None
@@ -28,7 +30,7 @@ class LarkBotConfigUpdate(BaseModel):
 @router.get("/config")
 async def get_lark_config():
     try:
-        return {"success": True, "data": app_config.lark_bot.model_dump()}
+        return {"success": True, "data": redact_secrets(app_config.lark_bot.model_dump())}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -38,7 +40,7 @@ async def update_lark_config(request: LarkBotConfigUpdate):
     try:
         updates = request.model_dump(exclude_unset=True)
         current = app_config.lark_bot.model_dump()
-        current.update(updates)
+        current = merge_masked_secrets(current, updates)
         app_config.lark_bot = LarkBotConfig(**current)
         save_config(app_config)
         return {"success": True, "message": "配置已更新"}
@@ -86,7 +88,7 @@ async def handle_lark_event(request: Request):
 
     # 立即返回 200，避免飞书 3 秒超时重试
     # 消息处理在后台异步执行
-    asyncio.create_task(_process_webhook_message(chat_id, content))
+    create_background_task(_process_webhook_message(chat_id, content), name=f"lark-webhook-{chat_id}")
     return {"success": True}
 
 

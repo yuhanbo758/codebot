@@ -5,10 +5,10 @@
         <el-switch v-model="form.enabled" />
       </el-form-item>
       <el-form-item label="Webhook URL">
-        <el-input v-model="form.webhook_url" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
+        <el-input v-model="form.webhook_url" type="password" show-password placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/..." />
       </el-form-item>
       <el-form-item label="签名密钥">
-        <el-input v-model="form.secret" />
+        <el-input v-model="form.secret" type="password" show-password />
       </el-form-item>
       <el-form-item label="启用飞书机器人">
         <el-switch v-model="form.bot_enabled" />
@@ -23,13 +23,13 @@
         <el-input v-model="form.app_id" />
       </el-form-item>
       <el-form-item label="App Secret">
-        <el-input v-model="form.app_secret" />
+        <el-input v-model="form.app_secret" type="password" show-password />
       </el-form-item>
       <el-form-item label="Verify Token">
-        <el-input v-model="form.verify_token" />
+        <el-input v-model="form.verify_token" type="password" show-password />
       </el-form-item>
       <el-form-item label="Encrypt Key">
-        <el-input v-model="form.encrypt_key" />
+        <el-input v-model="form.encrypt_key" type="password" show-password />
       </el-form-item>
       <el-form-item label="接收类型">
         <el-select v-model="form.receive_id_type" style="width: 100%">

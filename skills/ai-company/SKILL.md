@@ -1,6 +1,6 @@
 ---
 name: ai-company
-description: "AI Company orchestrator - assemble expert AI agent teams (Bezos, Munger, DHH, etc.) to brainstorm, evaluate, build and ship products. Use when you need multi-perspective strategic thinking, product evaluation, feature development workflow, or business decision-making with world-class expert personas."
+description: "Orchestrate a bounded Codebot expert team for complex product, engineering, launch, or business decisions that require several dependent specialties. Use for explicit multi-Agent work or cross-domain decisions; skip for routine implementation and single-domain questions."
 ---
 
 # AI Company - Expert Agent Team Orchestrator
@@ -112,6 +112,12 @@ Use these structured collaboration chains for common scenarios:
 
 ## How To Execute (For the AI Agent)
 
+### Codebot runtime boundary
+
+Use Codebot's real multi-Agent hub when the user explicitly requests separate agents or when independent workstreams can run concurrently. If the current conversation is not a multi-Agent hub, choose the required role lenses and synthesize them yourself; never invent agent transcripts or imply that a `Task` tool ran.
+
+Keep orchestration bounded: 2-5 roles, one owner per deliverable, explicit dependencies, and a concrete stop condition. A coding request should normally be implemented and tested directly; it should not become a company simulation merely because Agent mode is selected.
+
 When this skill is loaded, follow these steps:
 
 ### Step 1: Understand the Task
@@ -124,7 +130,7 @@ Identify what the user needs:
 
 ### Step 2: Assemble the Team
 
-Select 2-5 experts most relevant to the task. Use the Task tool to spawn sub-agents:
+Select 2-5 experts most relevant to the task. In runtimes that expose a `Task` tool, the following is a compatibility example; in Codebot use the multi-Agent hub:
 
 ```
 For each expert, use the Task tool with subagent_type: "general" and include:

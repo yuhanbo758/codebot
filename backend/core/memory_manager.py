@@ -4,6 +4,7 @@
 import sqlite3
 import json
 import chromadb
+from chromadb.config import Settings as ChromaSettings
 import shutil
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -11,6 +12,18 @@ from pathlib import Path
 from loguru import logger
 
 from config import settings, MemoryConfig
+
+
+def _create_chroma_client(path: Path):
+    """创建关闭匿名遥测的本地 Chroma 客户端。
+
+    Codebot 固定使用 ChromaDB 0.4.x，而新版 posthog 已改变 ``capture``
+    参数签名；关闭遥测可避免每次启动输出无关异常，同时不影响向量存储。
+    """
+    return chromadb.PersistentClient(
+        path=str(path),
+        settings=ChromaSettings(anonymized_telemetry=False),
+    )
 
 
 class MemoryManager:
@@ -918,7 +931,7 @@ class MemoryManager:
 
     def _init_chroma(self, chroma_dir: Path):
         try:
-            client = chromadb.PersistentClient(path=str(chroma_dir))
+            client = _create_chroma_client(chroma_dir)
             collection = client.get_or_create_collection(name="long_term_memory")
             return client, collection
         except Exception as e:
@@ -928,7 +941,7 @@ class MemoryManager:
                 logger.info("检测到 schema 不兼容，尝试自动修复...")
                 if self._repair_chroma_db(chroma_dir):
                     try:
-                        client = chromadb.PersistentClient(path=str(chroma_dir))
+                        client = _create_chroma_client(chroma_dir)
                         collection = client.get_or_create_collection(name="long_term_memory")
                         logger.info("ChromaDB schema 修复成功，已正常初始化")
                         return client, collection
@@ -942,7 +955,7 @@ class MemoryManager:
                 except Exception as move_error:
                     logger.warning(f"备份旧 Chroma 数据失败（文件可能被占用），将直接使用备用目录：{move_error}")
             fallback_dir = chroma_dir.parent / "chroma_v2"
-            client = chromadb.PersistentClient(path=str(fallback_dir))
+            client = _create_chroma_client(fallback_dir)
             collection = client.get_or_create_collection(name="long_term_memory")
             return client, collection
 
@@ -1139,9 +1152,7 @@ class MemoryManager:
                 )
                 self.sqlite_db.row_factory = sqlite3.Row
                 
-                self.chroma_client = chromadb.PersistentClient(
-                    path=str(Path(self.data_dir) / "chroma")
-                )
+                self.chroma_client = _create_chroma_client(Path(self.data_dir) / "chroma")
                 self.memory_collection = self.chroma_client.get_or_create_collection(
                     name="long_term_memory"
                 )

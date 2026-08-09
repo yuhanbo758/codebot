@@ -1,16 +1,25 @@
 ---
-name: Self-Improving Agent (Proactive Self-Reflection)
-slug: self-improving
-version: 1.2.10
-homepage: https://clawic.com/skills/self-improving
-description: Self-reflection + Self-criticism + Self-learning + Self-organizing memory. Agent evaluates its own work, catches mistakes, and improves permanently. Use before starting work and after responding to the user.
-changelog: "Sharper setup now lists relevant memory before non-trivial work, with a title that highlights proactive self-reflection."
-metadata: {"clawdbot":{"emoji":"🧠","requires":{"bins":[]},"os":["linux","darwin","win32"],"configPaths":["~/self-improving/"]}}
+name: self-improving
+description: Review important work, catch verified mistakes, and propose durable learning through Codebot's native memory and growth-candidate flow. Use after multi-step work, user corrections, or confirmed recurring failures; do not trigger for routine chat.
 ---
 
 ## When to Use
 
 User corrects you or points out mistakes. You complete significant work and want to evaluate the outcome. You notice something in your own output that could be better. Knowledge should compound over time without manual maintenance.
+
+## Codebot Runtime Contract
+
+When this skill runs inside Codebot, Codebot's memory and growth-candidate system is the only persistence boundary. Do not create or maintain `~/self-improving/`, do not write a second memory database, and do not claim that a lesson was saved unless Codebot actually accepted it.
+
+Use this compact loop:
+
+1. Compare the delivered result with the user's acceptance criteria and verification evidence.
+2. Identify at most three concrete defects, omissions, or reusable lessons.
+3. Fix recoverable defects within the current authorized scope, then rerun the affected check.
+4. Propose persistence only for a verified, non-sensitive lesson that will matter in future tasks. One-off task details remain in the current conversation.
+5. Report the delta concisely; never expose hidden chain-of-thought or fabricate a reflection log.
+
+The standalone file layout below is legacy compatibility guidance for running the skill outside Codebot. It must not override this runtime contract.
 
 ## Architecture
 
