@@ -211,7 +211,7 @@ class SandboxConfig(BaseModel):
 
 class AppConfig(BaseModel):
     """应用配置"""
-    version: str = "5.1.0"
+    version: str = "5.2.0"
     general: GeneralConfig = GeneralConfig()
     memory: MemoryConfig = MemoryConfig()
     logs: LogConfig = LogConfig()
