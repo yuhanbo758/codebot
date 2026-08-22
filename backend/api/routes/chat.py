@@ -32,7 +32,7 @@ from core.skill_registry import (
     AUTO_GENERATED,
     BUILTIN,
     EXTERNAL,
-    HERMES,
+    CODEX,
     OPENCLAW,
     OPENCODE,
     capture_opencode_skill_snapshot,
@@ -55,7 +55,6 @@ opencode_ws: Optional[OpenCodeClient] = None
 chat_memory_manager: Optional[MemoryManager] = None
 # 由 main.py lifespan 注入（可为 None）
 sandbox_manager = None
-HERMES_OBSIDIAN_SKILL = "note-taking/obsidian"
 
 
 def _collect_opencode_retry_ports() -> List[int]:
@@ -262,11 +261,12 @@ class SendMessageRequest(BaseModel):
     conversation_id: int
     message: str
     model: Optional[str] = None
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]] = None
     mode: Optional[Literal["plan", "build", "agent", "editor"]] = None
     attached_files: Optional[List[AttachedFile]] = Field(default=None, max_length=10)
     user_already_saved: bool = False
     project_dir: Optional[str] = None  # 用户选择的项目文件夹路径
-    target: Optional[str] = None  # codebot | hermes | obsidian | hermes_obsidian
+    target: Optional[str] = None  # codebot | codex | obsidian | codex_obsidian
     knowledge_paths: Optional[List[str]] = None
 
     @model_validator(mode="after")
@@ -312,8 +312,10 @@ class ToggleGroupRequest(BaseModel):
 class MultiAgentDispatchRequest(BaseModel):
     message: str
     model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
     mode: Optional[str] = None
     project_dir: Optional[str] = None
+    target: Optional[str] = None
 
 class ClearConversationRequest(BaseModel):
     confirm: bool = True
@@ -712,12 +714,20 @@ async def notify_task_growth_candidate(candidate: Optional[Dict[str, Any]], conv
 
 
 def _normalized_chat_target(target: Optional[str]) -> str:
-    return re.sub(r"[\s+:-]+", "_", str(target or "").strip().lower())
+    normalized = re.sub(r"[\s+:-]+", "_", str(target or "").strip().lower())
+    # 仅保留一个发布版本的输入兼容；内部状态立即统一为 Codex 名称。
+    legacy = {
+        "hermes": "codex",
+        "hermes_cli": "codex",
+        "hermes_agent": "codex",
+        "hermes_obsidian": "codex_obsidian",
+    }
+    return legacy.get(normalized, normalized)
 
 
-def _is_hermes_target(target: Optional[str]) -> bool:
+def _is_codex_target(target: Optional[str]) -> bool:
     normalized = _normalized_chat_target(target)
-    return normalized == "hermes" or normalized.startswith("hermes_")
+    return normalized == "codex" or normalized.startswith("codex_")
 
 
 def _is_obsidian_target(target: Optional[str]) -> bool:
@@ -726,7 +736,7 @@ def _is_obsidian_target(target: Optional[str]) -> bool:
 
 
 def _task_executor_from_target(target: Optional[str]) -> str:
-    return "hermes" if _is_hermes_target(target) else "opencode"
+    return "codex" if _is_codex_target(target) else "opencode"
 
 
 def _task_execution_model_from_chat_model(model: Optional[str]) -> str:
@@ -739,7 +749,7 @@ def _task_execution_model_from_chat_model(model: Optional[str]) -> str:
 
 
 def _task_executor_label(executor: Optional[str]) -> str:
-    return "Hermes CLI" if _task_executor_from_target(executor) == "hermes" else "OpenCode CLI"
+    return "Codex Agent Harness" if _task_executor_from_target(executor) == "codex" else "OpenCode CLI"
 
 
 def _looks_like_codebot_schedule_creation_request(message: str) -> bool:
@@ -766,7 +776,7 @@ async def _classify_codebot_schedule_creation_request(message: str, model: Optio
     if not text:
         return False
     # Most chat turns are not scheduler requests. Fast local heuristics avoid a
-    # blocking pre-classification model call on every send and keep Hermes/OpenCode
+    # blocking pre-classification model call on every send and keep Codex/OpenCode
     # routing responsive.
     if not _looks_like_schedule_message(text) and not _looks_like_codebot_schedule_creation_request(text):
         return False
@@ -1784,221 +1794,130 @@ async def _sync_codebot_as_third_party():
     mcp_router.ensure_codebot_remote_mcp_in_opencode()
 
 
-def _prepare_hermes_proxy_request(
-    message: str,
-    knowledge_paths: Optional[List[str]] = None,
-    obsidian_enabled: bool = False,
-) -> Tuple[str, List[str], Optional[dict], bool]:
-    selected_skill = None
-    cleaned_message = message
-    hermes_skills: List[str] = []
+def _codex_selected_skills(message: str, obsidian_enabled: bool) -> List[Dict[str, str]]:
+    """把 Codebot 的 ``@Skill`` 标记转换为 Codex 原生 skill input。"""
+    selected: List[dict] = []
     try:
-        selected_skill, cleaned_message, _ = _extract_requested_skill(message)
-        if selected_skill:
-            skill_name = selected_skill.get("slug") or selected_skill.get("name") or ""
-            if skill_name:
-                hermes_skills.append(str(skill_name))
+        explicit, _, _ = _extract_requested_skill(message)
+        if explicit:
+            selected.append(explicit)
     except Exception as exc:
-        logger.debug(f"[Hermes] skill marker parse failed: {exc}")
+        logger.debug(f"[Codex] skill marker parse failed: {exc}")
+    if obsidian_enabled:
+        obsidian_skill = _find_skill_prefer_non_opencode("obsidian", allow_opencode_fallback=False)
+        if obsidian_skill and all(item.get("id") != obsidian_skill.get("id") for item in selected):
+            selected.append(obsidian_skill)
 
-    hermes_message = cleaned_message or message
-    if obsidian_enabled or knowledge_paths:
-        obsidian_context = _build_obsidian_context(hermes_message, knowledge_paths)
-        if obsidian_context:
-            hermes_message = (
-                f"{hermes_message}\n\n"
-                "[Codebot selected Hermes + Obsidian Markdown context]\n"
-                f"{obsidian_context}"
-            )
-        else:
-            hermes_message = (
-                f"{hermes_message}\n\n"
-                "[Codebot selected Hermes + Obsidian mode]\n"
-                "Obsidian mode is active, but Codebot could not resolve a configured vault or knowledge base. "
-                "Ask the user to configure Obsidian Settings if Markdown vault access is required."
-            )
-        if HERMES_OBSIDIAN_SKILL.lower() not in {name.lower() for name in hermes_skills}:
-            hermes_skills.append(HERMES_OBSIDIAN_SKILL)
-    # Hermes can execute its native skills and Codebot writable skills, but some
-    # OpenCode-shared skills still stall inside Hermes' own runtime. When the
-    # user explicitly points to an OpenCode-root skill, transparently delegate
-    # that turn back to the parent OpenCode execution chain instead of letting
-    # Hermes hang in a silent subprocess.
-    should_delegate_to_opencode = bool(selected_skill and selected_skill.get("source") == OPENCODE)
-    return hermes_message, hermes_skills, selected_skill, should_delegate_to_opencode
+    result: List[Dict[str, str]] = []
+    for skill in selected:
+        name = str(skill.get("slug") or skill.get("name") or "").strip()
+        path = str(skill.get("skill_md_path") or "").strip()
+        if name and path and Path(path).is_file():
+            result.append({"name": name, "path": path})
+    return result
 
 
-async def _execute_hermes_proxy(
-    message: str,
-    model: Optional[str] = None,
-    conversation_id: Optional[str] = None,
-    knowledge_paths: Optional[List[str]] = None,
-    obsidian_enabled: bool = False,
+async def _codex_history_context(
+    conversation_id: int,
+    current_user_message_id: Optional[int],
 ) -> str:
-    from api.routes import hermes as hermes_router
-
-    hermes_message, hermes_skills, _, should_delegate_to_opencode = _prepare_hermes_proxy_request(
-        message,
-        knowledge_paths,
-        obsidian_enabled=obsidian_enabled,
-    )
-
-    conv_id = str(conversation_id) if conversation_id is not None else ""
-    if conv_id:
-        mark_conversation_running(conv_id)
+    """为 thread 丢失、项目切换或撤销后的安全重建提供可审计历史。"""
     try:
-        if should_delegate_to_opencode:
-            return await _execute_opencode(
-                message,
-                model=model,
-                mode="agent",
-                conversation_id=conversation_id,
-                project_dir=None,
-                target="obsidian" if obsidian_enabled else "codebot",
-                knowledge_paths=knowledge_paths,
-            )
-        response = await hermes_router.hermes_chat(
-            hermes_router.HermesChatRequest(
-                message=hermes_message,
-                model=model,
-                conversation_id=conversation_id,
-                skills=hermes_skills,
-            )
-        )
-        return ((response.get("data") or {}).get("content") or "").strip()
-    finally:
-        if conv_id:
-            unmark_conversation_running(conv_id)
+        manager = _get_chat_memory_manager()
+        messages = await manager.get_messages(conversation_id=conversation_id, limit=80)
+    except Exception as exc:
+        logger.debug(f"读取 Codex 恢复历史失败（跳过）：{exc}")
+        return ""
+    lines: List[str] = []
+    for item in messages:
+        message_id = item.get("id")
+        if current_user_message_id and message_id and int(message_id) >= int(current_user_message_id):
+            continue
+        role = "用户" if item.get("role") == "user" else "助手"
+        content = str(item.get("content") or "").strip()
+        if content:
+            lines.append(f"{role}: {content}")
+    text = "\n\n".join(lines[-30:])
+    return text[-16000:]
 
 
-async def _stream_hermes_proxy_events(
+async def _stream_codex_proxy_events(
     message: str,
     model: Optional[str] = None,
+    effort: Optional[str] = None,
+    mode: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    user_message_id: Optional[int] = None,
+    project_dir: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
     obsidian_enabled: bool = False,
+    interactive: bool = True,
 ):
-    from api.routes import hermes as hermes_router
+    from core.codex_runtime import codex_runtime
 
-    hermes_message, hermes_skills, selected_skill, should_delegate_to_opencode = _prepare_hermes_proxy_request(
+    if not str(conversation_id or "").isdigit():
+        raise HTTPException(status_code=400, detail="Codex 执行需要有效 conversation_id")
+    numeric_conversation_id = int(str(conversation_id))
+    target = "codex_obsidian" if obsidian_enabled else "codex"
+    system_prompt, user_message = await _build_opencode_prompt_parts(
         message,
-        knowledge_paths,
-        obsidian_enabled=obsidian_enabled,
+        mode=mode,
+        project_dir=project_dir,
+        target=target,
+        knowledge_paths=knowledge_paths,
+        model=model,
     )
-    conv_id = str(conversation_id) if conversation_id is not None else ""
-    content = ""
-    if conv_id:
-        mark_conversation_running(conv_id)
+    skills = _codex_selected_skills(message, obsidian_enabled=obsidian_enabled)
+    history_context = await _codex_history_context(numeric_conversation_id, user_message_id)
+    conv_id = str(numeric_conversation_id)
+    # Codex + Obsidian 只把知识库内容作为上下文输入；绝不把 Vault 或前端选择的
+    # 项目目录当作 Codex 可写工作区，避免知识库被 coding harness 意外修改。
+    runtime_project_dir = None if obsidian_enabled else project_dir
+    mark_conversation_running(conv_id)
     try:
-        if should_delegate_to_opencode:
-            skill_name = str(
-                (selected_skill or {}).get("slug")
-                or (selected_skill or {}).get("name")
-                or "OpenCode 共享 skill"
-            )
-            yield {
-                "type": "meta_event",
-                "source": "hermes",
-                "event_type": "session.compat",
-                "summary": f"Hermes 检测到共享 skill `{skill_name}`，已切换到 OpenCode 原生执行",
-                "detail": (
-                    "该 skill 来自 OpenCode 共享目录。运行时证据表明这类 skill 在 Hermes 子进程中"
-                    "可能长时间静默卡住，因此 Codebot 会透明委托给 OpenCode CLI 执行，"
-                    "避免暗箱等待。"
-                ),
-                "data": {
-                    "source": "hermes",
-                    "delegate": "opencode",
-                    "skill_name": skill_name,
-                    "skill_source": (selected_skill or {}).get("source"),
-                },
-            }
-            async for delegated_event in _stream_execute_opencode_with_meta(
-                message,
-                model=model,
-                mode="agent",
-                conversation_id=conversation_id,
-                project_dir=None,
-                target="obsidian" if obsidian_enabled else "codebot",
-                knowledge_paths=knowledge_paths,
-            ):
-                yield delegated_event
-            return
-        async for hermes_event in hermes_router.run_hermes_oneshot_stream(
-            message=hermes_message,
-            model=model or "",
-            system=None,
-            conversation_id=conversation_id,
-            skills=hermes_skills,
+        yield {"type": "internal_prompt", "prompt": f"[developer]\n{system_prompt}\n\n[user]\n{user_message}"}
+        async for event in codex_runtime.run_turn_stream(
+            message=user_message,
+            conversation_id=numeric_conversation_id,
+            user_message_id=user_message_id,
+            project_dir=runtime_project_dir,
+            model=model,
+            effort=effort,
+            mode=mode,
+            developer_instructions=system_prompt,
+            history_context=history_context,
+            skills=skills,
+            interactive=interactive,
         ):
-            event_type = hermes_event.get("type")
-            if event_type == "stdout":
-                delta = hermes_event.get("delta") or ""
-                content = hermes_event.get("content") or f"{content}{delta}"
-                if delta:
-                    yield {
-                        "type": "content_delta",
-                        "delta": delta,
-                        "content": content,
-                        "source": "hermes",
-                        "cli_display": False,
-                    }
-                continue
-            if event_type == "interaction":
-                event = hermes_event.get("event") if isinstance(hermes_event.get("event"), dict) else {}
-                if event:
-                    yield event
-                continue
-            if event_type == "event":
-                event = hermes_event.get("event") if isinstance(hermes_event.get("event"), dict) else {}
-                if event:
-                    yield event
-                continue
-            if event_type == "done":
-                content = (hermes_event.get("output") or hermes_event.get("final") or content or "").strip()
-                returncode = hermes_event.get("returncode")
-                if returncode not in (0, None):
-                    detail = content or "Hermes CLI failed"
-                    raise HTTPException(status_code=502, detail=detail)
-                continue
-            if event_type == "aborted":
-                raise HTTPException(
-                    status_code=499,
-                    detail=hermes_event.get("output") or "Hermes CLI task was aborted",
-                )
-            if event_type == "error":
-                raise HTTPException(
-                    status_code=int(hermes_event.get("status_code") or 502),
-                    detail=hermes_event.get("message") or "Hermes CLI failed",
-                )
+            yield event
     finally:
-        if conv_id:
-            unmark_conversation_running(conv_id)
+        unmark_conversation_running(conv_id)
 
-    yield {
-        "type": "status",
-        "phase": "hermes_cli",
-        "source": "hermes",
-        "message": "Hermes Agent CLI completed",
-    }
-    yield {
-        "type": "done",
-        "content": _sanitize_assistant_output(content or "", user_message=message),
-        "parts": [],
-        "source": "hermes",
-        "agent": "Hermes Agent CLI",
-        "cli_display": False,
-    }
+
+async def _execute_codex_proxy(
+    message: str,
+    **kwargs: Any,
+) -> str:
+    """非流式兼容入口，通过同一事件链收集最终回复。"""
+    content = ""
+    async for event in _stream_codex_proxy_events(message, **kwargs):
+        if event.get("type") == "content_delta":
+            content = str(event.get("content") or content)
+        elif event.get("type") == "done":
+            content = str(event.get("content") or content)
+    return _sanitize_assistant_output(content, user_message=message)
 
 
 async def _execute_opencode(
     message: str,
     model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     mode: Optional[str] = None,
     conversation_id: Optional[str] = None,
     project_dir: Optional[str] = None,
     target: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
+    user_message_id: Optional[int] = None,
 ) -> str:
     schedule_result = await _handle_codebot_schedule_creation_request(
         message,
@@ -2009,11 +1928,15 @@ async def _execute_opencode(
     if schedule_result:
         return schedule_result
 
-    if _is_hermes_target(target):
-        content = await _execute_hermes_proxy(
+    if _is_codex_target(target):
+        content = await _execute_codex_proxy(
             message,
             model=model,
+            effort=reasoning_effort,
+            mode=mode,
             conversation_id=conversation_id,
+            user_message_id=user_message_id,
+            project_dir=project_dir,
             knowledge_paths=knowledge_paths,
             obsidian_enabled=_is_obsidian_target(target),
         )
@@ -2050,11 +1973,13 @@ async def _execute_opencode(
 async def _execute_opencode_with_meta(
     message: str,
     model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     mode: Optional[str] = None,
     conversation_id: Optional[str] = None,
     project_dir: Optional[str] = None,
     target: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
+    user_message_id: Optional[int] = None,
 ) -> Tuple[str, List[dict]]:
     schedule_result = await _handle_codebot_schedule_creation_request(
         message,
@@ -2065,11 +1990,15 @@ async def _execute_opencode_with_meta(
     if schedule_result:
         return schedule_result, []
 
-    if _is_hermes_target(target):
-        content = await _execute_hermes_proxy(
+    if _is_codex_target(target):
+        content = await _execute_codex_proxy(
             message,
             model=model,
+            effort=reasoning_effort,
+            mode=mode,
             conversation_id=conversation_id,
+            user_message_id=user_message_id,
+            project_dir=project_dir,
             knowledge_paths=knowledge_paths,
             obsidian_enabled=_is_obsidian_target(target),
         )
@@ -2115,11 +2044,13 @@ async def _execute_opencode_with_meta(
 async def _stream_execute_opencode_with_meta(
     message: str,
     model: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     mode: Optional[str] = None,
     conversation_id: Optional[str] = None,
     project_dir: Optional[str] = None,
     target: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
+    user_message_id: Optional[int] = None,
 ):
     schedule_intent = await _classify_codebot_schedule_creation_request(message, model=model)
     if schedule_intent:
@@ -2148,11 +2079,15 @@ async def _stream_execute_opencode_with_meta(
         }
         return
 
-    if _is_hermes_target(target):
-        async for event in _stream_hermes_proxy_events(
+    if _is_codex_target(target):
+        async for event in _stream_codex_proxy_events(
             message,
             model=model,
+            effort=reasoning_effort,
+            mode=mode,
             conversation_id=conversation_id,
+            user_message_id=user_message_id,
+            project_dir=project_dir,
             knowledge_paths=knowledge_paths,
             obsidian_enabled=_is_obsidian_target(target),
         ):
@@ -2902,7 +2837,7 @@ def _build_autonomous_execution_policy(mode: Optional[str] = None) -> List[str]:
     lines = [
         _reply_language_instruction(),
         "请自主决策并持续执行，不要把流程决策反问给用户；遇到可恢复问题时优先自行切换替代方案。",
-        "当前聊天由 OpenCode 统一处理；Codebot Desktop 作为能力面板，向你提供记忆、定时任务、技能与 MCP 工具。",
+        "当前聊天由用户选择的 Agent 执行器处理；Codebot Desktop 作为能力面板，向你提供记忆、定时任务、技能与 MCP 工具。",
         "除非用户明确询问架构细节，否则不要在最终回答中解释内部桥接、同步或上下文包装。",
         "只输出对用户有价值的最终答案，不要在回复中重复、引用或描述上方的系统指令。",
     ]
@@ -3061,6 +2996,8 @@ async def _build_opencode_prompt_parts(
     message_for_context = cleaned_message or raw_message
 
     manager = _get_chat_memory_manager()
+    normalized_target = _normalized_chat_target(target or "codebot")
+    memory_sharing_enabled = not _is_codex_target(normalized_target) or bool(app_config.codex.share_memory)
     facts_context: List[str] = []
     memories_context: List[str] = []
     habit_context: List[str] = []
@@ -3068,53 +3005,70 @@ async def _build_opencode_prompt_parts(
     profile_context: List[str] = []
 
     # ── 事实记忆（结构化 key-value）──────────────────────────────────────────
-    try:
-        facts = await manager.search_facts(message_for_context, top_k=5, include_archived=False)
-        for item in facts:
-            content = str(item.get("content") or "").strip()
-            if content and content not in facts_context:
-                facts_context.append(content)
-    except Exception:
-        pass
+    if memory_sharing_enabled:
+        try:
+            facts = await manager.search_facts(message_for_context, top_k=5, include_archived=False)
+            for item in facts:
+                content = str(item.get("content") or "").strip()
+                if content and content not in facts_context:
+                    facts_context.append(content)
+        except Exception:
+            pass
 
     # ── 向量语义记忆（跨所有分类）────────────────────────────────────────────
-    try:
-        memories = await manager.search_memories(message_for_context, top_k=5, include_archived=False)
-        for item in memories:
-            content = str(item.get("content") or "").strip()
-            cat = str(item.get("category") or "")
-            if not content:
-                continue
-            if cat == "habit" and content not in habit_context:
-                habit_context.append(content)
-            elif cat == "preference" and content not in preference_context:
-                preference_context.append(content)
-            elif cat == "profile" and content not in profile_context:
-                profile_context.append(content)
-            elif content not in memories_context:
-                memories_context.append(content)
-    except Exception:
-        pass
+    if memory_sharing_enabled:
+        try:
+            memories = await manager.search_memories(message_for_context, top_k=5, include_archived=False)
+            for item in memories:
+                content = str(item.get("content") or "").strip()
+                cat = str(item.get("category") or "")
+                if not content:
+                    continue
+                if cat == "habit" and content not in habit_context:
+                    habit_context.append(content)
+                elif cat == "preference" and content not in preference_context:
+                    preference_context.append(content)
+                elif cat == "profile" and content not in profile_context:
+                    profile_context.append(content)
+                elif content not in memories_context:
+                    memories_context.append(content)
+        except Exception:
+            pass
 
     # ── 专项分类检索（补充语义检索未命中的内容）──────────────────────────────
-    for cat, target_bucket in [
-        ("habit", habit_context),
-        ("preference", preference_context),
-        ("profile", profile_context),
-    ]:
-        if len(target_bucket) < 3:
-            try:
-                extra = await manager.search_memories(
-                    message_for_context, top_k=3, category=cat, include_archived=False
-                )
-                for item in extra:
-                    content = str(item.get("content") or "").strip()
-                    if content and content not in target_bucket:
-                        target_bucket.append(content)
-            except Exception:
-                pass
+    if memory_sharing_enabled:
+        for cat, target_bucket in [
+            ("habit", habit_context),
+            ("preference", preference_context),
+            ("profile", profile_context),
+        ]:
+            if len(target_bucket) < 3:
+                try:
+                    extra = await manager.search_memories(
+                        message_for_context, top_k=3, category=cat, include_archived=False
+                    )
+                    for item in extra:
+                        content = str(item.get("content") or "").strip()
+                        if content and content not in target_bucket:
+                            target_bucket.append(content)
+                except Exception:
+                    pass
 
     policy_lines: List[str] = _build_autonomous_execution_policy(mode=mode)
+    # Agent 模式此前只有“可按需使用哪些技能”的索引，没有针对复杂用户任务的
+    # 明确执行契约。现在用纯规则复杂度判断按需追加短契约，不额外调用模型，
+    # 因而不会改写用户原文、增加一次计费或让简单问答变慢。
+    try:
+        from core.prompt_optimizer import optimize_agent_prompt
+
+        optimization = optimize_agent_prompt(message_for_context, mode)
+        if optimization.applied:
+            policy_lines.append(optimization.developer_contract)
+            logger.debug(
+                f"[prompt-optimizer] Agent 提示词优化已启用：score={optimization.score}"
+            )
+    except Exception as exc:
+        logger.debug(f"[prompt-optimizer] 生成 Agent 执行契约失败（跳过）：{exc}")
     memory_lines: List[str] = []
     has_any = any([facts_context, habit_context, preference_context, profile_context, memories_context])
     if facts_context:
@@ -3139,7 +3093,8 @@ async def _build_opencode_prompt_parts(
             memory_lines.append(f"- {item}")
 
     # ── 构建 system prompt（仅含系统指令，不含用户消息）─────────────────────
-    system_lines: List[str] = ["你正在 OpenCode 中处理用户消息。"]
+    # 该提示由 OpenCode 与 Codex 两条执行链共用，不能把运行时名称写死为 OpenCode。
+    system_lines: List[str] = ["你正在 Codebot 中处理用户消息。"]
     system_lines.extend(policy_lines)
     if _looks_like_skill_creation_intent(raw_message):
         system_lines.append(
@@ -3151,22 +3106,21 @@ async def _build_opencode_prompt_parts(
         system_lines.append("以下是与当前问题相关的用户记忆，请在回答中参考；若与用户本轮消息冲突，以用户本轮消息为准。")
         system_lines.extend(memory_lines)
 
-    if selected_skill and selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, HERMES, OPENCLAW}:
+    if selected_skill and selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, CODEX, OPENCLAW}:
         system_lines.append(_build_skill_system_context(selected_skill))
 
-    normalized_target = _normalized_chat_target(target or "codebot")
     if _is_obsidian_target(normalized_target):
         # Obsidian target should actively bias the agent toward the Obsidian
         # skill/toolchain instead of only attaching note snippets as passive
         # context.
         # Obsidian target must not fall back to an OpenCode-managed vault-local
         # skill, because packaged Windows builds may not have
-        # "<vault>/.opencode/skills/agents" at all. Prefer only Codebot/Hermes-
+        # "<vault>/.opencode/skills/agents" at all. Prefer only Codebot/Codex-
         # local Obsidian skills here.
         obsidian_skill = _find_skill_prefer_non_opencode("obsidian", allow_opencode_fallback=False)
         if obsidian_skill and not selected_skill:
             selected_skill = obsidian_skill
-            if selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, HERMES, OPENCLAW}:
+            if selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, CODEX, OPENCLAW}:
                 system_lines.append(_build_skill_system_context(selected_skill))
         elif obsidian_skill and selected_skill and obsidian_skill.get("id") != selected_skill.get("id"):
             system_lines.append(_build_skill_system_context(obsidian_skill))
@@ -3799,9 +3753,11 @@ async def dispatch_multi_agent_task(hub_id: int, request: MultiAgentDispatchRequ
                 _execute_opencode(
                     delegated_message,
                     model=request.model,
+                    reasoning_effort=request.reasoning_effort,
                     mode=request.mode or "build",
                     conversation_id=str(member["id"]),
                     project_dir=member.get("project_dir") or request.project_dir,
+                    target=_normalized_chat_target(request.target or "codebot"),
                 )
                 for _, member, _, _, delegated_message in prepared_assignments
             ], return_exceptions=True)
@@ -4439,7 +4395,7 @@ def _serialize_skill_for_search(skill: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _balanced_skill_results(skills: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
-    source_order = [AUTO_GENERATED, BUILTIN, HERMES, OPENCODE, OPENCLAW, EXTERNAL]
+    source_order = [AUTO_GENERATED, BUILTIN, CODEX, OPENCODE, OPENCLAW, EXTERNAL]
     buckets: Dict[str, List[Dict[str, Any]]] = {source: [] for source in source_order}
     buckets.setdefault("other", [])
     for skill in skills:
@@ -5115,7 +5071,7 @@ async def _notify_opencode_action_required(conversation_id: int, event: dict):
         _opencode_action_notification_keys.add(key)
 
     source = str(event.get("source") or (event.get("data") or {}).get("source") or "").strip().lower()
-    actor = "Hermes" if source == "hermes" else "OpenCode"
+    actor = "Codex" if source == "codex" else "OpenCode"
     title = f"{actor} 等待你的选择"
     summary = str(event.get("summary") or f"有一个 {actor} 操作需要确认")
     message = f"{summary}\n\n对话ID: {conversation_id}\n请回到 Codebot 聊天窗口处理。"
@@ -5500,11 +5456,11 @@ async def send_to_opencode_stream(request: SendMessageRequest):
         try:
             conversations_db.connect()
             memory_manager = MemoryManager()
-            if request.project_dir and request.project_dir.strip():
-                recent = await memory_manager.get_messages(conversation_id=request.conversation_id, limit=1000)
-                user_messages = [item for item in recent if item.get("role") == "user"]
-                if user_messages:
-                    version_message_id = int(user_messages[-1]["id"])
+            recent = await memory_manager.get_messages(conversation_id=request.conversation_id, limit=1000)
+            user_messages = [item for item in recent if item.get("role") == "user"]
+            if user_messages:
+                version_message_id = int(user_messages[-1]["id"])
+                if request.project_dir and request.project_dir.strip():
                     version_manager = ProjectVersionManager(settings.DATA_DIR)
                     await asyncio.to_thread(
                         version_manager.snapshot, request.project_dir,
@@ -5518,15 +5474,17 @@ async def send_to_opencode_stream(request: SendMessageRequest):
             internal_prompt: str = ""
             tool_events_log: List[dict] = []
             session_error_message = ""
-            is_hermes_target = _is_hermes_target(request.target)
-            cli_display = _opencode_cli_display_enabled() and not is_hermes_target
+            is_codex_target = _is_codex_target(request.target)
+            cli_display = _opencode_cli_display_enabled() and not is_codex_target
             cli_seen: set[str] = set()
             cli_text_started = False
             async for stream_event in _stream_execute_opencode_with_meta(
                 full_message,
                 model=request.model,
+                reasoning_effort=request.reasoning_effort,
                 mode=request.mode,
                 conversation_id=conv_id,
+                user_message_id=version_message_id,
                 project_dir=request.project_dir,
                 target=request.target,
                 knowledge_paths=request.knowledge_paths,
@@ -5553,7 +5511,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                             "delta": delta,
                             "content": content,
                             "cli_display": True,
-                            "source": stream_event.get("source") or ("hermes" if is_hermes_target else None),
+                            "source": stream_event.get("source") or ("codex" if is_codex_target else None),
                         })
                         continue
                     next_content = _sanitize_assistant_output(raw_content, user_message=request.message)
@@ -5565,7 +5523,8 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                     await event_queue.put({
                         "type": "content_delta",
                         "delta": delta,
-                        "content": content
+                        "content": content,
+                        "source": stream_event.get("source") or ("codex" if is_codex_target else "opencode"),
                     })
                     continue
                 if event_type == "tool_event":
@@ -5665,7 +5624,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                                         })
                     continue
                 if event_type == "error":
-                    raise RuntimeError(stream_event.get("error") or "OpenCode 流式调用失败")
+                    raise RuntimeError(stream_event.get("error") or "Agent 流式调用失败")
 
             # OpenCode 有时先发 session.error，随后仍以空 done 结束。此前该路径会被
             # 误判为成功，客户端只能看到空白助手气泡。没有正文时应提升为真正的流错误。
@@ -5728,7 +5687,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                 "type": "done",
                 "content": content or "",
                 "cli_display": cli_display,
-                "source": "hermes" if is_hermes_target else "opencode",
+                "source": "codex" if is_codex_target else "opencode",
             }
             _runtime_append_event(conv_id, done_event)
             await event_queue.put(done_event)
@@ -5778,6 +5737,22 @@ async def reply_opencode_permission(request: PermissionReplyRequest):
     if reply not in {"once", "always", "reject"}:
         raise HTTPException(status_code=400, detail="无效的权限回复")
 
+    if request_id.startswith("codex-"):
+        from core.codex_runtime import codex_runtime
+
+        if not codex_runtime.reply_permission(request_id, reply):
+            raise HTTPException(status_code=404, detail="Codex 权限请求已过期或不存在")
+        if request.conversation_id:
+            _runtime_append_event(str(request.conversation_id), {
+                "type": "meta_event",
+                "source": "codex",
+                "event_type": "permission.local_reply",
+                "summary": f"你已选择：{reply}",
+                "detail": "",
+                "data": {"request_id": request_id, "reply": reply, "source": "codex"},
+            })
+        return {"success": True, "message": "已回复 Codex 权限请求"}
+
     client = opencode_ws or OpenCodeClient(app_config.opencode.server_url)
     ok = await _ensure_opencode_client_connected(client)
     if not ok:
@@ -5810,22 +5785,21 @@ async def reply_opencode_question(request: QuestionReplyRequest):
     if not request_id:
         raise HTTPException(status_code=400, detail="缺少 question 请求 ID")
 
-    if (request.source or "").strip().lower() == "hermes" or request_id.startswith("hermes-"):
-        from api.routes import hermes as hermes_router
+    if (request.source or "").strip().lower() == "codex" or request_id.startswith("codex-"):
+        from core.codex_runtime import codex_runtime
 
         answers = request.answers
         answer = (request.answer or "").strip()
         if not request.reject and answers is None and not answer:
             raise HTTPException(status_code=400, detail="缺少问题回答")
-        success = hermes_router.reply_hermes_interaction(
+        success = codex_runtime.reply_question(
             request_id=request_id,
             answers=answers,
             answer=answer,
             reject=request.reject,
-            response_dir=request.response_dir,
         )
         if not success:
-            raise HTTPException(status_code=502, detail="回复 Hermes 问题失败")
+            raise HTTPException(status_code=404, detail="Codex 问题已过期或不存在")
         if request.reject:
             reply_text = "已取消/先不回答"
         elif answer:
@@ -5838,10 +5812,10 @@ async def reply_opencode_question(request: QuestionReplyRequest):
                 "event_type": "question.local_reply",
                 "summary": f"你已回复：{reply_text}",
                 "detail": "",
-                "source": "hermes",
-                "data": {"request_id": request_id, "reply": reply_text, "rejected": request.reject, "source": "hermes"},
+                "source": "codex",
+                "data": {"request_id": request_id, "reply": reply_text, "rejected": request.reject, "source": "codex"},
             })
-        return {"success": True, "message": "已回复 Hermes 问题"}
+        return {"success": True, "message": "已回复 Codex 问题"}
 
     client = opencode_ws or OpenCodeClient(app_config.opencode.server_url)
     ok = await _ensure_opencode_client_connected(client)
@@ -5996,15 +5970,15 @@ async def abort_task(request: AbortRequest):
 
     # 终止当前正在运行的 OpenCode session
     aborted_sessions = 0
-    aborted_hermes = 0
+    aborted_codex = 0
     for target_id in target_conv_ids:
         try:
-            from api.routes import hermes as hermes_router
-            if await hermes_router.abort_hermes_conversation(target_id):
-                aborted_hermes += 1
-                logger.info(f"已终止对话 {target_id} 的 Hermes CLI 进程")
+            from core.codex_runtime import codex_runtime
+            if str(target_id).isdigit() and await codex_runtime.abort_conversation(int(target_id)):
+                aborted_codex += 1
+                logger.info(f"已终止对话 {target_id} 的 Codex turn")
         except Exception as e:
-            logger.warning(f"终止 Hermes CLI 出错: {e}")
+            logger.warning(f"终止 Codex turn 出错: {e}")
 
         session_id = _conversation_current_session.get(target_id)
         if not session_id or not client:
@@ -6028,7 +6002,7 @@ async def abort_task(request: AbortRequest):
     return {
         "success": True,
         "message": "已发送终止信号",
-        "data": {"conversations": target_conv_ids, "aborted_sessions": aborted_sessions, "aborted_hermes": aborted_hermes}
+        "data": {"conversations": target_conv_ids, "aborted_sessions": aborted_sessions, "aborted_codex": aborted_codex}
     }
 
 
@@ -6079,20 +6053,27 @@ async def undo_message(conversation_id: int, request: UndoMessageRequest):
 
         conversation = await memory_manager.get_conversation(conversation_id)
         project_dir = str((conversation or {}).get("project_dir") or "").strip()
+        target_message = messages[target_idx]
+        version_message_id = target_message.get("id") if target_message.get("role") == "user" else None
+        if not version_message_id:
+            for previous in reversed(messages[:target_idx]):
+                if previous.get("role") == "user":
+                    version_message_id = previous.get("id")
+                    break
         restored = False
-        if project_dir:
-            target_message = messages[target_idx]
-            version_message_id = target_message.get("id") if target_message.get("role") == "user" else None
-            if not version_message_id:
-                for previous in reversed(messages[:target_idx]):
-                    if previous.get("role") == "user":
-                        version_message_id = previous.get("id")
-                        break
-            if version_message_id:
-                manager = ProjectVersionManager(settings.DATA_DIR)
-                restored = bool(await asyncio.to_thread(
-                    manager.restore_before, project_dir, conversation_id, int(version_message_id)
-                ))
+        if project_dir and version_message_id:
+            manager = ProjectVersionManager(settings.DATA_DIR)
+            restored = bool(await asyncio.to_thread(
+                manager.restore_before, project_dir, conversation_id, int(version_message_id)
+            ))
+
+        codex_context_rolled_back = True
+        if version_message_id:
+            from core.codex_runtime import codex_runtime
+            codex_context_rolled_back = await codex_runtime.rollback_from_message(
+                conversation_id,
+                int(version_message_id),
+            )
 
         # 删除该消息及其之后的所有消息
         to_delete = messages[target_idx:]
@@ -6108,7 +6089,11 @@ async def undo_message(conversation_id: int, request: UndoMessageRequest):
 
         return {
             "success": True,
-            "data": {"deleted_count": deleted_count, "project_restored": restored},
+            "data": {
+                "deleted_count": deleted_count,
+                "project_restored": restored,
+                "codex_context_rolled_back": codex_context_rolled_back,
+            },
             "message": f"已撤销 {deleted_count} 条消息" + ("，项目文件已恢复" if restored else "")
         }
     except HTTPException:

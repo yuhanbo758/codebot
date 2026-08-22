@@ -151,6 +151,7 @@ jobs:
           if (Test-Path dist_build) { Remove-Item dist_build -Recurse -Force }
           New-Item -ItemType Directory -Path dist_build | Out-Null
           Copy-Item dist/codebot-backend dist_build/codebot-backend -Recurse
+          python ../scripts/verify_codex_bundle.py dist/codebot-backend
 
       - name: Install electron dependencies
         working-directory: electron
@@ -216,6 +217,7 @@ jobs:
           rm -rf dist_build
           mkdir -p dist_build
           cp -R dist/codebot-backend dist_build/codebot-backend
+          python ../scripts/verify_codex_bundle.py dist/codebot-backend
 
       - name: Install electron dependencies
         working-directory: electron
@@ -286,6 +288,7 @@ jobs:
           rm -rf dist_build
           mkdir -p dist_build
           cp -R dist/codebot-backend dist_build/codebot-backend
+          python ../scripts/verify_codex_bundle.py dist/codebot-backend
 
       - name: Install electron dependencies
         working-directory: electron

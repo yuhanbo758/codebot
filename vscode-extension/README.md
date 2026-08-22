@@ -5,8 +5,8 @@
 支持：
 
 - Editor / Build / Plan / Agent 模式；Editor 默认面向当前工作区做精确源码修改；
-- Codebot、Hermes、Obsidian、Hermes + Obsidian 目标；
-- Codebot 当前模型列表；
+- Codebot、Codex、Obsidian、Codex + Obsidian 目标；
+- 按目标读取 OpenCode 模型，或 Codex 原生模型与兼容的 OpenCode 模型；用户接入 OpenCode 的 Responses 模型直连，OpenAI-compatible Chat Completions 与 Anthropic Messages 模型通过 Codebot 可扩展协议中间层继续使用 Codex 工具/沙箱；
 - `/` 命令、`@` Skill 与 `#` 知识库快速插入；知识库不会常驻显示为复选框；
 - 当前 VS Code 工作区作为项目目录；
 - 在编辑器中选中代码并停止调整选区后，会就地出现“加入 Codebot 对话”；编辑器右键菜单也保留同一命令；
@@ -30,4 +30,4 @@
 
 ## 安全边界
 
-Webview 不能直接访问文件系统或启动进程；所有网络请求都由 VS Code 扩展宿主发往用户配置或本机 Codebot 地址。项目修改仍由 Codebot/OpenCode/Hermes 在用户当前工作区权限范围内完成。
+Webview 不能直接访问文件系统或启动进程；所有网络请求都由 VS Code 扩展宿主发往用户配置或本机 Codebot 地址。项目修改仍由 Codebot/OpenCode/Codex 在用户当前工作区和沙箱权限范围内完成。

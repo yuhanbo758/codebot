@@ -270,7 +270,23 @@ class CodebotChatViewProvider {
 
   conversationPreferences(id = this.conversationId) {
     const all = this.context.workspaceState.get('codebot.conversationPreferences', {});
-    return all[String(id || '')] || { mode: 'editor', target: 'codebot', model: '' };
+    const stored = all[String(id || '')] || { mode: 'editor', target: 'codebot', model: '', reasoningEffort: '' };
+    const target = this.normalizeTarget(stored.target);
+    if (target !== stored.target) {
+      all[String(id || '')] = { ...stored, target };
+      // workspaceState 写入无需阻塞当前界面初始化；下一次读取即使用已迁移值。
+      void this.context.workspaceState.update('codebot.conversationPreferences', all);
+    }
+    return { ...stored, target };
+  }
+
+  normalizeTarget(target) {
+    return ({
+      hermes: 'codex',
+      hermes_cli: 'codex',
+      hermes_agent: 'codex',
+      hermes_obsidian: 'codex_obsidian',
+    })[String(target || '').toLowerCase()] || target || 'codebot';
   }
 
   async saveConversationPreferences(preferences) {
@@ -278,8 +294,9 @@ class CodebotChatViewProvider {
     const all = this.context.workspaceState.get('codebot.conversationPreferences', {});
     all[String(this.conversationId)] = {
       mode: ['build', 'plan', 'agent', 'editor'].includes(preferences.mode) ? preferences.mode : 'editor',
-      target: preferences.target || 'codebot',
+      target: this.normalizeTarget(preferences.target),
       model: preferences.model || '',
+      reasoningEffort: preferences.reasoningEffort || '',
     };
     await this.context.workspaceState.update('codebot.conversationPreferences', all);
   }
@@ -288,8 +305,10 @@ class CodebotChatViewProvider {
     this.post({ type: 'status', text: '正在连接 Codebot…' });
     try {
       const baseUrl = await this.client.connect();
+      const preferences = this.conversationPreferences();
+      const modelEndpoint = String(preferences.target || '').startsWith('codex') ? '/api/codex/models' : '/api/chat/models';
       const [models, skills, knowledge, commands, conversations] = await Promise.all([
-        this.client.request('GET', '/api/chat/models'),
+        this.client.request('GET', modelEndpoint),
         this.client.request('GET', '/api/chat/skills/search?query=&limit=100'),
         this.client.request('GET', '/api/chat/knowledge/search?query=&limit=50'),
         this.client.request('GET', '/api/chat/commands'),
@@ -304,13 +323,13 @@ class CodebotChatViewProvider {
         type: 'ready',
         baseUrl,
         workspacePath: this.workspacePath(),
-        models: models?.data?.models || [],
+        models: Array.isArray(models?.data) ? models.data : models?.data?.models || [],
         skills: skills?.data?.skills || skills?.data?.items || [],
         knowledge: knowledge?.data?.items || [],
         commands: [...(commands?.data?.commands || []), ...(commands?.data?.skills || [])],
         conversations: items,
         conversationId: this.conversationId,
-        preferences: this.conversationPreferences(),
+        preferences,
       });
       for (const item of this.pendingContexts.splice(0)) this.post({ type: 'contextAdded', item });
       if (this.conversationId) {
@@ -338,7 +357,7 @@ class CodebotChatViewProvider {
     });
     this.conversationId = response?.data?.id;
     await this.context.workspaceState.update('codebot.conversationId', this.conversationId);
-    await this.saveConversationPreferences({ mode: 'editor', target: 'codebot', model: '' });
+    await this.saveConversationPreferences({ mode: 'editor', target: 'codebot', model: '', reasoningEffort: '' });
     await this.refreshConversations();
     this.post({ type: 'conversationSelected', id: this.conversationId, clear: true, preferences: this.conversationPreferences() });
     return this.conversationId;
@@ -352,7 +371,9 @@ class CodebotChatViewProvider {
     this.stopRuntimePolling();
     this.running = false;
     this.runtimeLastSeq = 0;
-    this.post({ type: 'conversationSelected', id: numericId, preferences: this.conversationPreferences(numericId) });
+    const preferences = this.conversationPreferences(numericId);
+    this.post({ type: 'conversationSelected', id: numericId, preferences });
+    await this.loadModelsForTarget(preferences.target);
     await this.ensureConversationWorkspace();
     await this.loadMessages();
     await this.syncRuntime();
@@ -452,6 +473,7 @@ class CodebotChatViewProvider {
       if (message.type === 'newConversation') return this.newConversation();
       if (message.type === 'selectConversation') return this.selectConversation(message.id);
       if (message.type === 'preferences') return this.saveConversationPreferences(message.preferences || {});
+      if (message.type === 'refreshModels') return this.loadModelsForTarget(message.target);
       if (message.type === 'openSettings') return vscode.commands.executeCommand('workbench.action.openSettings', 'codebot.backendUrl');
       if (message.type === 'addEditorSelection') return this.addEditorSelection();
       if (message.type === 'addTerminalSelection') return this.addTerminalSelection();
@@ -500,6 +522,18 @@ class CodebotChatViewProvider {
       endLine: selection.end.line + 1,
       content: document.getText(selection),
     });
+  }
+
+  async loadModelsForTarget(target) {
+    const normalized = this.normalizeTarget(target);
+    const endpoint = normalized.startsWith('codex') ? '/api/codex/models' : '/api/chat/models';
+    try {
+      const response = await this.client.request('GET', endpoint);
+      const models = Array.isArray(response?.data) ? response.data : response?.data?.models || [];
+      this.post({ type: 'models', models, target: normalized });
+    } catch (error) {
+      this.post({ type: 'models', models: [], target: normalized, error: error.message });
+    }
   }
 
   async addContext(item) {
@@ -637,6 +671,7 @@ class CodebotChatViewProvider {
         conversation_id: this.conversationId,
         message: modelMessage,
         model: payload.model || null,
+        reasoning_effort: String(payload.target || '').startsWith('codex') ? payload.reasoningEffort || null : null,
         mode: ['build', 'plan', 'agent', 'editor'].includes(payload.mode) ? payload.mode : 'editor',
         project_dir: this.workspacePath() || null,
         target: payload.target || 'codebot',
@@ -673,7 +708,7 @@ class CodebotChatViewProvider {
     <div id="contextChips" class="chips"></div>
     <div id="suggestions" class="suggestions hidden"></div>
     <textarea id="input" rows="3" placeholder="输入消息…  / 命令 · @ Skill · # 知识库（Enter 发送，Ctrl+Enter 换行）"></textarea>
-    <div class="composer-actions"><div class="settings-inline"><select id="mode" aria-label="模式"><option value="editor">Editor</option><option value="build">Build</option><option value="plan">Plan</option><option value="agent">Agent</option></select><select id="target" aria-label="执行目标"><option value="codebot">Codebot</option><option value="hermes">Hermes</option><option value="obsidian">Obsidian</option><option value="hermes_obsidian">Hermes + Obsidian</option></select><select id="model" aria-label="模型"><option value="">默认模型</option></select><button id="terminal" title="稳定 API 无法监听终端选区松开，请选中输出后点击此处">终端选区</button><button id="files" title="选择文件；也可拖到下方原生拖放区或使用资源管理器右键菜单">文件</button></div><button id="send" class="primary">发送</button></div>
+    <div class="composer-actions"><div class="settings-inline"><select id="mode" aria-label="模式"><option value="editor">Editor</option><option value="build">Build</option><option value="plan">Plan</option><option value="agent">Agent</option></select><select id="target" aria-label="执行目标"><option value="codebot">Codebot</option><option value="codex">Codex</option><option value="obsidian">Obsidian</option><option value="codex_obsidian">Codex + Obsidian</option></select><select id="model" aria-label="模型"><option value="">默认模型</option></select><select id="effort" aria-label="Codex 推理强度" class="hidden"><option value="">默认推理</option></select><button id="terminal" title="稳定 API 无法监听终端选区松开，请选中输出后点击此处">终端选区</button><button id="files" title="选择文件；也可拖到下方原生拖放区或使用资源管理器右键菜单">文件</button></div><button id="send" class="primary">发送</button></div>
   </section>
 </div><script nonce="${token}" src="${scriptUri}"></script></body></html>`;
   }

@@ -6,7 +6,7 @@ Codebot owns two writable skill classes:
   - builtin: seeded Codebot skills in settings.SKILLS_DIR/*
 
 External skill stores are read-only from Codebot:
-  - external: configured Hermes/OpenClaw/custom compatible directories
+  - external: configured OpenClaw/custom compatible directories
   - openclaw: default OpenClaw/StepClaw skill directories such as ~/.stepclaw/skills
   - opencode: OpenCode CLI skills in ~/.agents/skills
 """
@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover - PyYAML is part of the runtime deps
 AUTO_GENERATED = "auto_generated"
 BUILTIN = "builtin"
 EXTERNAL = "external"
-HERMES = "hermes"
+CODEX = "codex"
 OPENCLAW = "openclaw"
 OPENCODE = "opencode"
 
@@ -42,7 +42,7 @@ SOURCE_LABELS = {
     AUTO_GENERATED: "自动生成",
     BUILTIN: "内置",
     EXTERNAL: "外部兼容",
-    HERMES: "Hermes Agent",
+    CODEX: "Codex",
     OPENCLAW: "OpenClaw",
     OPENCODE: "OpenCode",
 }
@@ -51,7 +51,7 @@ SOURCE_PRIORITY = {
     AUTO_GENERATED: 10,
     BUILTIN: 20,
     EXTERNAL: 30,
-    HERMES: 32,
+    CODEX: 32,
     OPENCLAW: 35,
     OPENCODE: 40,
 }
@@ -303,88 +303,44 @@ def opencode_skill_dirs() -> List[Path]:
     return _distinct_existing_dirs(candidates)
 
 
-def hermes_manual_skill_dirs() -> List[Path]:
+def codex_manual_skill_dirs() -> List[Path]:
     candidates: List[Path] = []
-    hermes_cfg = getattr(app_config, "hermes", None)
-    if hermes_cfg:
-        for raw in getattr(hermes_cfg, "skill_dirs", []) or []:
+    codex_cfg = getattr(app_config, "codex", None)
+    if codex_cfg:
+        for raw in getattr(codex_cfg, "skill_dirs", []) or []:
             if str(raw or "").strip():
                 candidates.append(Path(str(raw).strip()))
     return _distinct_existing_dirs(candidates)
 
 
-def hermes_excluded_auto_skill_dirs() -> List[str]:
-    hermes_cfg = getattr(app_config, "hermes", None)
-    values = getattr(hermes_cfg, "excluded_auto_skill_dirs", []) if hermes_cfg else []
-    deduped: List[str] = []
-    seen: set[str] = set()
-    for raw in values or []:
-        value = str(raw or "").strip()
-        if not value:
-            continue
-        key = _normalized_dir_key(value)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(str(Path(value).expanduser()))
-    return deduped
-
-
-def hermes_repo_skill_dirs() -> List[Path]:
-    candidates: List[Path] = []
-    hermes_cfg = getattr(app_config, "hermes", None)
-    if hermes_cfg:
-        install_dir = str(getattr(hermes_cfg, "install_dir", "") or "").strip()
-        install_root = Path(install_dir).expanduser() if install_dir else settings.BASE_DIR / "hermes-agent"
-        candidates.extend([
-            install_root / "skills",
-            install_root / "optional-skills",
-        ])
+def codex_native_skill_dirs() -> List[Path]:
+    """发现 Codex/AgentSkills 的真实运行时目录，不再扫描 Hermes 仓库。"""
+    candidates: List[Path] = [
+        Path.home() / ".codex" / "skills",
+        Path.home() / ".agents" / "skills",
+    ]
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if codex_home:
+        candidates.insert(0, Path(codex_home) / "skills")
     return _distinct_existing_dirs(candidates)
 
 
-def hermes_native_skill_dirs(include_excluded: bool = False) -> List[Path]:
-    candidates: List[Path] = []
-    # Keep Hermes' runtime skill root enabled by default.
-    candidates.append(settings.DATA_DIR / "hermes" / "home" / "skills")
-
-    hermes_home_env = os.environ.get("HERMES_HOME", "").strip()
-    if hermes_home_env:
-        candidates.append(Path(hermes_home_env) / "skills")
-
-    # Also keep the repo-bundled official skill catalogs enabled by default.
-    # Users can still exclude any auto-shared root from Codebot settings.
-    candidates.extend(hermes_repo_skill_dirs())
-
-    resolved = _distinct_existing_dirs(candidates)
-    if include_excluded:
-        return resolved
-
-    excluded_keys = {_normalized_dir_key(item) for item in hermes_excluded_auto_skill_dirs()}
-    if not excluded_keys:
-        return resolved
-    return [path for path in resolved if _normalized_dir_key(path) not in excluded_keys]
+def codex_skill_dirs() -> List[Path]:
+    return _distinct_existing_dirs([*codex_manual_skill_dirs(), *codex_native_skill_dirs()])
 
 
-def hermes_skill_dirs() -> List[Path]:
-    return _distinct_existing_dirs([*hermes_manual_skill_dirs(), *hermes_native_skill_dirs()])
-
-
-def hermes_source_detail(dir_path: Path | str) -> str:
+def codex_source_detail(dir_path: Path | str) -> str:
     key = _normalized_dir_key(dir_path)
-    if key in {_normalized_dir_key(path) for path in hermes_native_skill_dirs(include_excluded=True)}:
+    if key in {_normalized_dir_key(path) for path in codex_native_skill_dirs()}:
         return "runtime"
-    if key in {_normalized_dir_key(path) for path in hermes_repo_skill_dirs()}:
-        return "repo"
-    if key in {_normalized_dir_key(path) for path in hermes_manual_skill_dirs()}:
+    if key in {_normalized_dir_key(path) for path in codex_manual_skill_dirs()}:
         return "manual"
     return ""
 
 
-def hermes_source_detail_label(detail: str) -> str:
+def codex_source_detail_label(detail: str) -> str:
     mapping = {
         "runtime": "运行时",
-        "repo": "官方仓库",
         "manual": "手动目录",
     }
     return mapping.get((detail or "").strip(), "")
@@ -446,7 +402,7 @@ version: {_quote_yaml(version)}
 source: auto_generated
 compatibility:
   - codebot
-  - hermes-agent
+  - codex
   - openclaw
 created_at: {_quote_yaml(created_at)}
 ---
@@ -553,7 +509,7 @@ class SkillRegistry:
         entries.extend(self._list_codebot_json_skills())
         entries.extend(self._list_codebot_dir_skills())
         entries.extend(self._list_external_skills())
-        entries.extend(self._list_hermes_skills())
+        entries.extend(self._list_codex_skills())
         entries.extend(self._list_openclaw_skills())
         entries.extend(self._list_opencode_skills())
         entries = self._dedupe(entries)
@@ -709,7 +665,7 @@ class SkillRegistry:
             source = AUTO_GENERATED if is_auto else BUILTIN
             compat = info.get("compatibility") or []
             if not compat:
-                compat = ["codebot", "hermes-agent", "openclaw"] if is_auto else ["codebot"]
+                compat = ["codebot", "codex", "openclaw"] if is_auto else ["codebot"]
             entries.append(
                 SkillEntry(
                     id=f"auto:{entry.name}" if is_auto else f"builtin:{entry.name}",
@@ -736,14 +692,14 @@ class SkillRegistry:
         return self._list_readonly_dir_skills(
             custom_dirs,
             source=EXTERNAL,
-            default_compatibility=["codebot", "hermes-agent", "openclaw"],
+            default_compatibility=["codebot", "codex", "openclaw"],
         )
 
-    def _list_hermes_skills(self) -> List[SkillEntry]:
+    def _list_codex_skills(self) -> List[SkillEntry]:
         return self._list_readonly_dir_skills(
-            hermes_skill_dirs(),
-            source=HERMES,
-            default_compatibility=["hermes-agent", "codebot"],
+            codex_skill_dirs(),
+            source=CODEX,
+            default_compatibility=["codex", "codebot"],
         )
 
     def _list_readonly_dir_skills(
@@ -773,13 +729,13 @@ class SkillRegistry:
                         source=source,
                         source_label=SOURCE_LABELS[source],
                         source_detail=(
-                            hermes_source_detail(dir_path)
-                            if source == HERMES
+                            codex_source_detail(dir_path)
+                            if source == CODEX
                             else ""
                         ),
                         source_detail_label=(
-                            hermes_source_detail_label(hermes_source_detail(dir_path))
-                            if source == HERMES
+                            codex_source_detail_label(codex_source_detail(dir_path))
+                            if source == CODEX
                             else ""
                         ),
                         priority=SOURCE_PRIORITY[source],
@@ -906,7 +862,7 @@ version: "1.0.0"
 source: auto_generated
 compatibility:
   - codebot
-  - hermes-agent
+  - codex
   - openclaw
 created_at: {_quote_yaml(now)}
 ---

@@ -141,21 +141,20 @@ class SkillsConfig(BaseModel):
     custom_skill_dirs: List[str] = []
 
 
-class HermesConfig(BaseModel):
-    """Hermes Agent integration config."""
+class CodexConfig(BaseModel):
+    """Codex Agent Harness 集成配置。
+
+    默认使用 ``openai-codex`` Python SDK 随包携带的固定版本运行时；只有
+    用户明确选择 ``custom`` 时才读取 ``codex_bin``，避免打包版依赖系统 PATH。
+    """
     enabled: bool = True
     auto_start: bool = True
-    repo_url: str = "https://github.com/NousResearch/hermes-agent"
-    install_dir: str = ""
-    cli_path: str = "hermes"
-    share_models: bool = True
+    runtime_source: Literal["bundled", "custom"] = "bundled"
+    codex_bin: str = ""
+    approval_policy: Literal["interactive", "auto_review", "deny_all"] = "interactive"
     share_memory: bool = True
     share_scheduler: bool = True
     skill_dirs: List[str] = []
-    excluded_auto_skill_dirs: List[str] = []
-    last_action: str = ""
-    last_status: str = ""
-    last_message: str = ""
 
 
 class ObsidianKnowledgeBase(BaseModel):
@@ -224,7 +223,7 @@ class AppConfig(BaseModel):
     security: SecurityConfig = SecurityConfig()
     integration: IntegrationConfig = IntegrationConfig()
     skills: SkillsConfig = SkillsConfig()
-    hermes: HermesConfig = HermesConfig()
+    codex: CodexConfig = CodexConfig()
     obsidian: ObsidianConfig = ObsidianConfig()
     sandbox: SandboxConfig = SandboxConfig()
 
@@ -293,6 +292,29 @@ def load_or_create_lan_api_token(*, rotate: bool = False) -> str:
     return token
 
 
+def migrate_legacy_agent_config(data: dict) -> tuple[dict, bool]:
+    """把旧 Hermes 配置幂等迁移成固定字段的 CodexConfig。"""
+    if not isinstance(data, dict):
+        return data, False
+    legacy_hermes = data.get("hermes")
+    legacy_present = isinstance(legacy_hermes, dict)
+    if legacy_present and "codex" not in data:
+        legacy_cli = str(legacy_hermes.get("cli_path") or "").strip()
+        use_custom_runtime = bool(legacy_cli and legacy_cli.lower() != "hermes")
+        data["codex"] = {
+            "enabled": bool(legacy_hermes.get("enabled", True)),
+            "auto_start": bool(legacy_hermes.get("auto_start", True)),
+            "runtime_source": "custom" if use_custom_runtime else "bundled",
+            "codex_bin": legacy_cli if use_custom_runtime else "",
+            "approval_policy": "interactive",
+            "share_memory": bool(legacy_hermes.get("share_memory", True)),
+            "share_scheduler": bool(legacy_hermes.get("share_scheduler", True)),
+            "skill_dirs": list(legacy_hermes.get("skill_dirs") or []),
+        }
+    data.pop("hermes", None)
+    return data, legacy_present
+
+
 def load_config() -> AppConfig:
     """加载配置文件"""
     config_path = settings.DATA_DIR / "config.json"
@@ -300,9 +322,12 @@ def load_config() -> AppConfig:
     if config_path.exists():
         with open(config_path, "r", encoding="utf-8") as f:
             data = json.load(f)
+            # Hermes -> Codex 一次性配置迁移。迁移在 Pydantic 校验前完成，
+            # 保存成功后旧 ``hermes`` 节点即被移除；重复启动不会再次迁移。
+            data, migrated_hermes = migrate_legacy_agent_config(data)
             config = AppConfig(**data)
             config.security.lan_api_token = load_or_create_lan_api_token()
-            needs_save = False
+            needs_save = bool(migrated_hermes)
             if int(getattr(config.network, "port", 0) or 0) == 8080:
                 config.network.port = 15682
                 needs_save = True

@@ -5,17 +5,18 @@ from pathlib import Path
 import json
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Literal, Optional, List
 
 from config import (
     app_config,
     save_config,
     SkillsConfig,
-    HermesConfig,
+    CodexConfig,
     ObsidianConfig,
     ObsidianKnowledgeBase,
     settings,
     AppConfig,
+    migrate_legacy_agent_config,
 )
 from utils.secrets import merge_masked_secrets, redact_secrets
 
@@ -30,17 +31,15 @@ class SkillsConfigUpdateRequest(BaseModel):
     custom_skill_dirs: Optional[List[str]] = None
 
 
-class HermesConfigUpdateRequest(BaseModel):
+class CodexConfigUpdateRequest(BaseModel):
     enabled: Optional[bool] = None
     auto_start: Optional[bool] = None
-    repo_url: Optional[str] = None
-    install_dir: Optional[str] = None
-    cli_path: Optional[str] = None
-    share_models: Optional[bool] = None
+    runtime_source: Optional[Literal["bundled", "custom"]] = None
+    codex_bin: Optional[str] = None
+    approval_policy: Optional[Literal["interactive", "auto_review", "deny_all"]] = None
     share_memory: Optional[bool] = None
     share_scheduler: Optional[bool] = None
     skill_dirs: Optional[List[str]] = None
-    excluded_auto_skill_dirs: Optional[List[str]] = None
 
 
 class ObsidianKnowledgeBaseRequest(BaseModel):
@@ -99,6 +98,7 @@ async def load_config_from_path(request: LoadConfigFromPathRequest):
 
         with open(source_path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        data, _ = migrate_legacy_agent_config(data)
         loaded = AppConfig(**data)
 
         for key in loaded.model_fields.keys():
@@ -191,32 +191,27 @@ def _validate_abs_dir_list(values: Optional[List[str]], label: str) -> List[str]
     return result
 
 
-@router.get("/hermes")
-async def get_hermes_config():
-    return {"success": True, "data": app_config.hermes.model_dump()}
+@router.get("/codex")
+async def get_codex_config():
+    return {"success": True, "data": app_config.codex.model_dump()}
 
 
-@router.patch("/hermes")
-async def update_hermes_config(request: HermesConfigUpdateRequest):
+@router.patch("/codex")
+async def update_codex_config(request: CodexConfigUpdateRequest):
     try:
         updates = request.model_dump(exclude_unset=True)
-        if "install_dir" in updates and updates["install_dir"]:
-            install_dir = Path(updates["install_dir"]).expanduser()
-            if not install_dir.is_absolute():
-                raise HTTPException(status_code=400, detail="Hermes 安装目录必须是绝对路径")
-            updates["install_dir"] = str(install_dir)
+        if "codex_bin" in updates and updates["codex_bin"]:
+            codex_bin = Path(updates["codex_bin"]).expanduser()
+            if not codex_bin.is_absolute():
+                raise HTTPException(status_code=400, detail="Codex 可执行文件必须使用绝对路径")
+            updates["codex_bin"] = str(codex_bin)
         if "skill_dirs" in updates:
-            updates["skill_dirs"] = _validate_abs_dir_list(updates.get("skill_dirs"), "Hermes skill 目录")
-        if "excluded_auto_skill_dirs" in updates:
-            updates["excluded_auto_skill_dirs"] = _validate_abs_dir_list(
-                updates.get("excluded_auto_skill_dirs"),
-                "Hermes 自动共享排除目录",
-            )
-        current = app_config.hermes.model_dump()
+            updates["skill_dirs"] = _validate_abs_dir_list(updates.get("skill_dirs"), "Codex skill 目录")
+        current = app_config.codex.model_dump()
         current.update(updates)
-        app_config.hermes = HermesConfig(**current)
+        app_config.codex = CodexConfig(**current)
         save_config(app_config)
-        return {"success": True, "data": app_config.hermes.model_dump(), "message": "Hermes 配置已保存"}
+        return {"success": True, "data": app_config.codex.model_dump(), "message": "Codex 配置已保存；运行时设置变更将在重启 Codex 后生效"}
     except HTTPException:
         raise
     except Exception as e:

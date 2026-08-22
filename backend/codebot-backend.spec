@@ -41,6 +41,15 @@ hiddenimports += collect_submodules('uvicorn')
 tmp_ret = collect_all('lark_oapi')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
+# 官方 Codex Python SDK 与平台随包 runtime。codex_cli_bin 中不仅有 Python
+# 元数据，还包含 codex、rg、命令执行器和 Windows 沙箱辅助程序，必须整体收集。
+for _pkg in ('openai_codex', 'codex_cli_bin'):
+    try:
+        tmp_ret = collect_all(_pkg)
+        datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+    except Exception as e:
+        print(f"Warning: collect_all('{_pkg}') failed: {e}")
+
 # hnswlib / winrt native extensions. Detect them from the active CI/dev
 # environment instead of hard-coding one local Conda path.
 try:

@@ -22,7 +22,6 @@
         >
           <el-option label="全部来源细分" value="" />
           <el-option label="运行时" value="runtime" />
-          <el-option label="官方仓库" value="repo" />
           <el-option label="手动目录" value="manual" />
         </el-select>
         <div class="header-actions">
@@ -56,7 +55,7 @@
           </el-button>
         </div>
       </div>
-      <div class="skills-subtitle">管理 Codebot 的技能。调用优先级为自动生成、内置、外部兼容目录、OpenClaw、OpenCode。Codebot 技能仅供 Codebot 使用，不再默认同步到 OpenCode CLI。</div>
+      <div class="skills-subtitle">管理 Codebot 的技能。调用优先级为自动生成、内置、外部兼容目录、Codex、OpenClaw、OpenCode。Codex 来源只读，并细分为运行时与手动目录。</div>
     </div>
 
     <!-- 可滚动表格区域 -->
@@ -79,7 +78,7 @@
                 {{ row.sourceLabel || row.source_label || sourceLabel(row) }}
               </el-tag>
               <el-tag
-                v-if="row.source === 'hermes' && (row.sourceDetailLabel || row.source_detail_label)"
+                v-if="row.source === 'codex' && (row.sourceDetailLabel || row.source_detail_label)"
                 size="small"
                 type="info"
                 effect="plain"
@@ -353,7 +352,7 @@ const filteredSkills = computed(() => {
     const matchesQuery = !q || (s.name || '').toLowerCase().includes(q) || (s.description || '').toLowerCase().includes(q)
     if (!matchesQuery) return false
     if (!detail) return true
-    return s.source === 'hermes' && (s.sourceDetail || s.source_detail || '') === detail
+    return s.source === 'codex' && (s.sourceDetail || s.source_detail || '') === detail
   })
 })
 
@@ -362,12 +361,14 @@ const sourceLabel = (row) => {
   if (row?.source === 'auto_generated') return '自动生成'
   if (row?.source === 'builtin') return '内置'
   if (row?.source === 'external') return '外部兼容'
+  if (row?.source === 'codex') return 'Codex'
   if (row?.source === 'openclaw') return 'OpenClaw'
   if (row?.source === 'opencode') return 'OpenCode'
   if (!id) return '自定义'
   if (id.startsWith('builtin:')) return '内置'
   if (id.startsWith('auto:')) return '自动生成'
   if (id.startsWith('opencode:')) return 'OpenCode'
+  if (id.startsWith('codex:')) return 'Codex'
   if (id.startsWith('openclaw:')) return 'OpenClaw'
   if (id.startsWith('custom:') || id.startsWith('external:')) return '外部兼容'
   return '自定义'
@@ -377,6 +378,7 @@ const sourceTagType = (source) => {
   if (source === 'builtin') return 'warning'
   if (source === 'auto' || source === 'auto_generated') return 'success'
   if (source === 'opencode') return 'info'
+  if (source === 'codex') return 'success'
   if (source === 'custom' || source === 'external' || source === 'openclaw') return ''
   return 'primary'
 }

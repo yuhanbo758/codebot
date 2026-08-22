@@ -1,7 +1,7 @@
 {
   "name": "codebot-chat",
   "displayName": "Codebot Chat",
-  "description": "在 VS Code 中复用 Codebot 的模型、Agent、Skill、Hermes 与 Obsidian 知识库能力。",
+  "description": "在 VS Code 中复用 Codebot 的模型、Agent、Skill、Codex 与 Obsidian 知识库能力。",
   "version": "1.4.0",
   "publisher": "codebot",
   "license": "MIT",

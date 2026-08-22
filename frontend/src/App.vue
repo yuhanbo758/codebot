@@ -183,9 +183,9 @@
             <el-input v-model="growthEditForm.task.cron_expression" placeholder="0 9 * * *" />
           </el-form-item>
           <el-form-item label="执行器">
-            <el-radio-group v-model="growthEditForm.task.executor">
+            <el-radio-group v-model="growthEditForm.task.executor" @change="loadGrowthModels(true)">
               <el-radio-button label="opencode">OpenCode</el-radio-button>
-              <el-radio-button label="hermes">Hermes</el-radio-button>
+              <el-radio-button label="codex">Codex</el-radio-button>
             </el-radio-group>
           </el-form-item>
           <el-form-item label="执行模型">
@@ -502,13 +502,20 @@ const refreshGrowthCandidateState = async () => {
   } catch {}
 }
 
-const loadGrowthModels = async () => {
-  if (growthAvailableModels.value.length > 0 || growthModelsLoading.value) return
+const loadGrowthModels = async (force = false) => {
+  if ((!force && growthAvailableModels.value.length > 0) || growthModelsLoading.value) return
+  if (force) growthAvailableModels.value = []
   growthModelsLoading.value = true
   try {
-    const resp = await axios.get('/api/chat/models')
+    const endpoint = growthEditForm.value.task.executor === 'codex' ? '/api/codex/models' : '/api/chat/models'
+    const resp = await axios.get(endpoint)
     if (resp.data?.success) {
-      growthAvailableModels.value = resp.data.data?.models || []
+      const raw = resp.data?.data
+      growthAvailableModels.value = (Array.isArray(raw) ? raw : raw?.models || []).map((item) => ({
+        ...item,
+        id: item.id || item.model || item.name || '',
+        name: item.displayName || item.display_name || item.name || item.id || item.model || '',
+      })).filter((item) => item.id)
     }
   } catch (err) {
     console.warn('加载成长候选模型列表失败:', err)
@@ -553,7 +560,7 @@ const editGrowth = (row) => {
     }
   }
   growthEditVisible.value = true
-  loadGrowthModels()
+  loadGrowthModels(true)
 }
 
 const saveGrowthEdit = async () => {

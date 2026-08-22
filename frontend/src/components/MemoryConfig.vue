@@ -39,7 +39,7 @@
       <el-divider content-position="left">自动整理</el-divider>
       <el-form-item label="每日自动整理">
         <el-switch v-model="config.organize_enabled" />
-        <span class="hint">开启后，会参考 Hermes 的持续学习闭环，定期对记忆、任务、技能沉淀进行整理和补漏</span>
+        <span class="hint">开启后，会定期对记忆、任务、技能沉淀进行整理和补漏</span>
       </el-form-item>
       <template v-if="config.organize_enabled">
         <el-form-item label="整理聊天记录">

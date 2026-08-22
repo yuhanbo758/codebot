@@ -31,7 +31,7 @@ from utils.background_tasks import create_background_task, cancel_background_tas
 from core.lan_auth import path_is_auth_exempt, request_is_authenticated
 
 # 导入 API 路由
-from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router, growth as growth_router, hermes as hermes_router, security as security_router
+from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router, growth as growth_router, codex as codex_router, security as security_router
 
 
 # 全局组件实例
@@ -312,21 +312,16 @@ async def lifespan(app: FastAPI):
 
     create_background_task(sync_to_opencode(), name="opencode-mcp-sync")
 
-    # Prepare Hermes CLI with Codebot so Hermes chat handoff is warm.
-    if app_config.hermes.enabled and app_config.hermes.auto_start:
-        async def prepare_hermes_cli():
+    # 预热官方 Codex App Server；失败不会阻止默认 OpenCode 执行链启动。
+    if app_config.codex.enabled and app_config.codex.auto_start:
+        async def prepare_codex_runtime():
             try:
-                await hermes_router.prepare_cli_if_enabled()
-                status = await hermes_router.hermes_status()
-                data = status.get("data", {})
-                app_urls = data.get("codebot_app") or {}
-                logger.info(f"Codebot local access: {app_urls.get('local_url', '')}")
-                logger.info(f"Codebot LAN access: {app_urls.get('lan_url', '')}")
-                logger.info(f"Hermes CLI runtime: {data.get('runtime_python', '')}")
+                await codex_router.prepare_if_enabled()
+                logger.info("Codex App Server 已预热")
             except Exception as exc:
-                logger.warning(f"Hermes CLI prepare failed: {exc}")
+                logger.warning(f"Codex App Server 预热失败，将在首次使用时重试：{exc}")
 
-        create_background_task(prepare_hermes_cli(), name="hermes-prepare")
+        create_background_task(prepare_codex_runtime(), name="codex-prepare")
 
     # 9. 启动记忆自动整理循环
     global _organize_loop_task
@@ -396,6 +391,12 @@ async def lifespan(app: FastAPI):
 
     if opencode_ws and opencode_ws.connected:
         await opencode_ws.disconnect()
+
+    try:
+        from core.codex_runtime import codex_runtime
+        await codex_runtime.close()
+    except Exception as exc:
+        logger.debug(f"关闭 Codex App Server 失败（跳过）：{exc}")
     
     if memory_manager:
         memory_manager.close()
@@ -517,7 +518,7 @@ app.include_router(lark.router, prefix="/api/lark", tags=["飞书"])
 app.include_router(sandbox_router.router, prefix="/api/sandbox", tags=["沙箱"])
 app.include_router(security_router.router, prefix="/api/security", tags=["安全与配对"])
 app.include_router(growth_router.router, prefix="/api/growth", tags=["成长沉淀"])
-app.include_router(hermes_router.router, prefix="/api/hermes", tags=["Hermes"])
+app.include_router(codex_router.router, prefix="/api/codex", tags=["Codex"])
 app.include_router(gateway_router.router, prefix="/v1", tags=["模型网关"])
 
 
