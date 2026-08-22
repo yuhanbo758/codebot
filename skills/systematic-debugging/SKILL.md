@@ -2,7 +2,7 @@
 name: systematic-debugging
 description: Use when encountering any bug, test failure, or unexpected behavior. 4-phase root cause investigation — NO fixes without understanding the problem first.
 version: 1.1.0
-author: Hermes Agent (adapted from obra/superpowers)
+author: Codebot adaptation (obra/superpowers)
 license: MIT
 ---
 

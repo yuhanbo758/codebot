@@ -5,7 +5,7 @@ description: Read, search, and create notes in the Obsidian vault.
 
 # Obsidian Vault
 
-**Location:** Set via `OBSIDIAN_VAULT_PATH` environment variable (e.g. in `~/.hermes/.env`).
+**Location:** Set via `OBSIDIAN_VAULT_PATH` environment variable or Codebot Obsidian settings.
 
 If unset, defaults to `~/Documents/Obsidian Vault`.
 

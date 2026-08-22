@@ -4,13 +4,14 @@
 
 > 成长候选说明：聊天识别到定时任务创建意图后，会先生成可编辑的成长候选，只有用户接受后才加入调度器。顶部按钮会显示待审数量并自动更新；记忆候选会过滤临时任务信息并合并重复或近义内容。
 
-基于 OpenCode 的第三方能力工作台 - 所有聊天统一由 OpenCode 处理，Codebot 负责提供 MCP / Skills / 记忆 / 定时任务能力并展示结果
+以 OpenCode 为默认主链、可选 Codex Agent Harness 的第三方能力工作台。Codebot 负责 MCP、Skills、记忆、定时任务、编排与统一界面。
 
 发布版本通过 GitHub Actions 在每次推送到 `main` 后自动递增并发布到 Releases。
 
 ## ✨ 特性
 
 - 🤖 **OpenCode 主控**: 所有聊天消息统一交给 OpenCode 处理，支持多模型切换与原生工具流式事件展示
+- 🧩 **Codex Agent Harness**: 可按对话切换到官方 `openai-codex` SDK/App Server，复用其线程、代码工具、沙箱、审批、Skills、MCP、模型与 ChatGPT 账号
 - 🔗 **Codebot 第三方化**: Codebot 自身以第三方 MCP 形式注册到 OpenCode，OpenCode 可直接调用 Codebot 的记忆、任务、技能与会话工具
 - 🧭 **自主执行策略**: 默认优先自主决策与自动重试，减少把流程决策抛给用户
 - 💾 **记忆系统**: SQLite + ChromaDB 持久化存储，支持上下文记忆和长期记忆
@@ -318,8 +319,8 @@ codebot/
 - 支持在聊天中创建定时任务（如"每天8点写一个故事并保存到D盘""每天8:10提醒我喝水"，可在定时任务中查看）
 - 支持在聊天中保存记忆（如"帮我记住 广东揭阳普宁船埔 这个地址""10月2日是姐姐的生日"，可在记忆中查看）
 - **意图分类**: 消息自动分类为"定时任务/保存记忆/普通对话"，避免误判
-- **运行模式**: 支持 `build`（直接执行）、`plan`（结构化规划）和 `agent`（自主拆解、执行与验证）。Agent 模式只按需加载 `self-improving`、`expert-agents`、`ai-company` 的能力索引，不再每轮注入多份完整人设或虚构子代理执行结果
-- **对话级状态**: 每个普通对话会独立保存当前模式、模型、Hermes/Obsidian 目标和已选知识库；在 B 对话切换模型或处理目标，不会覆盖 A 对话原来的选择。新建对话仍会沿用最近主动选择的全局默认模型，创建后再形成自己的独立状态
+- **运行模式**: 支持 `build`（直接执行）、`plan`（结构化规划）和 `agent`（自主拆解、执行与验证）。Agent 模式只按需加载 `self-improving`、`expert-agents`、`ai-company` 的能力索引；当任务同时包含检查、修改、验证、多项约束等复杂度信号时，才追加精简的目标/验收/证据/停止条件执行契约。简单问答不会额外改写提示词，也不会为“优化提示词”多调用一次模型
+- **对话级状态**: 每个普通对话会独立保存当前模式、模型、Codex/Obsidian 目标、Codex 推理强度和已选知识库；在 B 对话切换模型或处理目标，不会覆盖 A 对话原来的选择
 - 消息一键复制（Electron 使用系统剪贴板）
 - 支持文件附件上传；多模态模型支持图片分析
 - 支持截图后直接在聊天输入框粘贴图片，图片会自动作为附件加入当前消息
@@ -386,22 +387,24 @@ codebot/
 - `backend/core/tool_dispatcher.py` 已收敛为桥接辅助模块，仅负责技能发现与 MCP 协议适配，不再承担聊天主链路上的工具调度
 - 前端聊天页只展示 OpenCode 的流式步骤与最终结果，并提示当前第三方桥接状态
 
-### 1.2 Hermes / Obsidian / VS Code / 文档入口
+### 1.2 Codex / Obsidian / VS Code / 文档入口
 
-- **Hermes 模式**: 在聊天页点击 `Hermes` 后，当前消息默认会交给 Codebot 管理目录中的 Hermes Agent CLI 处理。设置页中的 `Hermes` 标签位于“通用设置”右侧，提供“一键安装 / 一键修复 / 一键更新”，默认把 Hermes 浅克隆到 Codebot 根目录下的 `hermes-agent/`；更新前若发现该目录存在未提交修改会安全停止，不覆盖本地改动。Codebot 只作为薄适配层：写入共享配置（模型网关、记忆库、定时任务库、技能目录和 Obsidian 路径），通过当前官方 `hermes chat -q` 单次查询入口启动 CLI 子进程，把终端输出持续追加到当前聊天气泡。配置文件版本会从已安装 Hermes 的源码动态读取，避免 Hermes 升级后继续写入过期版本号。Hermes 明确要求确认、密码或输入时，聊天页会显示交互面板；长时间无正文时会显示状态、轨迹和心跳，启动后 45 秒仍完全无 stdout 时自动重试一次。stdout 使用增量 UTF-8 解码，并过滤 ANSI、Rich 边框、会话辅助行、用户提示词回显与项目上下文截断警告；截断只作为 `session.warning` 事件展示，不污染最终正文。Hermes 的技能目录、模型网关、记忆、任务和 Obsidian 配置继续与 Codebot 共享；显式选择 skill 时只挂载能解析它的必要目录。Hermes 异常退出、空内容、空闲超时或连续 180 秒没有可显示输出时会返回明确错误。Hermes 模式创建的定时任务记录 `executor=hermes`，OpenCode 模式则记录 `executor=opencode`
-- **Obsidian 模式**: 设置页中的 `Obsidian` 标签支持配置默认 Vault 路径与多个知识库路径；聊天页通过 `#` 可多选知识库。Codebot 会把这些 Markdown 知识库当成原生 Obsidian wiki 结构直接处理，优先引导调用 `obsidian-cli` 与相关 Obsidian skill 去完成检索、模板调用、读取、写入、移动与 wiki-link 安全操作，不会把知识库先转成向量库。桌面正式版在 `Obsidian` 目标下只会选择 Codebot/Hermes 本地可用的 Obsidian skill，不再回退到 Vault 内部的 OpenCode skill 路径；发送给 OpenCode 的 session workspace 会固定到 Codebot 可写数据目录，而不是 Vault 目录。整库扫描 Markdown 时会跳过 `.opencode`、`.obsidian` 等工具目录并忽略坏目录，因此即使 `<vault>/.opencode/skills/agents` 不存在，也不应再因此导致发送失败
+- **Codex 模式**: 聊天页点击 `Codex` 后使用官方 `openai-codex==0.147.0` Python SDK 和随包 Codex runtime。设置页可切换 SDK 内置或本机自定义 binary、选择审批策略、管理额外 Skill 根目录，并查看 App Server、账号、订阅、用量、速率限制，以及 Codex 原生模型和兼容的 OpenCode 模型。ChatGPT 浏览器登录为默认方式，设备码为回退；API Key 只在用户主动选择时单次传给 App Server，不写入 Codebot 配置、不回传前端
+- **OpenCode 模型中间层**: Codex 官方自定义 provider 只接受 Responses 协议。Codebot 因此读取当前 OpenCode `/provider` 元数据并通过可扩展协议注册表分流：`@ai-sdk/openai` 以及同地址已证明支持 Responses 的模型由 Codex 直连；`@ai-sdk/openai-compatible`（包括用户添加的官方 `deepseek/deepseek-v4-flash`）由本机 Responses → Chat Completions 适配器转换；`@ai-sdk/anthropic` 由本机 Responses → Anthropic Messages 适配器转换。凡用户当前已接入 OpenCode 且属于这些协议的模型都会自动加入 Codex 模型列表，不区分 OpenCode 自带、官方 provider 或用户自定义 provider。中间层只做一次模型采样并翻译输入、工具调用和输出 item，不嵌套 OpenCode Agent 循环，所以线程、命令、文件工具、沙箱和审批仍全部由 Codex Harness 控制
+- **协议覆盖边界**: “模型兼容”不是修改模型名称，而是转换真实上游 wire protocol。设置页会展示各适配协议的模型数量和不兼容数量；OpenCode 全目录中的 Google/Vertex/Bedrock 等原生协议只有在 Codebot 注册并测试对应的请求、鉴权、工具调用和响应适配器后才会启用。未知协议不会猜成 Chat Completions，更不会静默改用 ChatGPT 账号；这可避免界面选中 A 模型、实际却由 B 模型回答
+- **模型身份与路由**: 每个 Codex turn 开始都会产生宿主控制的 `model.route` 事件，显示用户选择的模型、实际上游模型 ID、provider 和直连/桥接方式；同一权威路由也会作为 developer instruction 注入。模型被问“你是什么模型”时必须区分“Codex Agent Harness 执行器”和“本轮所选上游模型”，不能再因运行在 Codex 中就把 DeepSeek 等第三方模型误答成 OpenAI。该信息证明实际请求路由，不声称能从模型自述验证训练权重
+- **OpenCode 凭据安全与刷新**: 兼容 provider 复用本机已有的 OpenCode API 凭据。Responses 直连凭据通过唯一子进程环境变量传入；Chat/Anthropic 桥接时第三方密钥只留在 Codebot 后端内存，Codex 子进程只得到每次后端启动随机生成的本机桥令牌。任何凭据都不会写入 Codebot 配置、Codex 全局配置、模型 API 响应或前端。刷新模型列表时若检测到 OpenCode 新增/修改 provider 且没有活跃 turn，会自动重启 App Server 加载新路由；有任务运行时延后刷新，避免中断任务
+- **OpenCode 上游限制**: Codebot 会保留 Codex 的自动重试并在最终失败时展示上游原始原因。某些贡献者模型（例如 Muse Spark Contributor）可能要求用户先在 OpenCode 工作区显式同意数据贡献条款；Codebot 不会代表用户自动同意账号条款，也不会把这种 `403` 误报成模型协议不兼容
+- **线程与权限**: 同一对话和项目目录复用持久化 Codex thread；项目切换时新建 thread。`plan` 使用只读沙箱，`build/editor/agent` 使用工作区写沙箱。需要升级权限时在聊天中审批；停止会调用 Codex turn interrupt。撤销会先恢复 Codebot Git 快照，再回滚 Codex 隐藏上下文；回滚失败则丢弃 thread 映射并从仍保留的聊天记录安全重建
+- **Codex MCP 与 Skill**: Codex 通过带进程级 Bearer Token 的 `/api/mcp/codebot/mcp` Streamable HTTP MCP 调用 Codebot 记忆、任务、Skills 与第三方 MCP 代理，不修改用户全局 `~/.codex/config.toml`。显式 `@Skill` 会转换为 Codex Skill input；技能页的只读 `Codex` 来源按“运行时/手动目录”细分
+- **Obsidian 模式**: 设置页支持配置默认 Vault 与多个知识库，聊天页通过 `#` 多选。`codex_obsidian` 使用 Codebot 的可写工作区，只把检索结果和 Skill 作为上下文交给 Codex，不把 Vault 当作 Codex 工作目录。整库扫描会跳过 `.opencode`、`.obsidian` 等工具目录并忽略坏目录
 - **VS Code 按钮**: 输入框下方、`Obsidian` 右侧新增 `VS Code`。选择项目目录后点击，会通过 Electron 主进程验证绝对路径并使用本机 VS Code 打开该目录；浏览器版不会尝试直接启动本机程序
-- **VS Code 扩展**: `vscode-extension/` 提供独立的 Codebot Chat 侧栏并使用 Codebot 原生机器人图标。输入区固定在底部，消息区独立滚动；模式、目标和模型直接显示在输入框下方、“终端选区”左侧，知识库不再常驻显示为复选框。扩展支持历史对话续接、Editor / Build / Plan / Agent、模型、`/` 命令、`@` Skill、`#` 知识库、Codebot / Hermes / Obsidian / Hermes + Obsidian。编辑器选中代码并停止调整后会就地出现“加入 Codebot 对话”。由于 VS Code 会屏蔽资源管理器到 Webview 输入框的拖放事件，且修饰键不可由扩展自定义，Codebot 侧栏改为提供原生“拖放文件到对话”TreeView；从资源管理器直接拖到该区域无需按键，放下后会将文件加入聊天输入上下文。输入框下方“文件”按钮和资源管理器右键“Codebot: 将文件加入对话”继续作为可靠入口。终端因 VS Code 稳定 API 不提供选区变化事件，保留输入框下方“终端选区”和终端右键菜单作为可靠入口。Editor 模式默认基于当前工作区做精确、最小且可验证的源码修改；`Enter` 发送，`Ctrl+Enter` 换行。运行 `cd vscode-extension && npm ci && npm run package` 可生成 VSIX；GitHub Release 也会附带 VSIX。扩展默认依次探测开发端口 `18080` 和正式端口 `15682`，也可通过 `codebot.backendUrl` 指定地址。扩展会显示工具调用、会话状态、空闲用时和真实模型/API 错误；重新加载后从后端恢复运行态，阻止旧任务仍在执行时重复发送。消息支持逐条复制，顶部可复制整个对话；发送按钮在运行中切换为“停止”。用户消息支持撤销：删除该轮及之后的对话，并通过 Codebot 独立 Git 快照把关联工作区恢复到该轮修改前
-- **Hermes + Obsidian 双选**: 聊天页同时点亮 `Hermes` 和 `Obsidian` 时，前端会发送组合目标 `hermes_obsidian`，后端会同时走 Hermes CLI 执行链和 Obsidian Markdown 上下文构建链。此模式会固定加载 Hermes 原生 Obsidian skill `note-taking/obsidian`，并把 Hermes `skills.external_dirs` 收窄到能解析该 skill 的根目录，避免正式版因多个 Obsidian skill 同名或目录重复而静默卡住
-- **Hermes 错误处理**: Hermes CLI 异常退出、返回空内容、空闲超时，或连续 180 秒没有任何可显示输出时，聊天流会立即返回明确错误，包含退出码和最后输出片段；不会再只持续显示 `session.idle` 心跳让用户猜后台是否已经报错
-- **首响优化**: 聊天发送后，Codebot 只会在消息明显像“创建定时任务/提醒/闹钟”时才调用额外的意图分类；普通 Hermes / OpenCode / Obsidian 对话现在直接进入对应执行链，减少发送后前十几秒无响应的情况
-- **技能搜索**: 聊天输入框中的 `@` 会搜索全部技能来源，包括 Codebot 内置/自动生成、OpenCode、Hermes Agent 与 OpenClaw，支持描述、单词和多词搜索
-- **Hermes 来源细分**: 技能页中 `Hermes Agent` 来源现在会继续细分显示 `运行时`、`官方仓库`、`手动目录` 标签，并支持按这三类快速过滤，方便判断该 skill 是来自当前 `HERMES_HOME/skills`、Hermes 仓库自带目录，还是用户在设置页手动追加的目录
-- **技能调用修复**: 聊天页从 `@` 面板插入 skill 时，前端会写入 `使用技能 @[skill.id] 技能名` 标记；后端现在已兼容解析这类格式，并会在 Hermes 目标下正确恢复 `selected_skill -> skill slug -> --skills` 调用链，避免“已选 Hermes 但实际上没有把 skill 传给 CLI”导致长时间静默
-- **Hermes 共享修复**: 当用户在聊天里显式选中 Hermes skill 时，Codebot 现在会把 Hermes `skills.external_dirs` 从“全量共享根目录”收窄为“能解析所选 skill 的根目录集合”；未显式选中 skill 时，仍保持默认全量共享。这样可以避免 Hermes 在调用单个 skill 时继续扫描整包共享 roots，减少“CLI 已启动但长时间静默”的情况
+- **VS Code 扩展**: `vscode-extension/` 支持 Codebot / Codex / Obsidian / Codex + Obsidian，按目标读取 OpenCode 模型，或 Codex 原生模型与 OpenCode Responses/Chat/Anthropic 兼容模型，并在 Codex 目标下只显示模型明确支持的 reasoning effort。扩展继续支持历史续聊、停止、后台恢复、撤销、`/` 命令、`@` Skill、`#` 知识库、编辑器/终端选区和文件上下文
+- **首响优化**: 只有消息明显像“创建定时任务/提醒/闹钟”时才调用额外意图分类；普通 Codex / OpenCode / Obsidian 对话直接进入对应执行链
+- **技能搜索**: `@` 搜索 Codebot 内置/自动生成、OpenCode、Codex、OpenClaw 与外部兼容技能；显式选择后由当前运行时以原生 Skill 方式接收
 - **命令搜索**: 聊天输入框中的 `/` 会搜索 OpenCode CLI 命令，并支持按描述、单词和多词进行匹配
 - **文档入口**: 设置页里的“文档”会直接渲染本 README，文档右上角可刷新，适合在改动配置、功能或使用方式后重新查看
-- **使用顺序**: 建议先看“快速开始”和“访问”，再看这里的使用说明；真正上手时，优先用聊天页底部的 `项目`、`生成技能`、`Hermes`、`Obsidian`、`VS Code` 按钮切换处理目标
+- **使用顺序**: 建议先看“快速开始”和“访问”，再用聊天页底部的 `项目`、`生成技能`、`Codex`、`Obsidian`、`VS Code` 按钮切换处理目标
 
 ### 2. 记忆系统
 
@@ -435,11 +438,11 @@ codebot/
 - **通知渠道**: 飞书/邮箱/应用内通知
 - **候选通知**: 定时任务页顶部的“开启通知”控制任务候选提醒；开启后，聊天或自动整理把定时任务加入“成长候选”时会发送应用内/桌面操作提醒，便于及时打开“成长候选”确认、编辑或接受
 - **执行日志**: 详细的任务执行记录
-- **执行器归属**: 定时任务会持久化 `executor` 字段。聊天中选择 Hermes 后沉淀的任务、成长候选接受后的任务和手动编辑为 Hermes 的任务，到点执行时会调用 Hermes CLI；选择 OpenCode 或未指定时走 OpenCode
+- **执行器归属**: 定时任务持久化 `executor`。选择 Codex 后沉淀、接受或手动编辑的任务到点会调用 Codex Agent Harness；选择 OpenCode 或未指定时走现有 OpenCode 链
 - **执行模型**: 聊天中创建定时任务时，会把当时选择的主模型保存为任务的 `execution_model`；任务执行前会检查该模型是否仍在当前可用模型列表中，如果模型过时或供应商不再提供，会自动回退到“记忆 → 自动整理 → 整理使用模型”。在“定时任务”编辑窗口中可以为任务重新选择可用模型
-- **调度边界**: 聊天中的定时任务创建意图由 AI 结构化分类器判断；只有判断为“创建/添加/设置 Codebot 定时任务、提醒或闹钟”时，Codebot 才会写入内置定时任务系统或成长候选。普通排错、日志分析和文件处理会继续交给 OpenCode/Hermes CLI，不会被误创建为任务；Codebot 也不会让 CLI 立即创建 PowerShell 后台作业、Windows `schtasks`、cron/systemd/launchd 等系统级定时器
-- **提醒任务**: 带 `__REMINDER__` 标志的纯提醒任务不依赖 Hermes/OpenCode 也能按计划触发通知；AI 类任务（生成内容/写文件等）按任务执行器要求对应运行时可用
-- **像聊天一样执行**: 定时任务到达执行时间时，系统会按任务执行器像对应聊天入口一样处理任务内容，充分利用 AI 的代码生成与文件写入能力
+- **调度边界**: 只有判断为“创建/添加/设置 Codebot 定时任务、提醒或闹钟”时才写入调度器或成长候选。普通排错、日志分析和文件处理继续交给 OpenCode/Codex，不会误建系统级定时器
+- **Codex 非交互安全**: Codex 定时任务固定使用 `deny_all` 和工作区沙箱，不等待人工审批，也不能升级到沙箱外；带 `__REMINDER__` 的纯提醒不依赖任何 Agent 运行时
+- **像聊天一样执行**: 定时任务到达执行时间时，系统会按任务执行器像对应聊天入口一样处理任务内容，充分利用 AI 的代码生成与文件写入能力。非提醒类 AI 任务每次尝试会按需附加无人值守执行契约（计划时间、触发方式、重试序号、证据、停止条件），但不修改数据库中保存的原始任务正文；纯提醒仍不调用模型
 - **可靠执行**: 调度循环默认每 5 秒检查一次，到期任务先持久化认领再后台执行；慢任务不会阻塞其他任务。应用重启后会识别错过的计划时间，在宽限期内合并补跑一次，超期则明确记录“已跳过”，不再静默丢失
 - **超时与重试**: 每个任务可独立设置执行超时、失败重试次数与间隔；默认同一任务禁止重入，手动重复执行返回明确提示。通知失败与任务执行结果相互隔离
 - **运行可见性**: 定时任务页显示调度器是否运行、当前执行数量、上次结果、耗时和连续失败次数；日志额外记录计划时间、触发类型、尝试次数与耗时。AI 无法识别自然语言时间时会要求补充说明，不再擅自回退为“每天 09:00”
@@ -696,6 +699,17 @@ npm run build
 
 - `GET /api/config/file-info` - 获取当前生效配置文件路径
 - `POST /api/config/load-from-path` - 从指定 `config.json` 路径导入并应用配置
+- `GET /api/config/codex` - 获取 Codex Agent Harness 配置
+- `PATCH /api/config/codex` - 更新 Codex Agent Harness 配置
+
+### Codex Agent Harness API
+
+- `GET /api/codex/status` - 获取 App Server、SDK/runtime 和待处理请求状态
+- `POST /api/codex/restart` - 拒绝待处理审批并重启 App Server
+- `GET /api/codex/models` - 获取 Codex 原生模型、OpenCode Responses 直连/Chat/Anthropic 桥接模型及其 reasoning effort 能力；空闲时自动刷新新增 provider
+- `GET /api/codex/account` - 获取当前账号、订阅、用量和速率限制
+- `POST /api/codex/account/login` - 启动 ChatGPT 浏览器、设备码或用户主动选择的 API Key 登录
+- `POST /api/codex/account/logout` - 退出 Codex 账号
 
 ### 记忆 API
 
@@ -719,7 +733,7 @@ npm run build
 ### 定时任务 API
 
 - `GET /api/scheduler/tasks` - 获取任务列表
-- `POST /api/scheduler/tasks` - 创建任务，支持 `executor` 为 `opencode` 或 `hermes`，支持 `execution_model` 指定任务优先执行模型
+- `POST /api/scheduler/tasks` - 创建任务，支持 `executor` 为 `opencode` 或 `codex`，支持 `execution_model` 指定任务优先执行模型
 - `GET /api/scheduler/tasks/archived` - 获取已归档任务
 - `GET /api/scheduler/tasks/{task_id}` - 获取任务详情
 - `PUT /api/scheduler/tasks/{id}` - 更新任务
@@ -760,6 +774,7 @@ npm run build
 - `POST /api/mcp/codebot/register` - 注册 Codebot bridge
 - `GET /api/mcp/codebot/sse` - Codebot 自身 MCP SSE 入口
 - `POST /api/mcp/codebot/messages` - Codebot 自身 MCP 消息入口
+- `POST /api/mcp/codebot/mcp` - Codex 使用的 Bearer Token 鉴权 Streamable HTTP MCP 入口
 
 ### 通知 API
 

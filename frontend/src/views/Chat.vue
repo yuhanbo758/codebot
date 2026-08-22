@@ -164,7 +164,7 @@
             <template v-for="msg in messages" :key="msg.id">
               <!-- 工具步骤事件：独立气泡展示，不显示头像 -->
               <div v-if="msg.role === 'event'" class="message event-message">
-                <div class="tool-event-item" :class="classifyHermesEventClass(msg.event)">
+                <div class="tool-event-item" :class="classifyCodexEventClass(msg.event)">
                   <div class="tool-event-header" @click="toggleEventDetails(msg)">
                     <span class="tool-event-type">{{ toolEventLabel(msg.event) }}</span>
                     <span class="tool-event-summary">{{ toolEventSummary(msg.event) }}</span>
@@ -298,7 +298,7 @@
                   <el-avatar v-else :src="assistantAvatarUrl" />
                 </div>
                 <div class="message-content">
-                  <div v-if="msg.role === 'assistant' && msg.source === 'hermes'" class="message-source-badge">Hermes Agent CLI</div>
+                  <div v-if="msg.role === 'assistant' && msg.source === 'codex'" class="message-source-badge">Codex Agent Harness</div>
                   <div v-if="isCliDisplayMessage(msg)" class="cli-output">{{ msg.content }}</div>
                   <div v-else-if="msg.streaming" class="message-text streaming-text">{{ msg.content }}</div>
                   <div v-else class="message-text markdown-body" v-html="renderMarkdown(msg.content)"></div>
@@ -550,7 +550,7 @@
                       :disabled="m.runnable === false"
                     >
                       <span class="model-option-name">{{ m.model }}</span>
-                      <span class="model-option-provider">{{ m.runnable === false ? `${m.provider} · 未加载` : m.provider }}</span>
+                      <span class="model-option-provider">{{ modelProviderLabel(m) }}</span>
                     </el-option>
                   </template>
                   <template v-else>
@@ -567,7 +567,7 @@
                         :disabled="m.runnable === false"
                       >
                         <span class="model-option-name">{{ m.model }}</span>
-                        <span class="model-option-provider">{{ m.runnable === false ? `${m.provider} · 未加载` : m.provider }}</span>
+                        <span class="model-option-provider">{{ modelProviderLabel(m) }}</span>
                       </el-option>
                     </el-option-group>
                   </template>
@@ -582,6 +582,24 @@
                 >
                   <el-icon><Refresh /></el-icon>
                 </el-button>
+                <template v-if="codexEnabled">
+                  <el-divider direction="vertical" />
+                  <span class="toolbar-label">推理</span>
+                  <el-select
+                    v-model="selectedReasoningEffort"
+                    placeholder="Codex 默认"
+                    size="small"
+                    clearable
+                    class="agent-mode-select"
+                  >
+                    <el-option
+                      v-for="effort in supportedReasoningEfforts"
+                      :key="effort"
+                      :label="reasoningEffortLabel(effort)"
+                      :value="effort"
+                    />
+                  </el-select>
+                </template>
               </div>
             </div>
 
@@ -702,8 +720,8 @@
                   <el-icon><MagicStick /></el-icon>
                   生成技能
                 </el-button>
-                <el-button :type="hermesEnabled ? 'primary' : 'default'" @click="toggleHermesMode">
-                  Hermes
+                <el-button :type="codexEnabled ? 'primary' : 'default'" @click="toggleCodexMode">
+                  Codex
                 </el-button>
                 <el-button :type="obsidianEnabled ? 'primary' : 'default'" @click="toggleObsidianMode">
                   Obsidian
@@ -1430,7 +1448,31 @@ let _knowledgeSearchTimer = null
 
 const loadConversationTargetMap = () => {
   try {
-    return JSON.parse(localStorage.getItem(CONVERSATION_TARGETS_KEY) || '{}') || {}
+    const map = JSON.parse(localStorage.getItem(CONVERSATION_TARGETS_KEY) || '{}') || {}
+    let changed = false
+    for (const state of Object.values(map)) {
+      if (!state || typeof state !== 'object') continue
+      const legacyTarget = String(state.target || '').toLowerCase()
+      const migratedTarget = {
+        hermes: 'codex',
+        hermes_cli: 'codex',
+        hermes_agent: 'codex',
+        hermes_obsidian: 'codex_obsidian',
+      }[legacyTarget]
+      if (migratedTarget) {
+        state.target = migratedTarget
+        changed = true
+      }
+      if (Object.prototype.hasOwnProperty.call(state, 'hermes_enabled')) {
+        if (!Object.prototype.hasOwnProperty.call(state, 'codex_enabled')) {
+          state.codex_enabled = Boolean(state.hermes_enabled)
+        }
+        delete state.hermes_enabled
+        changed = true
+      }
+    }
+    if (changed) saveConversationTargetMap(map)
+    return map
   } catch {
     return {}
   }
@@ -1440,19 +1482,19 @@ const saveConversationTargetMap = (map) => {
   localStorage.setItem(CONVERSATION_TARGETS_KEY, JSON.stringify(map || {}))
 }
 
-const hermesEnabled = ref(false)
+const codexEnabled = ref(false)
 const obsidianEnabled = ref(false)
 
 const chatTarget = computed(() => {
-  if (hermesEnabled.value && obsidianEnabled.value) return 'hermes_obsidian'
-  if (hermesEnabled.value) return 'hermes'
+  if (codexEnabled.value && obsidianEnabled.value) return 'codex_obsidian'
+  if (codexEnabled.value) return 'codex'
   if (obsidianEnabled.value) return 'obsidian'
   return 'codebot'
 })
 
-const isHermesChatTarget = (target) => {
+const isCodexChatTarget = (target) => {
   const value = String(target || '').trim().toLowerCase()
-  return value === 'hermes' || value.startsWith('hermes_')
+  return value === 'codex' || value.startsWith('codex_')
 }
 
 const applyConversationTargetState = (conversationId) => {
@@ -1460,16 +1502,18 @@ const applyConversationTargetState = (conversationId) => {
   const target = state.target || 'codebot'
   applyingConversationUiState = true
   try {
-    hermesEnabled.value = Boolean(state.hermes_enabled ?? isHermesChatTarget(target))
+    codexEnabled.value = Boolean(state.codex_enabled ?? isCodexChatTarget(target))
     obsidianEnabled.value = Boolean(state.obsidian_enabled ?? (target === 'obsidian' || String(target || '').includes('obsidian') || (state.knowledge_bases || []).length > 0))
     selectedKnowledgeBases.value = Array.isArray(state.knowledge_bases) ? state.knowledge_bases : []
     agentMode.value = state.mode || localStorage.getItem(AGENT_MODE_KEY) || 'build'
     const model = normalizeModelId(state.model || localStorage.getItem(LAST_MODEL_KEY) || selectedModel.value || '')
     selectedModel.value = model
+    selectedReasoningEffort.value = state.reasoning_effort || ''
     ensureSelectedModelOption(model)
   } finally {
     nextTick(() => {
       applyingConversationUiState = false
+      loadModels()
     })
   }
 }
@@ -1479,11 +1523,12 @@ const saveCurrentConversationTargetState = () => {
   const map = loadConversationTargetMap()
   map[String(currentConversationId.value)] = {
     target: chatTarget.value || 'codebot',
-    hermes_enabled: hermesEnabled.value,
+    codex_enabled: codexEnabled.value,
     obsidian_enabled: obsidianEnabled.value,
     knowledge_bases: selectedKnowledgeBases.value || [],
     mode: agentMode.value || 'build',
-    model: selectedModel.value || ''
+    model: selectedModel.value || '',
+    reasoning_effort: selectedReasoningEffort.value || '',
   }
   saveConversationTargetMap(map)
 }
@@ -1491,11 +1536,12 @@ const saveCurrentConversationTargetState = () => {
 const resetCurrentConversationTargetState = () => {
   applyingConversationUiState = true
   try {
-    hermesEnabled.value = false
+    codexEnabled.value = false
     obsidianEnabled.value = false
     selectedKnowledgeBases.value = []
     agentMode.value = localStorage.getItem(AGENT_MODE_KEY) || 'build'
     selectedModel.value = normalizeModelId(localStorage.getItem(LAST_MODEL_KEY) || selectedModel.value || '')
+    selectedReasoningEffort.value = ''
     ensureSelectedModelOption(selectedModel.value)
   } finally {
     nextTick(() => {
@@ -1505,9 +1551,11 @@ const resetCurrentConversationTargetState = () => {
   }
 }
 
-const toggleHermesMode = () => {
-  hermesEnabled.value = !hermesEnabled.value
+const toggleCodexMode = async () => {
+  codexEnabled.value = !codexEnabled.value
+  selectedReasoningEffort.value = ''
   saveCurrentConversationTargetState()
+  await loadModels()
 }
 
 const toggleObsidianMode = () => {
@@ -1729,6 +1777,7 @@ const ensureSelectedModelOption = (modelId) => {
 const _savedModel = normalizeModelId(localStorage.getItem(LAST_MODEL_KEY) || '')
 if (_savedModel) localStorage.setItem(LAST_MODEL_KEY, _savedModel)
 const selectedModel = ref(_savedModel)
+const selectedReasoningEffort = ref('')
 // Pre-populate with the saved model so el-select can resolve its label before the API responds
 const availableModels = ref(
   _savedModel
@@ -1762,8 +1811,43 @@ watch(selectedModel, (val) => {
     localStorage.removeItem(LAST_MODEL_KEY)
   }
   saveCurrentConversationTargetState()
-  syncChatDefaultModel(val || '')
+  if (!codexEnabled.value) syncChatDefaultModel(val || '')
 })
+
+watch(selectedReasoningEffort, () => {
+  if (!applyingConversationUiState) saveCurrentConversationTargetState()
+})
+
+const supportedReasoningEfforts = computed(() => {
+  const selected = availableModels.value.find((item) => item.id === selectedModel.value)
+  const raw = selected?.supportedReasoningEfforts || selected?.supported_reasoning_efforts || []
+  const values = raw
+    .map((item) => typeof item === 'string' ? item : item?.effort || item?.value || item?.reasoningEffort)
+    .filter(Boolean)
+  if (values.length) return [...new Set(values)]
+  // OpenCode 兼容模型只能使用其 provider 明确声明的 reasoning effort；
+  // 没有声明时保留 Codex 默认值，避免向第三方模型发送不支持的参数。
+  if (selected?.source === 'opencode') return []
+  return ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+})
+
+const reasoningEffortLabel = (effort) => ({
+  none: '关闭', minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '超高', max: '最大', ultra: '自动委派'
+}[effort] || effort)
+
+const modelProviderLabel = (model) => {
+  if (model?.runnable === false) return `${model?.provider || '模型'} · Codex 不兼容`
+  if (model?.source === 'opencode') {
+    const protocol = String(model?.protocol || '')
+    const transport = protocol === 'chat-completions-bridge'
+      ? 'Chat 兼容桥'
+      : protocol === 'anthropic-bridge'
+        ? 'Anthropic 兼容桥'
+        : 'Responses'
+    return `${model?.provider || 'OpenCode'} · ${transport}`
+  }
+  return model?.provider || ''
+}
 
 // 按 provider 分组
 const groupedModels = computed(() => {
@@ -1956,7 +2040,7 @@ const notifyActionRequiredEvent = (event) => {
   const key = event.request_id || event?.data?.id || event?.data?.requestID || `${event.event_type}:${event.summary}`
   if (!key || actionRequiredEventSeen.value[key]) return
   actionRequiredEventSeen.value = { ...actionRequiredEventSeen.value, [key]: true }
-  const sourceLabel = eventSourceName(event) === 'hermes' ? 'Hermes' : 'OpenCode'
+  const sourceLabel = eventSourceName(event) === 'codex' ? 'Codex' : 'OpenCode'
   ElMessage({
     type: 'warning',
     message: event.summary || `${sourceLabel} 正在等待你的选择`,
@@ -1973,7 +2057,7 @@ const looksLikeCliOutput = (content = '') => {
 
 const isCliDisplayMessage = (msg) => {
   if (msg?.role !== 'assistant') return false
-  if (msg?.source === 'hermes') return false
+  if (msg?.source === 'codex') return false
   return Boolean(msg.cli_display || (opencodeCliDisplay.value && looksLikeCliOutput(msg.content)))
 }
 
@@ -1987,8 +2071,8 @@ const attachCliActionEvent = (assistantMsg, event) => {
 const shouldShowStructuredEvent = (event) => {
   if (!event) return false
   if (
-    eventSourceName(event) === 'hermes'
-    && ['session.status', 'session.idle', 'session.trace', 'session.retry'].includes(event?.event_type)
+    eventSourceName(event) === 'codex'
+    && ['session.status', 'session.idle', 'session.trace', 'session.retry', 'model.route'].includes(event?.event_type)
   ) {
     return true
   }
@@ -2066,7 +2150,7 @@ const eventActionKey = (event) => {
 const eventSourceName = (event) => String(event?.source || event?.data?.source || '').toLowerCase()
 
 const shouldUseChatEventPanel = (event) => (
-  eventSourceName(event) === 'hermes'
+  eventSourceName(event) === 'codex'
   && event?.requires_user_action
   && event?.event_type === 'question.asked'
 )
@@ -2166,7 +2250,7 @@ const ensureRuntimeAssistant = (conversationId) => {
 const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => {
   if (currentConversationId.value !== conversationId) return
   const seen = new Set(runtimeEventSeqSeen.value[conversationId] || [])
-  const runtimeHasHermes = (events || []).some((event) => eventSourceName(event) === 'hermes' || event?.source === 'hermes')
+  const runtimeHasCodex = (events || []).some((event) => eventSourceName(event) === 'codex' || event?.source === 'codex')
   let assistantMsg = null
   const newEventMsgs = []
   for (const event of (events || [])) {
@@ -2176,7 +2260,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
     if (event?.type === 'tool_event' || event?.type === 'meta_event') {
       resolvePendingActionEvents(conversationId, event)
       const eventSource = String(event?.source || event?.data?.source || '').toLowerCase()
-      const forceStructuredEvent = eventSource === 'hermes' && !event?.requires_user_action
+      const forceStructuredEvent = eventSource === 'codex' && !event?.requires_user_action
       if (shouldUseChatEventPanel(event)) {
         assistantMsg = assistantMsg || ensureRuntimeAssistant(conversationId)
         upsertStructuredEventMessage(conversationId, event, assistantMsg)
@@ -2255,8 +2339,8 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
     assistantMsg = assistantMsg || ensureRuntimeAssistant(conversationId)
   }
   if (assistantMsg) {
-    if (runtimeHasHermes) {
-      assistantMsg.source = 'hermes'
+    if (runtimeHasCodex) {
+      assistantMsg.source = 'codex'
       assistantMsg.cli_display = false
     }
     if (typeof runtimeContent === 'string' && runtimeContent) {
@@ -2382,11 +2466,14 @@ const loadModels = async (options = {}) => {
   const manual = Boolean(options?.manual)
   modelsLoading.value = true
   try {
-    const res = await axios.get('/api/chat/models')
+    const res = await axios.get(codexEnabled.value ? '/api/codex/models' : '/api/chat/models')
     if (manual && res.data?.success === false) {
       ElMessage.error(res.data?.message || '刷新模型列表失败')
     }
-    const raw = res.data?.data?.models || []
+    const rawData = res.data?.data
+    const raw = codexEnabled.value
+      ? (Array.isArray(rawData) ? rawData : rawData?.models || [])
+      : (rawData?.models || [])
     const newList = raw.map(m => {
       if (typeof m === 'string') return makeModelOption(m, { runnable: true, source: 'server' })
       const id = m.id || m.modelID || m.name || ''
@@ -2394,11 +2481,14 @@ const loadModels = async (options = {}) => {
       const model = m.model || id.split('/')[1] || id
       return {
         id,
-        name: m.name || id,
+        name: m.displayName || m.display_name || m.name || id,
         provider,
         model,
         source: m.source || '',
         runnable: m.runnable !== false,
+        protocol: m.protocol || '',
+        transport: m.transport || '',
+        supportedReasoningEfforts: m.supportedReasoningEfforts || m.supported_reasoning_efforts || [],
       }
     }).filter(m => m.id)
 
@@ -2408,7 +2498,15 @@ const loadModels = async (options = {}) => {
       selectedModel.value = saved
     }
     if (saved && !newList.find(m => m.id === saved)) {
-      newList.push(makeModelOption(saved, { runnable: false, source: 'saved' }))
+      if (codexEnabled.value && saved.includes('/')) {
+        // 当前运行时没有返回该旧 OpenCode 模型时清空选择，阻止它误落到
+        // ChatGPT 账号通道；支持桥接的 Chat/Anthropic 模型会正常出现在 newList。
+        selectedModel.value = ''
+        localStorage.removeItem(LAST_MODEL_KEY)
+        ElMessage.warning(`模型 ${saved} 不支持 Codex Responses，已切换为 Codex 默认模型；关闭 Codex 后仍可继续使用原模型。`)
+      } else {
+        newList.push(makeModelOption(saved, { runnable: false, source: 'saved' }))
+      }
     }
     availableModels.value = newList
     if (manual && res.data?.message) {
@@ -2547,6 +2645,7 @@ const toolEventLabel = (event) => {
     'session.trace': '运行轨迹',
     'session.retry': '自动重试',
     'session.error': '会话错误',
+    'model.route': '模型路由',
     'message.updated': '消息状态',
     'message.part.updated': '消息片段',
     'file.edited': '文件编辑',
@@ -2581,12 +2680,13 @@ const toolEventDetail = (event) => {
   return ''
 }
 
-const classifyHermesEventClass = (event) => {
-  if ((event?.source || event?.data?.source || '').toLowerCase() !== 'hermes') return ''
-  if (event?.event_type === 'session.idle') return 'hermes-idle'
-  if (event?.event_type === 'session.status') return 'hermes-status'
-  if (event?.event_type === 'session.trace') return 'hermes-trace'
-  if (event?.event_type === 'tool-call') return 'hermes-tool'
+const classifyCodexEventClass = (event) => {
+  if ((event?.source || event?.data?.source || '').toLowerCase() !== 'codex') return ''
+  if (event?.event_type === 'session.idle') return 'codex-idle'
+  if (event?.event_type === 'session.status') return 'codex-status'
+  if (event?.event_type === 'model.route') return 'codex-status'
+  if (event?.event_type?.includes('reasoning')) return 'codex-trace'
+  if (event?.event_type === 'item/started' || event?.event_type === 'item/completed') return 'codex-tool'
   return ''
 }
 
@@ -2866,7 +2966,7 @@ const permissionReplyLabel = (reply) => {
 const replyQuestion = async (event, actionOrReply) => {
   const action = typeof actionOrReply === 'string' ? { reply: actionOrReply } : (actionOrReply || {})
   const requestId = event?.request_id || event?.data?.id || event?.data?.requestID
-  const sourceLabel = (event?.source || event?.data?.source || '').toLowerCase() === 'hermes' ? 'Hermes' : 'OpenCode'
+  const sourceLabel = (event?.source || event?.data?.source || '').toLowerCase() === 'codex' ? 'Codex' : 'OpenCode'
   if (!requestId) {
     ElMessage.error(`缺少${sourceLabel}问题请求 ID`)
     return false
@@ -2913,10 +3013,10 @@ const replyQuestion = async (event, actionOrReply) => {
     event.summary = payload.reject ? '你已取消/先不回答' : `你已选择：${payload.answer || (payload.answers || []).map((group) => (group || []).join(', ')).join('；')}`
     event.actions = []
     clearQuestionPanelState(event)
-    ElMessage.success(payload.source === 'hermes' ? '已回复 Hermes' : '已回复 OpenCode')
+    ElMessage.success(payload.source === 'codex' ? '已回复 Codex' : '已回复 OpenCode')
     return true
   } catch (error) {
-    ElMessage.error(error?.response?.data?.detail || (payload.source === 'hermes' ? '回复 Hermes 问题失败' : '回复 OpenCode 问题失败'))
+    ElMessage.error(error?.response?.data?.detail || (payload.source === 'codex' ? '回复 Codex 问题失败' : '回复 OpenCode 问题失败'))
     return false
   } finally {
     event.replying = ''
@@ -2927,8 +3027,9 @@ const replyPermission = async (event, actionOrReply) => {
   const action = typeof actionOrReply === 'string' ? { reply: actionOrReply } : (actionOrReply || {})
   const reply = action.reply
   const requestId = event?.request_id || event?.data?.id || event?.data?.requestID || event?.data?.permissionID
+  const sourceLabel = eventSourceName(event) === 'codex' ? 'Codex' : 'OpenCode'
   if (!requestId) {
-    ElMessage.error('缺少 OpenCode 权限请求 ID')
+    ElMessage.error(`缺少 ${sourceLabel} 权限请求 ID`)
     return
   }
   event.replying = toolEventActionKey(action)
@@ -2944,9 +3045,9 @@ const replyPermission = async (event, actionOrReply) => {
     event.replied = reply
     event.summary = `你已选择：${permissionReplyLabel(reply)}`
     event.actions = []
-    ElMessage.success('已回复 OpenCode')
+    ElMessage.success(`已回复 ${sourceLabel}`)
   } catch (error) {
-    ElMessage.error(error?.response?.data?.detail || '回复 OpenCode 失败')
+    ElMessage.error(error?.response?.data?.detail || `回复 ${sourceLabel} 失败`)
   } finally {
     event.replying = ''
   }
@@ -3039,7 +3140,7 @@ const sendMessage = async () => {
   const content = inputMessage.value
   const filesToSend = [...attachedFiles.value]
   const targetToSend = chatTarget.value || 'codebot'
-  const isHermesTargetToSend = isHermesChatTarget(targetToSend)
+  const isCodexTargetToSend = isCodexChatTarget(targetToSend)
   const knowledgePathsToSend = obsidianEnabled.value
     ? selectedKnowledgeBases.value.map((item) => item.id || item.path).filter(Boolean)
     : []
@@ -3061,7 +3162,7 @@ const sendMessage = async () => {
       return
     }
     clearPendingQuestionEvent(pendingQuestionEvent)
-    ElMessage.warning(`上一个${(pendingQuestionEvent?.source || pendingQuestionEvent?.data?.source || '').toLowerCase() === 'hermes' ? 'Hermes' : 'OpenCode'}问题已失效，已按普通消息发送`)
+    ElMessage.warning(`上一个${(pendingQuestionEvent?.source || pendingQuestionEvent?.data?.source || '').toLowerCase() === 'codex' ? 'Codex' : 'OpenCode'}问题已失效，已按普通消息发送`)
   }
 
   inputMessage.value = ''
@@ -3103,8 +3204,10 @@ const sendMessage = async () => {
       const response = await axios.post(`/api/chat/multi-agent/${conversationId}/dispatch`, {
         message: content,
         model: selectedModel.value || null,
+        reasoning_effort: isCodexTargetToSend ? selectedReasoningEffort.value || null : null,
         mode: agentMode.value || 'agent',
         project_dir: currentProjectDir.value || null,
+        target: targetToSend,
       })
       assistantMessage.content = response.data?.data?.content || '多Agent任务已完成。'
       assistantMessage.streaming = false
@@ -3112,7 +3215,7 @@ const sendMessage = async () => {
       await loadMultiAgentMembers()
       await loadConversations()
     } catch (error) {
-      assistantMessage.content = '多Agent任务分配失败，请检查成员对话和 OpenCode 连接。'
+      assistantMessage.content = '多Agent任务分配失败，请检查成员对话和所选执行器连接。'
       assistantMessage.streaming = false
       ElMessage.error('多Agent任务分配失败')
     } finally {
@@ -3141,6 +3244,7 @@ const sendMessage = async () => {
         conversation_id: conversationId,
         message: content,
         model: selectedModel.value || null,
+        reasoning_effort: isCodexTargetToSend ? selectedReasoningEffort.value || null : null,
         mode: agentMode.value || null,
         attached_files: filesToSend.length > 0 ? filesToSend : null,
         project_dir: currentProjectDir.value || null,
@@ -3185,11 +3289,11 @@ const sendMessage = async () => {
     assistantMessage = {
       id: Date.now() + 1,
       role: 'assistant',
-      content: isHermesTargetToSend ? 'Hermes CLI 已启动，正在处理...' : '',
-      rawContent: isHermesTargetToSend ? 'Hermes CLI 已启动，正在处理...' : '',
+      content: isCodexTargetToSend ? 'Codex Agent Harness 已启动，正在处理...' : '',
+      rawContent: isCodexTargetToSend ? 'Codex Agent Harness 已启动，正在处理...' : '',
       tool_events: [],
-      cli_display: isHermesTargetToSend ? false : opencodeCliDisplay.value,
-      source: isHermesTargetToSend ? 'hermes' : '',
+      cli_display: isCodexTargetToSend ? false : opencodeCliDisplay.value,
+      source: isCodexTargetToSend ? 'codex' : '',
       pendingActionEvent: null,
       streaming: true,
       created_at: new Date().toISOString()
@@ -3226,6 +3330,7 @@ const sendMessage = async () => {
         conversation_id: conversationId,
         message: content,
         model: selectedModel.value || null,
+        reasoning_effort: isCodexTargetToSend ? selectedReasoningEffort.value || null : null,
         mode: agentMode.value || null,
         attached_files: filesToSend.length > 0 ? filesToSend : null,
         project_dir: currentProjectDir.value || null,
@@ -3253,7 +3358,7 @@ const sendMessage = async () => {
         if (event?.type === 'tool_event' || event?.type === 'meta_event') {
           resolvePendingActionEvents(conversationId, event)
           const eventSource = String(event?.source || event?.data?.source || '').toLowerCase()
-          const forceStructuredEvent = eventSource === 'hermes' && !event?.requires_user_action
+          const forceStructuredEvent = eventSource === 'codex' && !event?.requires_user_action
           if (shouldUseChatEventPanel(event)) {
             upsertStructuredEventMessage(conversationId, event, assistantMessage)
             scheduleStreamScroll()
@@ -4214,18 +4319,18 @@ onUnmounted(() => {
   padding: 3px 8px;
 }
 
-.tool-event-item.hermes-tool {
+.tool-event-item.codex-tool {
   background: #eef6ff;
   border-color: #c6e2ff;
 }
 
-.tool-event-item.hermes-trace {
+.tool-event-item.codex-trace {
   background: #f6f8fa;
   border-color: #e5e7eb;
 }
 
-.tool-event-item.hermes-status,
-.tool-event-item.hermes-idle {
+.tool-event-item.codex-status,
+.tool-event-item.codex-idle {
   background: #fff8e8;
   border-color: #f3d19e;
 }

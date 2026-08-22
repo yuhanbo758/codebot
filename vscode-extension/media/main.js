@@ -8,7 +8,7 @@ const state = {
 
 function post(type, extra) { vscode.postMessage(Object.assign({ type: type }, extra || {})); }
 function setStatus(text, error) { el('status').textContent = text || ''; el('status').className = error ? 'status error' : 'status'; }
-function option(select, value, label) { const item = document.createElement('option'); item.value = value; item.textContent = label; select.appendChild(item); }
+function option(select, value, label, disabled) { const item = document.createElement('option'); item.value = value; item.textContent = label; item.disabled = Boolean(disabled); select.appendChild(item); }
 function nearBottom() { return el('messages').scrollHeight - el('messages').scrollTop - el('messages').clientHeight < 80; }
 function scrollBottom(force) { if (force || nearBottom()) requestAnimationFrame(() => { el('messages').scrollTop = el('messages').scrollHeight; }); }
 
@@ -24,11 +24,56 @@ function applyPreferences(preferences) {
   const value = preferences || {};
   el('mode').value = value.mode || 'editor';
   el('target').value = value.target || 'codebot';
-  el('model').value = value.model || '';
+  const requestedModel = value.model || '';
+  // 旧版本可能持久化过只能走 Chat Completions 的 OpenCode 模型。
+  // Codex 目标的模型接口不会返回它们，因此这里必须清空而不是让一个不可见旧值继续随请求发送。
+  el('model').value = Array.from(el('model').options).some((item) => item.value === requestedModel) ? requestedModel : '';
+  el('effort').value = value.reasoningEffort || '';
+  renderEfforts();
 }
 
 function savePreferences() {
-  post('preferences', { preferences: { mode: el('mode').value, target: el('target').value, model: el('model').value } });
+  post('preferences', { preferences: { mode: el('mode').value, target: el('target').value, model: el('model').value, reasoningEffort: el('effort').value } });
+}
+
+function renderModels(models) {
+  state.models = models || [];
+  const selected = el('model').value;
+  const model = el('model'); model.innerHTML = ''; option(model, '', '默认模型');
+  for (const item of state.models) {
+    const id = typeof item === 'string' ? item : (item.id || item.model || item.name);
+    if (id) {
+      const baseLabel = typeof item === 'string' ? item : (item.displayName || item.display_name || item.name || id);
+      const sourceLabel = typeof item === 'object'
+        && item.source === 'opencode'
+        && !String(baseLabel).includes('OpenCode')
+        ? ' · OpenCode 兼容模型'
+        : '';
+      option(model, id, baseLabel + sourceLabel, typeof item === 'object' && item.runnable === false);
+    }
+  }
+  if (selected && Array.from(model.options).some((item) => item.value === selected)) model.value = selected;
+  renderEfforts();
+}
+
+function renderEfforts() {
+  const select = el('effort');
+  const codex = String(el('target').value || '').startsWith('codex');
+  select.classList.toggle('hidden', !codex);
+  const selectedEffort = select.value;
+  const selectedModel = state.models.find((item) => typeof item === 'object' && (item.id || item.model || item.name) === el('model').value);
+  const raw = selectedModel?.supportedReasoningEfforts || selectedModel?.supported_reasoning_efforts || [];
+  const efforts = raw.map((item) => typeof item === 'string' ? item : item?.effort || item?.value || item?.reasoningEffort).filter(Boolean);
+  // OpenCode 兼容模型只展示上游明确声明的档位；没有元数据时交给 Codex/provider 使用默认值。
+  // Codex 原生旧格式模型仍保留历史兜底列表，避免兼容旧版 App Server 返回结构。
+  const values = efforts.length
+    ? [...new Set(efforts)]
+    : selectedModel?.source === 'opencode'
+      ? []
+      : ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+  select.innerHTML = ''; option(select, '', '默认推理');
+  for (const effort of values) option(select, effort, ({ minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '超高', max: '最大', ultra: '自动委派' })[effort] || effort);
+  if (values.includes(selectedEffort)) select.value = selectedEffort;
 }
 
 function addMessage(role, text, contexts, messageId) {
@@ -76,7 +121,7 @@ function setRunning(running) {
   el('send').classList.toggle('stop', state.running);
   // 单个 Webview 只维护一个活动流；运行中锁定会话和执行参数，避免切换后把
   // 当前流的完成事件、历史刷新或 Git 撤销错误地应用到另一个对话。
-  for (const id of ['conversation', 'new', 'refresh', 'mode', 'target', 'model']) {
+  for (const id of ['conversation', 'new', 'refresh', 'mode', 'target', 'model', 'effort']) {
     el(id).disabled = state.running;
   }
 }
@@ -183,7 +228,7 @@ function chooseSuggestion(index) {
   if (entry.kind === 'knowledge') {
     const item = entry.item; const path = item.path || item.id;
     if (!state.knowledgePaths.some((entry) => entry.path === path)) state.knowledgePaths.push({ name: item.name || path, path: path });
-    el('target').value = el('target').value === 'hermes' ? 'hermes_obsidian' : 'obsidian'; savePreferences(); renderContexts(); replaceTrigger(''); return;
+    el('target').value = el('target').value === 'codex' ? 'codex_obsidian' : 'obsidian'; savePreferences(); post('refreshModels', { target: el('target').value }); renderContexts(); replaceTrigger(''); return;
   }
   const command = entry.item;
   if (command.type === 'skill' && command.skill_id) { replaceTrigger('使用技能 @[' + command.skill_id + '] ' + command.skill_name + ' '); return; }
@@ -205,7 +250,7 @@ function send() {
   const message = el('input').value.trim(); if (!message && !state.contexts.length) return;
   setRunning(true);
   post('send', { payload: {
-    message: message, mode: el('mode').value, target: el('target').value, model: el('model').value,
+    message: message, mode: el('mode').value, target: el('target').value, model: el('model').value, reasoningEffort: el('effort').value,
     contexts: state.contexts, knowledgePaths: state.knowledgePaths.map((item) => item.path),
   } });
   el('input').value = ''; hideSuggestions();
@@ -253,7 +298,10 @@ el('terminal').onclick = () => post('addTerminalSelection');
 el('files').onclick = () => post('attachFiles');
 el('send').onclick = send;
 el('conversation').onchange = () => { if (el('conversation').value) post('selectConversation', { id: el('conversation').value }); };
-el('mode').onchange = savePreferences; el('target').onchange = savePreferences; el('model').onchange = savePreferences;
+el('mode').onchange = savePreferences;
+el('target').onchange = () => { el('model').value = ''; el('effort').value = ''; savePreferences(); post('refreshModels', { target: el('target').value }); renderEfforts(); };
+el('model').onchange = () => { renderEfforts(); savePreferences(); };
+el('effort').onchange = savePreferences;
 el('input').oninput = updateSuggestions;
 el('input').onkeydown = (event) => {
   if (event.isComposing) return;
@@ -275,13 +323,16 @@ window.addEventListener('message', ({ data }) => {
     }
   }
   if (data.type === 'ready') {
-    state.models = data.models || []; state.skills = data.skills || []; state.knowledge = data.knowledge || []; state.commands = data.commands || [];
-    const model = el('model'); model.innerHTML = ''; option(model, '', '默认模型');
-    for (const item of state.models) { const id = typeof item === 'string' ? item : (item.id || item.name); if (id) option(model, id, typeof item === 'string' ? item : (item.name || id)); }
+    state.skills = data.skills || []; state.knowledge = data.knowledge || []; state.commands = data.commands || [];
+    renderModels(data.models || []);
     renderConversations(data.conversations, data.conversationId); applyPreferences(data.preferences);
     setRunning(false); setStatus('已连接 ' + data.baseUrl + (data.workspacePath ? ' · ' + data.workspacePath : ''));
   }
   if (data.type === 'conversations') renderConversations(data.items, data.conversationId);
+  if (data.type === 'models') {
+    renderModels(data.models || []);
+    if (data.error) setStatus('模型列表加载失败：' + data.error, true);
+  }
   if (data.type === 'conversationSelected') {
     el('conversation').value = String(data.id || ''); applyPreferences(data.preferences);
     state.contexts = []; state.knowledgePaths = []; state.assistant = null; state.progressRoot = null;

@@ -25,12 +25,14 @@ class _RetryOnceOpenCode:
 
     def __init__(self):
         self.calls = 0
+        self.system_prompts = []
 
     async def get_models(self):
         return []
 
-    async def execute_task(self, prompt, model=None):
+    async def execute_task(self, prompt, model=None, mode=None, system=None):
         self.calls += 1
+        self.system_prompts.append(system)
         if self.calls == 1:
             return SimpleNamespace(success=False, content="", error="临时失败", tokens_used=0)
         return SimpleNamespace(success=True, content=f"完成：{prompt}", error=None, tokens_used=12)
@@ -70,6 +72,8 @@ class SchedulerReliabilityTests(unittest.IsolatedAsyncioTestCase):
         finally:
             conn.close()
         self.assertEqual((status, attempts), ("success", 2))
+        self.assertTrue(all("定时任务执行契约" in value for value in client.system_prompts))
+        self.assertIn("第 2 次尝试", client.system_prompts[-1])
 
     async def test_misfire_is_recorded_instead_of_silently_discarded(self):
         scheduler = TaskScheduler(db_path=self.db_path)

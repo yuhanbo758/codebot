@@ -30,7 +30,31 @@ def _load() -> List[Dict[str, Any]]:
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        changed = False
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            payload = item.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            # 成长候选是 JSON 持久化而不是数据库；在每次加载时执行幂等迁移，
+            # 避免接受旧候选后又重新创建 Hermes 执行器任务。
+            for key in ("executor", "source", "target"):
+                raw = str(payload.get(key) or "").strip().lower()
+                replacement = {
+                    "hermes": "codex",
+                    "hermes_cli": "codex",
+                    "hermes_agent": "codex",
+                    "hermes_obsidian": "codex_obsidian",
+                }.get(raw)
+                if replacement:
+                    payload[key] = replacement
+                    changed = True
+        if changed:
+            _save(data)
+        return data
     except Exception:
         return []
 

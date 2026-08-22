@@ -4,8 +4,8 @@
       <el-tab-pane label="通用设置" name="general">
         <GeneralSettings />
       </el-tab-pane>
-      <el-tab-pane label="Hermes" name="hermes">
-        <HermesSettings />
+      <el-tab-pane label="Codex" name="codex">
+        <CodexSettings />
       </el-tab-pane>
       <el-tab-pane label="Obsidian" name="obsidian">
         <ObsidianSettings />
@@ -45,7 +45,7 @@
 import { ref } from 'vue'
 import { useRoute } from 'vue-router'
 import GeneralSettings from '@/components/GeneralSettings.vue'
-import HermesSettings from '@/components/HermesSettings.vue'
+import CodexSettings from '@/components/CodexSettings.vue'
 import ObsidianSettings from '@/components/ObsidianSettings.vue'
 import NotificationSettings from '@/components/NotificationSettings.vue'
 import LarkSettings from '@/components/LarkSettings.vue'
@@ -58,8 +58,10 @@ import SandboxSettings from '@/components/SandboxSettings.vue'
 import Docs from '@/views/Docs.vue'
 
 const route = useRoute()
-const tabNames = new Set(['general', 'hermes', 'obsidian', 'notification', 'lark', 'email', 'skills', 'backup', 'integration', 'security', 'sandbox', 'docs'])
-const initialTab = typeof route.query.tab === 'string' && tabNames.has(route.query.tab) ? route.query.tab : 'general'
+const tabNames = new Set(['general', 'codex', 'obsidian', 'notification', 'lark', 'email', 'skills', 'backup', 'integration', 'security', 'sandbox', 'docs'])
+// 兼容旧收藏链接，但页面本身不再保留 Hermes 标签或接口。
+const requestedTab = route.query.tab === 'hermes' ? 'codex' : route.query.tab
+const initialTab = typeof requestedTab === 'string' && tabNames.has(requestedTab) ? requestedTab : 'general'
 const activeTab = ref(initialTab)
 </script>
 

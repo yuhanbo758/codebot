@@ -29,7 +29,7 @@
       </el-table-column>
       <el-table-column label="执行器" width="100">
         <template #default="{ row }">
-          <el-tag size="small" :type="row.executor === 'hermes' ? 'success' : 'info'">
+          <el-tag size="small" :type="row.executor === 'codex' ? 'success' : 'info'">
             {{ executorLabel(row.executor) }}
           </el-tag>
         </template>
@@ -91,7 +91,7 @@
           <el-table-column prop="name" label="任务名称" width="200" />
           <el-table-column label="执行器" width="100">
             <template #default="{ row }">
-              <el-tag size="small" :type="row.executor === 'hermes' ? 'success' : 'info'">
+              <el-tag size="small" :type="row.executor === 'codex' ? 'success' : 'info'">
                 {{ executorLabel(row.executor) }}
               </el-tag>
             </template>
@@ -149,7 +149,7 @@
         <el-form-item label="执行器">
           <el-radio-group v-model="newTask.executor">
             <el-radio-button label="opencode">OpenCode</el-radio-button>
-            <el-radio-button label="hermes">Hermes</el-radio-button>
+            <el-radio-button label="codex">Codex</el-radio-button>
           </el-radio-group>
         </el-form-item>
         <el-form-item label="执行模型">
@@ -221,7 +221,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus } from '@element-plus/icons-vue'
 import axios from 'axios'
@@ -261,7 +261,7 @@ const CHANNEL_LABELS = {
 }
 
 const channelLabel = (ch) => CHANNEL_LABELS[ch] || ch
-const executorLabel = (executor) => executor === 'hermes' ? 'Hermes' : 'OpenCode'
+const executorLabel = (executor) => executor === 'codex' ? 'Codex' : 'OpenCode'
 const modelLabel = (modelId) => {
   const id = String(modelId || '').trim()
   if (!id) return '记忆整理备用模型'
@@ -284,9 +284,14 @@ const loadModels = async () => {
   if (availableModels.value.length > 0 || modelsLoading.value) return
   modelsLoading.value = true
   try {
-    const response = await axios.get('/api/chat/models')
+    const response = await axios.get(newTask.value.executor === 'codex' ? '/api/codex/models' : '/api/chat/models')
     if (response.data?.success) {
-      availableModels.value = response.data.data?.models || []
+      const raw = response.data?.data
+      availableModels.value = (Array.isArray(raw) ? raw : raw?.models || []).map((item) => ({
+        ...item,
+        id: item.id || item.model || item.name || '',
+        name: item.displayName || item.display_name || item.name || item.id || item.model || '',
+      })).filter((item) => item.id)
     }
   } catch {
     // 表格仍显示已保存的模型 ID，模型列表加载失败不阻断任务编辑
@@ -368,6 +373,11 @@ const openCreateDialog = () => {
   aiPrompt.value = ''
   showCreateDialog.value = true
 }
+
+watch(() => newTask.value.executor, () => {
+  availableModels.value = []
+  loadModels()
+})
 
 const generateWithAI = async () => {
   if (!aiPrompt.value) return

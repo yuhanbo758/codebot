@@ -75,6 +75,7 @@ security-report*.json
 
 # 本地 AI / 私有协作文档
 AGENTS.md
+!AGENTS.md
 .trae/
 
 # IDE

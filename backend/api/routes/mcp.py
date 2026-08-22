@@ -2,6 +2,7 @@
 MCP (Model Context Protocol) Server 管理 API
 """
 import asyncio
+import hmac
 import json
 import os
 import shutil
@@ -31,6 +32,24 @@ CODEBOT_REMOTE_MCP_KEY = "codebot"
 CODEBOT_REMOTE_SERVER_NAME = "Codebot Third-Party MCP"
 MCP_PROTOCOL_VERSION = "2024-11-05"
 _codebot_mcp_sessions: Dict[str, Dict[str, Any]] = {}
+
+
+def _streamable_mcp_authorized(request: Request) -> bool:
+    """Codex 专用入口只接受进程级 Bearer Token，不复用浏览器会话。"""
+    expected = str(app_config.security.lan_api_token or "")
+    authorization = str(request.headers.get("authorization") or "")
+    if not expected or not authorization.lower().startswith("bearer "):
+        return False
+    supplied = authorization.split(" ", 1)[1].strip()
+    return hmac.compare_digest(supplied, expected)
+
+
+def _streamable_mcp_unauthorized() -> JSONResponse:
+    return JSONResponse(
+        status_code=401,
+        content=_make_mcp_error_response(None, -32001, "Unauthorized"),
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 # ── 跨平台命令解析工具 ─────────────────────────────────────────────────────────
@@ -1317,7 +1336,7 @@ def _build_codebot_tool_definitions() -> List[dict]:
         },
         {
             "name": "codebot_create_task",
-            "description": "在 Codebot 中创建定时任务，可直接给 cron_expression，或用 schedule_description 让 Codebot 生成 cron。executor=hermes 时后续由 Hermes CLI 执行，否则由 OpenCode 执行。",
+            "description": "在 Codebot 中创建定时任务，可直接给 cron_expression，或用 schedule_description 让 Codebot 生成 cron。executor=codex 时后续由 Codex Agent Harness 执行，否则由 OpenCode 执行。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1331,8 +1350,8 @@ def _build_codebot_tool_definitions() -> List[dict]:
                     },
                     "executor": {
                         "type": "string",
-                        "enum": ["opencode", "hermes"],
-                        "description": "任务触发时使用的执行器。Hermes 会使用 Hermes CLI；OpenCode 使用 OpenCode。"
+                        "enum": ["opencode", "codex"],
+                        "description": "任务触发时使用的执行器。Codex 使用官方 Agent Harness；OpenCode 使用现有 OpenCode 链。"
                     },
                     "notify_channels": {
                         "type": "array",
@@ -1399,6 +1418,35 @@ def _build_codebot_tool_definitions() -> List[dict]:
     ]
 
 
+# Codex 使用独立的 Streamable HTTP 入口，因此可以在不影响 OpenCode 旧 SSE
+# 桥接的前提下，严格落实 Codex 配置中的记忆/调度共享开关。
+_CODEX_MEMORY_TOOL_NAMES = {
+    "codebot_list_conversations",
+    "codebot_get_conversation_messages",
+    "codebot_search_memories",
+    "codebot_save_memory",
+    "codebot_list_memories",
+}
+_CODEX_SCHEDULER_TOOL_NAMES = {
+    "codebot_create_task",
+    "codebot_list_tasks",
+    "codebot_delete_task",
+}
+
+
+def _codex_tool_allowed(tool_name: str) -> bool:
+    """根据 Codex 共享配置判断内置工具是否可被 Codex 看见和调用。"""
+    if tool_name in _CODEX_MEMORY_TOOL_NAMES:
+        return bool(app_config.codex.share_memory)
+    if tool_name in _CODEX_SCHEDULER_TOOL_NAMES:
+        return bool(app_config.codex.share_scheduler)
+    return True
+
+
+def _codex_visible_tool_definitions(tools: List[dict]) -> List[dict]:
+    return [tool for tool in tools if _codex_tool_allowed(str(tool.get("name") or ""))]
+
+
 def _make_mcp_success_response(request_id: Any, result: dict) -> dict:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
@@ -1407,7 +1455,7 @@ def _make_mcp_error_response(request_id: Any, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-async def _codebot_overview_payload() -> dict:
+async def _codebot_overview_payload(*, codex_client: bool = False) -> dict:
     manager = MemoryManager()
     try:
         memory_counts = await manager.get_storage_counts()
@@ -1419,7 +1467,7 @@ async def _codebot_overview_payload() -> dict:
     bridge_status = get_codebot_remote_mcp_status()
     scheduler = scheduler_router.scheduler
     tasks = scheduler.list_tasks() if scheduler else []
-    return {
+    payload = {
         "mode": "third_party",
         "mcp_server_name": CODEBOT_REMOTE_SERVER_NAME,
         "remote_sse_url": get_codebot_remote_sse_url(),
@@ -1430,12 +1478,21 @@ async def _codebot_overview_payload() -> dict:
         "task_count": len(tasks),
         "opencode_server_url": app_config.opencode.server_url,
     }
+    # 总览工具本身仍可用，但关闭共享后不能通过总览侧信道暴露对应摘要。
+    if codex_client and not app_config.codex.share_memory:
+        payload.pop("memory_counts", None)
+        payload.pop("recent_conversations", None)
+    if codex_client and not app_config.codex.share_scheduler:
+        payload.pop("task_count", None)
+    return payload
 
 
-async def _call_codebot_tool(name: str, arguments: dict) -> dict:
+async def _call_codebot_tool(name: str, arguments: dict, *, codex_client: bool = False) -> dict:
     args = arguments or {}
+    if codex_client and not _codex_tool_allowed(name):
+        raise PermissionError(f"Codex 配置未允许共享工具：{name}")
     if name == "codebot_get_runtime_overview":
-        payload = await _codebot_overview_payload()
+        payload = await _codebot_overview_payload(codex_client=codex_client)
         return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]}
 
     if name == "codebot_list_conversations":
@@ -1607,7 +1664,7 @@ def _read_skill_content_by_id(skill_id: str) -> Optional[str]:
     return None
 
 
-async def _handle_codebot_jsonrpc(payload: dict) -> Optional[dict]:
+async def _handle_codebot_jsonrpc(payload: dict, *, codex_client: bool = False) -> Optional[dict]:
     if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0":
         return _make_mcp_error_response(payload.get("id") if isinstance(payload, dict) else None, -32600, "Invalid Request")
     request_id = payload.get("id")
@@ -1632,7 +1689,10 @@ async def _handle_codebot_jsonrpc(payload: dict) -> Optional[dict]:
         return _make_mcp_success_response(request_id, {})
     if method == "tools/list":
         proxy_tools = await _list_external_proxy_tool_definitions()
-        return _make_mcp_success_response(request_id, {"tools": _build_codebot_tool_definitions() + proxy_tools})
+        builtin_tools = _build_codebot_tool_definitions()
+        if codex_client:
+            builtin_tools = _codex_visible_tool_definitions(builtin_tools)
+        return _make_mcp_success_response(request_id, {"tools": builtin_tools + proxy_tools})
     if method == "resources/list":
         return _make_mcp_success_response(request_id, {"resources": []})
     if method == "prompts/list":
@@ -1646,7 +1706,7 @@ async def _handle_codebot_jsonrpc(payload: dict) -> Optional[dict]:
             if _parse_proxy_tool_name(tool_name):
                 result = await _call_external_proxy_tool(tool_name, arguments)
             else:
-                result = await _call_codebot_tool(tool_name, arguments)
+                result = await _call_codebot_tool(tool_name, arguments, codex_client=codex_client)
             return _make_mcp_success_response(request_id, result)
         except Exception as exc:
             return _make_mcp_error_response(request_id, -32603, str(exc))
@@ -1753,6 +1813,59 @@ async def codebot_mcp_sse(request: Request):
             "Connection": "keep-alive",
         },
     )
+
+
+@router.post("/codebot/mcp")
+async def codebot_mcp_streamable_http(request: Request):
+    """供 Codex App Server 使用的无状态 Streamable HTTP MCP 入口。
+
+    Codebot 当前工具都不依赖传输层会话状态，因此普通 JSON-RPC 请求可以
+    直接返回 ``application/json``；通知按 MCP 规范返回 202。旧 SSE 端点继续
+    保留给 OpenCode，不改变现有第三方能力同步路径。
+    """
+    if not _streamable_mcp_authorized(request):
+        return _streamable_mcp_unauthorized()
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content=_make_mcp_error_response(None, -32700, "Parse error"),
+        )
+
+    if isinstance(payload, list):
+        responses = [await _handle_codebot_jsonrpc(item, codex_client=True) for item in payload]
+        visible = [item for item in responses if item is not None]
+        if not visible:
+            return Response(status_code=202)
+        return JSONResponse(
+            content=visible,
+            headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
+        )
+
+    response_payload = await _handle_codebot_jsonrpc(payload, codex_client=True)
+    if response_payload is None:
+        return Response(status_code=202)
+    return JSONResponse(
+        content=response_payload,
+        headers={"MCP-Protocol-Version": MCP_PROTOCOL_VERSION},
+    )
+
+
+@router.get("/codebot/mcp")
+async def codebot_mcp_streamable_http_get(request: Request):
+    """本实现是无状态 JSON 响应模式，不提供独立 SSE GET 流。"""
+    if not _streamable_mcp_authorized(request):
+        return _streamable_mcp_unauthorized()
+    return Response(status_code=405, headers={"Allow": "POST, DELETE"})
+
+
+@router.delete("/codebot/mcp")
+async def codebot_mcp_streamable_http_delete(request: Request):
+    """无状态传输没有服务器会话需要释放，幂等返回 204。"""
+    if not _streamable_mcp_authorized(request):
+        return _streamable_mcp_unauthorized()
+    return Response(status_code=204)
 
 
 @router.post("/codebot/messages")

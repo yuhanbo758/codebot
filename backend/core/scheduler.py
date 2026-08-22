@@ -2,6 +2,7 @@
 定时任务调度器
 """
 import asyncio
+import hashlib
 import sqlite3
 import json
 import threading
@@ -18,8 +19,11 @@ from config import settings, app_config
 
 def normalize_task_executor(value: Optional[str]) -> str:
     raw = (value or "").strip().lower()
+    if raw in {"codex", "codex_cli", "codex-agent", "codex_agent"}:
+        return "codex"
+    # 兼容一个发布版本：旧 Hermes 任务在读取和写回时立即规范为 Codex。
     if raw in {"hermes", "hermes_cli", "hermes-agent", "hermes_agent"}:
-        return "hermes"
+        return "codex"
     return "opencode"
 
 
@@ -226,6 +230,12 @@ class TaskScheduler:
             ON scheduled_tasks(archived)
         """)
 
+        # 数据库内旧执行器一次性迁移；重复执行 UPDATE 仍保持幂等。
+        cursor.execute(
+            """UPDATE scheduled_tasks SET executor = 'codex'
+               WHERE lower(COALESCE(executor, '')) IN
+               ('hermes', 'hermes_cli', 'hermes-agent', 'hermes_agent')"""
+        )
         conn.commit()
         conn.close()
         logger.info("定时任务数据库初始化完成")
@@ -400,7 +410,7 @@ class TaskScheduler:
         执行逻辑：
         - 带 __REMINDER__ 前缀的纯提醒任务：直接生成提醒内容，不调用 OpenCode
         - 其他所有任务（包括带 __RUN_ONCE__ 前缀的一次性任务）：
-          按任务自身的 executor 分别交给 Hermes CLI 或 OpenCode 处理，
+          按任务自身的 executor 分别交给 Codex Agent Harness 或 OpenCode 处理，
           task_prompt 中只包含纯任务内容
           （时间部分已在创建任务时从原始消息中剥离）
         """
@@ -446,11 +456,36 @@ class TaskScheduler:
             else:
                 execution_model, model_notice = await self._resolve_task_execution_model(task)
 
+            execution_instructions = ""
+            if not is_reminder:
+                # 定时任务无人值守，不能依赖聊天中的临时上下文。每次尝试都生成一份
+                # 包含计划时间、重试序号、证据和停止条件的短契约；不改写持久化 prompt。
+                from core.prompt_optimizer import build_scheduled_task_instructions
+
+                optimization = build_scheduled_task_instructions(
+                    raw_prompt,
+                    task_name=task.name,
+                    scheduled_for=scheduled_for,
+                    trigger_type=trigger_type,
+                    attempt=attempts,
+                    max_retries=task.max_retries,
+                )
+                execution_instructions = optimization.developer_contract
+                logger.debug(
+                    f"[prompt-optimizer] 定时任务执行契约已启用："
+                    f"task={task.name}, score={optimization.score}, attempt={attempts}"
+                )
+
             if result is not None:
                 pass
-            elif normalize_task_executor(getattr(task, "executor", "opencode")) == "hermes":
+            elif normalize_task_executor(getattr(task, "executor", "opencode")) == "codex":
                 result = await asyncio.wait_for(
-                    self._execute_hermes_task(task, raw_prompt, model=execution_model),
+                    self._execute_codex_task(
+                        task,
+                        raw_prompt,
+                        model=execution_model,
+                        developer_instructions=execution_instructions,
+                    ),
                     timeout=task.timeout_seconds,
                 )
             elif self.opencode_ws:
@@ -458,7 +493,12 @@ class TaskScheduler:
                 # raw_prompt 此时是纯任务内容（已去除时间前缀）
                 logger.info(f"通过 OpenCode 执行任务：{task.name}，model={execution_model or 'default'}，prompt：{raw_prompt[:100]}...")
                 result = await asyncio.wait_for(
-                    self.opencode_ws.execute_task(raw_prompt, model=execution_model or None),
+                    self.opencode_ws.execute_task(
+                        raw_prompt,
+                        model=execution_model or None,
+                        mode="agent",
+                        system=execution_instructions or None,
+                    ),
                     timeout=task.timeout_seconds,
                 )
             else:
@@ -561,7 +601,20 @@ class TaskScheduler:
                 return matches[0]
         return None
 
-    async def _available_model_ids(self) -> Optional[set[str]]:
+    async def _available_model_ids(self, executor: str = "opencode") -> Optional[set[str]]:
+        if normalize_task_executor(executor) == "codex":
+            try:
+                from core.codex_runtime import codex_runtime
+
+                models = await codex_runtime.models()
+            except Exception as exc:
+                logger.warning(f"检查 Codex 定时任务模型可用性失败：{exc}")
+                return None
+            return {
+                str(item.get("id") or item.get("model") or "").strip()
+                for item in models
+                if isinstance(item, dict) and str(item.get("id") or item.get("model") or "").strip()
+            }
         if not self.opencode_ws:
             return None
         try:
@@ -580,7 +633,7 @@ class TaskScheduler:
     async def _resolve_task_execution_model(self, task: ScheduledTask) -> tuple[Optional[str], str]:
         requested = normalize_task_execution_model(getattr(task, "execution_model", ""))
         fallback = self._fallback_execution_model()
-        available_ids = await self._available_model_ids()
+        available_ids = await self._available_model_ids(getattr(task, "executor", "opencode"))
 
         if available_ids is None:
             model = requested or fallback
@@ -607,19 +660,42 @@ class TaskScheduler:
             raise RuntimeError(f"定时任务执行模型不可用：{requested}；且未配置可用的记忆整理备用模型")
         return None, ""
 
-    async def _execute_hermes_task(self, task: ScheduledTask, raw_prompt: str, model: Optional[str] = None):
-        from api.routes import hermes as hermes_router
+    async def _execute_codex_task(
+        self,
+        task: ScheduledTask,
+        raw_prompt: str,
+        model: Optional[str] = None,
+        developer_instructions: str = "",
+    ):
+        """使用非交互、禁止提权的 Codex turn 执行定时任务。"""
+        from core.codex_runtime import codex_runtime
 
-        logger.info(f"通过 Hermes CLI 执行任务：{task.name}，model={model or 'default'}，prompt：{raw_prompt[:100]}...")
-        response = await hermes_router.hermes_chat(
-            hermes_router.HermesChatRequest(
-                message=raw_prompt,
-                model=model,
-                conversation_id=f"scheduled_task:{task.id}",
-            )
+        # 定时任务没有 Codebot 对话外键，使用稳定负整数隔离其持久化 thread，
+        # 既能续接同一任务，也不会与正常的正数 conversation_id 冲突。
+        task_digest = hashlib.sha256(str(task.id).encode("utf-8")).hexdigest()[:15]
+        runtime_conversation_id = -int(task_digest, 16) - 1
+        logger.info(
+            f"通过 Codex Agent Harness 执行任务：{task.name}，"
+            f"model={model or 'default'}，prompt：{raw_prompt[:100]}..."
         )
-        data = response.get("data") if isinstance(response, dict) else {}
-        content = str((data or {}).get("content") or "").strip()
+        content = ""
+        async for event in codex_runtime.run_turn_stream(
+            message=raw_prompt,
+            conversation_id=runtime_conversation_id,
+            model=model,
+            mode="agent",
+            developer_instructions=(
+                f"{developer_instructions.strip()}\n\n"
+                "该任务必须全程非交互运行；不得请求人工审批，"
+                "不得尝试越过 Codex 沙箱。"
+            ),
+            interactive=False,
+        ):
+            if event.get("type") in {"content_delta", "done"}:
+                content = str(event.get("content") or content)
+        content = content.strip()
+        if not content:
+            raise RuntimeError("Codex 定时任务已结束，但没有返回可显示内容")
         return SimpleNamespace(success=True, content=content, error=None, tokens_used=0)
 
     def _try_save_markdown_output(self, task_prompt: str, content: str) -> Optional[str]:

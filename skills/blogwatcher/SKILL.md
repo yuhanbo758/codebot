@@ -5,7 +5,7 @@ version: 2.0.0
 author: JulienTant (fork of Hyaxia/blogwatcher)
 license: MIT
 metadata:
-  hermes:
+  codex:
     tags: [RSS, Blogs, Feed-Reader, Monitoring]
     homepage: https://github.com/JulienTant/blogwatcher-cli
 prerequisites:
