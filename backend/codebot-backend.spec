@@ -22,9 +22,11 @@ hiddenimports += collect_submodules('starlette')
 tmp_ret = collect_all('pydantic')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
-# onnxruntime
-tmp_ret = collect_all('onnxruntime')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# onnxruntime 由 PyInstaller 官方 hook 收集 capi 下的原生推理库。不要使用
+# collect_all：它会把 quantization、transformers、tools 等未使用的开发工具全部
+# 作为隐藏导入；部分 Windows wheel 在隔离导入 quantization 时会直接崩溃。
+# 下方显式 hidden import 的 onnxruntime/onnxruntime.capi 足以覆盖 ChromaDB
+# 默认嵌入函数通过 importlib 动态加载的核心推理入口。
 
 # tokenizers
 tmp_ret = collect_all('tokenizers')
@@ -145,6 +147,8 @@ hiddenimports += [
     'sniffio',
     'onnxruntime',
     'onnxruntime.capi',
+    'onnxruntime.capi._pybind_state',
+    'onnxruntime.capi.onnxruntime_inference_collection',
     'tokenizers',
     'tornado',
     'tornado.gen',

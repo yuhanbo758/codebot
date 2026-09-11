@@ -157,7 +157,9 @@ jobs:
         working-directory: backend
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           pyinstaller codebot-backend.spec --noconfirm
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Test-Path dist_build) { Remove-Item dist_build -Recurse -Force }
           New-Item -ItemType Directory -Path dist_build | Out-Null
           Copy-Item dist/codebot-backend dist_build/codebot-backend -Recurse
