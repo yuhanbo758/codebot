@@ -709,6 +709,7 @@ npm run build
 - GitHub Releases 公共更新会在桌面端先解析 Release API 中的真实安装包资产名，再执行下载；即使资产名里的空格、点号或连字符存在差异，也不会再因为 404 导致下载失败。
 - 项目已在 `.trae/rules/release-update-compat.md` 固化 GitHub Release 更新兼容规则，后续智能体处理发版、补传资产或自动更新问题时应优先遵循该规则。
 - `build.bat` 会自动清理 `electron/dist/electron_new/win-unpacked`，避免旧桌面资源残留导致打包混淆。
+- Electron 主进程新增同级模块时，必须同步加入 `electron/package.json` 的 `build.files`；测试会递归检查本地 CommonJS 依赖，避免开发态正常但安装后的 `app.asar` 缺少模块。
 - `build.bat` 使用 `python -m pip` 安装依赖并关闭 pip 版本检查，兼容 Conda/venv 场景。
 - `build.bat` 使用 `python -m PyInstaller` 执行后端封装，避免 `pyinstaller.exe` 路径缺失导致构建失败。
 - `build.bat` 在前端/桌面依赖安装失败时会直接给出错误并退出，便于快速定位打包问题。

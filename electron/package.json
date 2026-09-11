@@ -26,6 +26,7 @@
       "main.js",
       "preload.js",
       "docker-installer.js",
+      "rakazo-startup.js",
       "loading.html"
     ],
     "extraResources": [
