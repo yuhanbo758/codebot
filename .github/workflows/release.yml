@@ -32,7 +32,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install pip-audit
-          timeout --signal=TERM 10m python -m pip_audit --requirement backend/requirements.txt --vulnerability-service osv --progress-spinner off --timeout 60
+          # ChromaDB 当前没有已发布的修复版本。Codebot 仅使用进程内
+          # PersistentClient；先用源码门禁确认没有引入漏洞所需的 HTTP 服务面，
+          # 再精确忽略这两个不适用公告，其他依赖漏洞仍然会阻断发布。
+          python scripts/verify_chromadb_security_exception.py
+          timeout --signal=TERM 10m python -m pip_audit \
+            --requirement backend/requirements.txt \
+            --vulnerability-service osv \
+            --progress-spinner off \
+            --timeout 60 \
+            --ignore-vuln PYSEC-2026-3813 \
+            --ignore-vuln PYSEC-2026-3814
 
       - name: Setup Node
         uses: actions/setup-node@v6

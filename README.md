@@ -6,7 +6,7 @@
 
 以 OpenCode 为默认主链，并提供可选 Codex Agent Harness 与 Rakazo 受控试运行执行器的第三方能力工作台。Codebot 负责 MCP、Skills、记忆、定时任务、编排与统一界面。
 
-发布版本通过 GitHub Actions 在每次推送到 `main` 后自动递增并发布到 Releases。
+发布版本通过 GitHub Actions 在每次推送到 `main` 后自动递增并发布到 Releases。发布前会审计 Python、前端和 Electron 运行依赖；ChromaDB 当前无修复版本的两个服务端漏洞仅在源码检查确认项目仍只使用进程内 `PersistentClient` 时精确豁免，引入 Chroma HTTP 服务面会立即阻断发布。
 
 ## ✨ 特性
 
