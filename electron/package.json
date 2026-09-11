@@ -6,7 +6,8 @@
   "main": "main.js",
   "scripts": {
     "start": "chcp 65001 && electron .",
-    "build": "electron-builder"
+    "build": "electron-builder",
+    "test": "node --test tests/*.test.cjs"
   },
   "dependencies": {
     "electron-updater": "^6.8.3"
@@ -24,6 +25,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "docker-installer.js",
       "loading.html"
     ],
     "extraResources": [
@@ -53,6 +55,18 @@
         ]
       },
       {
+        "from": "../integrations",
+        "to": "integrations",
+        "filter": [
+          "rakazo/**/*",
+          "rakazo-adapter/package.json",
+          "rakazo-adapter/package-lock.json",
+          "rakazo-adapter/tsconfig.json",
+          "rakazo-adapter/Dockerfile",
+          "rakazo-adapter/src/**/*"
+        ]
+      },
+      {
         "from": "vendor/opencode",
         "to": "opencode",
         "filter": [
@@ -74,7 +88,11 @@
       ]
     },
     "nsis": {
-      "artifactName": "Codebot-Setup-${version}.${ext}"
+      "artifactName": "Codebot-Setup-${version}.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "selectPerMachineByDefault": false
     },
     "portable": {
       "artifactName": "Codebot-${version}.${ext}"

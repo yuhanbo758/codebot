@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-import hashlib
 import json
 import os
 import secrets
@@ -19,17 +18,12 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
 from loguru import logger
 
 from config import app_config, settings
-from core.codex_model_bridge import (
-    bridge_adapter,
-    bridge_protocol_for_npm,
-    bridge_protocol_metadata,
-)
+from core.codex_model_bridge import bridge_protocol_metadata
+from core.model_route_registry import ModelRoute, model_route_registry
 
 
 def _model_dump(value: Any) -> Dict[str, Any]:
@@ -70,64 +64,8 @@ class ActiveCodexTurn:
     interactive: bool
 
 
-@dataclass(frozen=True)
-class OpenCodeResponsesModel:
-    """一个可由 Codex 自定义 provider 安全调用的 OpenCode 模型。
-
-    Responses 模型由 Codex 直连；Chat Completions/Anthropic 模型先经过
-    Codebot 本机协议桥接。`api_key` 始终只保存在后端进程内存，不进入
-    状态接口、日志或前端模型对象。
-    """
-
-    display_id: str
-    display_name: str
-    opencode_provider: str
-    opencode_model: str
-    codex_provider: str
-    codex_model: str
-    base_url: str
-    env_key: str
-    api_key: str = field(repr=False)
-    upstream_protocol: str = "responses"
-    adapter_package: str = "@ai-sdk/openai"
-    request_headers: tuple[tuple[str, str], ...] = field(default=(), repr=False)
-    query_params: tuple[tuple[str, str], ...] = field(default=(), repr=False)
-    context_window: Optional[int] = None
-    max_output_tokens: Optional[int] = None
-    reasoning: bool = False
-    reasoning_efforts: tuple[str, ...] = ()
-
-    @property
-    def uses_bridge(self) -> bool:
-        return self.upstream_protocol != "responses"
-
-    def public_model(self) -> Dict[str, Any]:
-        """返回不含上游地址和凭据的前端模型描述。"""
-        adapter = bridge_adapter(self.upstream_protocol)
-        protocol_label = (
-            "OpenCode Responses"
-            if self.upstream_protocol == "responses"
-            else f"OpenCode {adapter.label} 兼容桥" if adapter else "OpenCode 兼容桥"
-        )
-        public_protocol = (
-            "responses"
-            if self.upstream_protocol == "responses"
-            else adapter.public_protocol if adapter else self.upstream_protocol
-        )
-        return {
-            "id": self.display_id,
-            "name": self.display_name,
-            "displayName": f"{self.display_name} · {protocol_label}",
-            "provider": self.opencode_provider,
-            "model": self.opencode_model,
-            "source": "opencode",
-            "runnable": True,
-            "protocol": public_protocol,
-            "transport": "codebot-bridge" if self.uses_bridge else "direct",
-            "modelProvider": self.codex_provider,
-            "adapterPackage": self.adapter_package,
-            "supportedReasoningEfforts": list(self.reasoning_efforts),
-        }
+# 保留旧类型名，避免外部测试和插件导入路径被共享注册表抽取破坏。
+OpenCodeResponsesModel = ModelRoute
 
 
 class CodexRuntime:
@@ -188,86 +126,28 @@ class CodexRuntime:
     @staticmethod
     def _opencode_auth_paths() -> List[Path]:
         """返回 OpenCode 官方凭据文件的候选位置，不创建或修改任何文件。"""
-        paths: List[Path] = []
-        xdg_data_home = str(os.environ.get("XDG_DATA_HOME") or "").strip()
-        if xdg_data_home:
-            paths.append(Path(xdg_data_home).expanduser() / "opencode" / "auth.json")
-        # OpenCode 官方文档在所有平台统一使用该路径；当前 Windows 安装也位于此处。
-        paths.append(Path.home() / ".local" / "share" / "opencode" / "auth.json")
-        if os.name == "nt":
-            for variable in ("LOCALAPPDATA", "APPDATA"):
-                root = str(os.environ.get(variable) or "").strip()
-                if root:
-                    paths.append(Path(root) / "opencode" / "auth.json")
-        result: List[Path] = []
-        for path in paths:
-            if path not in result:
-                result.append(path)
-        return result
+        return model_route_registry.opencode_auth_paths()
 
     @classmethod
     def _load_opencode_api_credentials(cls) -> Dict[str, str]:
         """只读取 OpenCode 中 `type=api` 的密钥；OAuth 凭据不会转交第三方 provider。"""
-        credentials: Dict[str, str] = {}
-        for path in cls._opencode_auth_paths():
-            if not path.is_file():
-                continue
-            try:
-                raw = json.loads(path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                logger.warning(f"读取 OpenCode provider 凭据索引失败（不影响原生 Codex）：{path}: {exc}")
-                continue
-            if not isinstance(raw, dict):
-                continue
-            for provider_id, value in raw.items():
-                if not isinstance(value, dict) or str(value.get("type") or "") != "api":
-                    continue
-                api_key = str(value.get("key") or "").strip()
-                if api_key:
-                    credentials[str(provider_id)] = api_key
-            # OpenCode 只使用一个活动 auth.json；找到后不继续合并旧位置的凭据。
-            break
-        return credentials
+        return model_route_registry.load_opencode_api_credentials()
 
     def _opencode_server_url(self) -> str:
         """优先使用 main.py 已连接的真实 OpenCode 地址，兼容打包端口回退。"""
-        try:
-            from api.routes import gateway as gateway_router
-
-            client = getattr(gateway_router, "opencode_ws", None)
-            actual = str(getattr(client, "base_url", "") or "").strip()
-            if actual:
-                return actual.rstrip("/")
-        except Exception:
-            pass
-        return str(app_config.opencode.server_url or "http://127.0.0.1:11200").rstrip("/")
+        return model_route_registry.opencode_server_url()
 
     @staticmethod
     def _provider_env_name(provider_id: str, base_url: str) -> str:
-        digest = hashlib.sha256(f"{provider_id}\0{base_url}".encode("utf-8")).hexdigest()[:10].upper()
-        safe_provider = "".join(ch if ch.isalnum() else "_" for ch in provider_id.upper()).strip("_")
-        return f"CODEBOT_OPENCODE_{safe_provider[:24] or 'PROVIDER'}_{digest}_KEY"
+        return model_route_registry.provider_env_name(provider_id, base_url)
 
     @staticmethod
     def _codex_provider_id(provider_id: str, base_url: str, upstream_protocol: str = "responses") -> str:
-        # 同一 base URL 可能同时存在 Responses 与 Chat 模型；协议必须参与 provider
-        # ID，否则 Codex 只能为两组模型配置同一个 base_url。
-        digest = hashlib.sha256(
-            f"{provider_id}\0{base_url}\0{upstream_protocol}".encode("utf-8")
-        ).hexdigest()[:8]
-        safe_provider = "".join(ch if ch.isalnum() else "_" for ch in provider_id.lower()).strip("_")
-        return f"codebot_{safe_provider[:28] or 'opencode'}_{digest}"
+        return model_route_registry.codex_provider_id(provider_id, base_url, upstream_protocol)
 
     @staticmethod
     def _protocol_label(npm_package: str) -> str:
-        package = str(npm_package or "").strip().lower()
-        if package == "@ai-sdk/openai":
-            return "Responses API"
-        protocol = bridge_protocol_for_npm(package)
-        adapter = bridge_adapter(protocol or "")
-        if adapter is not None:
-            return adapter.label
-        return package or "未知协议"
+        return model_route_registry.protocol_label(npm_package)
 
     @classmethod
     def _parse_opencode_provider_catalog(
@@ -286,220 +166,29 @@ class CodexRuntime:
         其余模型按 ``codex_model_bridge`` 的显式协议注册表交给 Codebot 本机
         中间层；未知协议继续明确标记为不兼容，绝不偷偷回退到 ChatGPT 账号。
         """
-        env = environ if environ is not None else dict(os.environ)
-        if not isinstance(payload, dict):
-            return {}, {}
-        connected = {str(item) for item in (payload.get("connected") or [])}
-        providers = payload.get("all") if isinstance(payload.get("all"), list) else []
-        routes: Dict[str, OpenCodeResponsesModel] = {}
-        incompatible: Dict[str, str] = {}
-        allowed_efforts = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
-
-        for provider in providers:
-            if not isinstance(provider, dict):
-                continue
-            provider_id = str(provider.get("id") or "").strip()
-            if not provider_id or provider_id not in connected:
-                continue
-            provider_name = str(provider.get("name") or provider_id)
-            provider_options = provider.get("options") if isinstance(provider.get("options"), dict) else {}
-            configured_base_url = str(
-                provider_options.get("baseURL") or provider_options.get("base_url") or ""
-            ).strip()
-            api_key = str(credentials.get(provider_id) or "").strip()
-            if not api_key:
-                for env_name in provider.get("env") or []:
-                    candidate = str(env.get(str(env_name)) or "").strip()
-                    if candidate:
-                        api_key = candidate
-                        break
-            if not api_key:
-                configured_key = str(provider_options.get("apiKey") or "").strip()
-                if configured_key and not configured_key.startswith("{"):
-                    api_key = configured_key
-
-            # OpenCode 的 OpenAI OAuth 不是可转交第三方 provider 的 API Key；这种
-            # 账号继续走 Codex 内置 `openai` provider，保持登录和计费语义。用户若
-            # 在 OpenCode 明确配置 OPENAI_API_KEY，则按真实元数据加入兼容路由。
-            # Ollama / LM Studio 不再硬编码排除：loopback 模型可按其声明协议桥接。
-            has_explicit_openai_endpoint = bool(configured_base_url) or any(
-                isinstance(item, dict)
-                and isinstance(item.get("api"), dict)
-                and str(item["api"].get("url") or "").strip()
-                for item in (
-                    provider.get("models", {}).values()
-                    if isinstance(provider.get("models"), dict)
-                    else []
-                )
-            )
-            if provider_id == "openai" and (not api_key or not has_explicit_openai_endpoint):
-                continue
-
-            models = provider.get("models") if isinstance(provider.get("models"), dict) else {}
-            responses_base_urls: set[str] = set()
-            for candidate_model in models.values():
-                if not isinstance(candidate_model, dict):
-                    continue
-                candidate_api = (
-                    candidate_model.get("api")
-                    if isinstance(candidate_model.get("api"), dict)
-                    else {}
-                )
-                candidate_package = str(candidate_api.get("npm") or provider.get("npm") or "").strip()
-                candidate_url = str(candidate_api.get("url") or configured_base_url).strip().rstrip("/")
-                candidate_parsed_url = urlparse(candidate_url)
-                if (
-                    candidate_package == "@ai-sdk/openai"
-                    and candidate_parsed_url.scheme in {"http", "https"}
-                    and candidate_parsed_url.netloc
-                ):
-                    responses_base_urls.add(candidate_url)
-
-            for model_key, raw_model in models.items():
-                if not isinstance(raw_model, dict):
-                    continue
-                full_id = f"{provider_id}/{model_key}"
-                api = raw_model.get("api") if isinstance(raw_model.get("api"), dict) else {}
-                npm_package = str(api.get("npm") or provider.get("npm") or "").strip()
-                base_url = str(api.get("url") or configured_base_url).strip().rstrip("/")
-                parsed_url = urlparse(base_url)
-                declared_responses = npm_package == "@ai-sdk/openai"
-                # `@ai-sdk/openai-compatible` 只说明 OpenCode 自己选择 Chat Completions；
-                # 同地址若已有明确 Responses 模型，就证明 provider 服务端同时暴露
-                # `/responses`。目标模型是否可用由上游返回，不再误送到 ChatGPT 账号。
-                inferred_dual_wire = (
-                    npm_package == "@ai-sdk/openai-compatible"
-                    and base_url in responses_base_urls
-                )
-                bridged_protocol = bridge_protocol_for_npm(npm_package)
-                if declared_responses or inferred_dual_wire:
-                    upstream_protocol = "responses"
-                elif bridged_protocol:
-                    upstream_protocol = bridged_protocol
-                else:
-                    incompatible[full_id] = (
-                        f"OpenCode 模型 {full_id} 使用 {cls._protocol_label(npm_package)}，"
-                        "Codebot 当前没有该协议到 Responses 的安全桥接器。"
-                    )
-                    continue
-                if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-                    incompatible[full_id] = f"OpenCode 模型 {full_id} 没有可用的模型 API 地址。"
-                    continue
-                is_loopback = (parsed_url.hostname or "").lower() in {"127.0.0.1", "localhost", "::1"}
-                if not api_key and not is_loopback:
-                    incompatible[full_id] = (
-                        f"OpenCode 模型 {full_id} 没有找到可复用的 API 凭据。"
-                        "请先在 OpenCode 中连接该 provider，然后重启 Codex App Server。"
-                    )
-                    continue
-                codex_provider = cls._codex_provider_id(provider_id, base_url, upstream_protocol)
-                variants = raw_model.get("variants") if isinstance(raw_model.get("variants"), dict) else {}
-                efforts = tuple(
-                    value for value in variants.keys()
-                    if str(value) in allowed_efforts
-                )
-                capabilities = raw_model.get("capabilities") if isinstance(raw_model.get("capabilities"), dict) else {}
-                limits = raw_model.get("limit") if isinstance(raw_model.get("limit"), dict) else {}
-                try:
-                    context_window = int(limits.get("context")) if limits.get("context") else None
-                except (TypeError, ValueError):
-                    context_window = None
-                try:
-                    max_output_tokens = int(limits.get("output")) if limits.get("output") else None
-                except (TypeError, ValueError):
-                    max_output_tokens = None
-                provider_headers = provider_options.get("headers") if isinstance(provider_options.get("headers"), dict) else {}
-                model_headers = raw_model.get("headers") if isinstance(raw_model.get("headers"), dict) else {}
-                request_headers = tuple(
-                    (str(key), str(value))
-                    for key, value in {**provider_headers, **model_headers}.items()
-                    if isinstance(value, (str, int, float, bool))
-                )
-                raw_query = (
-                    provider_options.get("queryParams")
-                    if isinstance(provider_options.get("queryParams"), dict)
-                    else provider_options.get("query_params")
-                )
-                query_params = tuple(
-                    (str(key), str(value))
-                    for key, value in (raw_query.items() if isinstance(raw_query, dict) else [])
-                    if isinstance(value, (str, int, float, bool))
-                )
-                # Codex 支持 provider 级 header/query，但 OpenCode 允许逐模型覆盖；
-                # 直接写进 App Server 启动参数既可能串到同 provider 的其他模型，也
-                # 可能把敏感 query 暴露在命令行。此类 Responses 路由改走本机安全
-                # 代理，凭据与逐模型参数只留在 Codebot 后端内存。
-                if upstream_protocol == "responses" and (request_headers or query_params):
-                    upstream_protocol = "responses_proxy"
-                # provider ID 还要区分逐模型 header/query；否则两个同地址模型若使用
-                # 不同租户头，会共用一个 Codex provider 并在桥入口发生路由歧义。
-                routing_scope = base_url
-                if request_headers or query_params:
-                    routing_scope += "\0" + json.dumps(
-                        {"headers": request_headers, "query": query_params},
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    )
-                codex_provider = cls._codex_provider_id(
-                    provider_id,
-                    routing_scope,
-                    upstream_protocol,
-                )
-                routes[full_id] = OpenCodeResponsesModel(
-                    display_id=full_id,
-                    display_name=str(raw_model.get("name") or model_key),
-                    opencode_provider=provider_id,
-                    opencode_model=str(model_key),
-                    codex_provider=codex_provider,
-                    codex_model=str(api.get("id") or raw_model.get("id") or model_key),
-                    base_url=base_url,
-                    env_key=cls._provider_env_name(provider_id, base_url) if api_key else "",
-                    api_key=api_key,
-                    upstream_protocol=upstream_protocol,
-                    adapter_package=npm_package,
-                    request_headers=request_headers,
-                    query_params=query_params,
-                    context_window=context_window,
-                    max_output_tokens=max_output_tokens,
-                    reasoning=bool(capabilities.get("reasoning")),
-                    reasoning_efforts=efforts,
-                )
-        return routes, incompatible
+        return model_route_registry.parse_runnable_catalog(payload, credentials, environ)
 
     def _discover_opencode_models_sync(self) -> tuple[Dict[str, OpenCodeResponsesModel], Dict[str, str]]:
         """读取本机 OpenCode 的公开 provider 元数据；失败时只禁用兼容扩展。"""
-        request = Request(
-            f"{self._opencode_server_url()}/provider",
-            headers={"Accept": "application/json", "User-Agent": "Codebot-Codex/1"},
-        )
-        try:
-            with urlopen(request, timeout=12) as response:
-                raw = response.read(16 * 1024 * 1024 + 1)
-            if len(raw) > 16 * 1024 * 1024:
-                raise ValueError("OpenCode provider 元数据超过 16 MiB 安全上限")
-            payload = json.loads(raw.decode("utf-8"))
-            return self._parse_opencode_provider_catalog(
-                payload,
-                self._load_opencode_api_credentials(),
-            )
-        except Exception as exc:
-            logger.warning(f"未能加载 OpenCode 兼容模型，Codex 将只显示原生模型：{exc}")
-            return {}, {}
+        routes, incompatible = model_route_registry.discover_sync(force=True)
+        # OpenCode OAuth 的短期 access token 由 Rakazo 宿主采样桥按请求刷新；
+        # Codex App Server 的 provider 配置是进程启动快照，无法安全轮换它。
+        # Codex 自身已有官方 ChatGPT 账号通道，因此这里继续只注入稳定 API/
+        # loopback 路由，避免 OAuth 到期后把 Codex 历史线程变成失效 provider。
+        filtered = {
+            route_id: route
+            for route_id, route in routes.items()
+            if route.credential_mode != "opencode_oauth"
+        }
+        for route_id, route in routes.items():
+            if route.credential_mode == "opencode_oauth":
+                incompatible[route_id] = "该 OpenCode OAuth 路由由 Rakazo 宿主桥动态刷新；Codex 使用自身官方账号通道"
+        return filtered, incompatible
 
     @staticmethod
     def _route_signature(route: OpenCodeResponsesModel) -> tuple[Any, ...]:
         """比较 provider 配置是否变化；凭据只比较哈希，绝不写日志。"""
-        return (
-            route.display_id,
-            route.codex_provider,
-            route.codex_model,
-            route.base_url,
-            route.upstream_protocol,
-            route.adapter_package,
-            route.request_headers,
-            route.query_params,
-            hashlib.sha256(route.api_key.encode("utf-8")).hexdigest() if route.api_key else "",
-        )
+        return model_route_registry.route_signature(route)
 
     async def _refresh_opencode_models_if_changed(self) -> bool:
         """OpenCode 新增/修改 provider 后，在安全空闲点自动重启 App Server。

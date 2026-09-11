@@ -1,0 +1,176 @@
+# 与 Rakazo 官方 docker-compose.images.yml 叠加使用。
+# Codebot 在启动 Compose 时临时注入以下变量；令牌不会写入本文件或 .env。
+services:
+  # 官方 Compose 默认引用会漂移的 edge 标签。Codebot 只从兼容清单注入
+  # repo@sha256:... 的不可变引用；任一变量缺失时 Compose 直接失败。
+  computer:
+    image: ${CODEBOT_RAKAZO_COMPUTER_IMAGE:?Pinned Rakazo computer image is required}
+
+  supervisor:
+    image: ${CODEBOT_RAKAZO_APP_IMAGE:?Pinned Rakazo app image is required}
+    environment:
+      RAKAZO_COMPUTER_IMAGE: ${CODEBOT_RAKAZO_COMPUTER_IMAGE:?Pinned Rakazo computer image is required}
+      COREPACK_HOME: /corepack
+    volumes:
+      - corepack-cache:/corepack
+    depends_on:
+      # 官方 app 镜像在首次 pnpm 调用时才由 Corepack 下载包管理器。
+      # 先做一次可重试预热，避免每次重建多个服务各自依赖外网下载。
+      corepack-init:
+        condition: service_completed_successfully
+
+  corepack-init:
+    image: ${CODEBOT_RAKAZO_APP_IMAGE:?Pinned Rakazo app image is required}
+    user: "0:0"
+    command:
+      - bash
+      - -lc
+      - COREPACK_HOME=/corepack pnpm --version && chown -R 1000:1000 /corepack
+    restart: "on-failure:5"
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 0.5
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid
+    environment:
+      COREPACK_HOME: /corepack
+    volumes:
+      - corepack-cache:/corepack
+    networks:
+      - app
+
+  model-adapter:
+    build:
+      # Compose 的 project directory 指向用户选择的官方 Compose 目录，不能
+      # 使用相对路径猜测 Codebot 安装位置；后端只在本次启动环境中注入绝对路径。
+      context: ${CODEBOT_RAKAZO_ADAPTER_CONTEXT:?Codebot adapter context is required}
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 96
+    mem_limit: 256m
+    cpus: 0.5
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8787"
+      # 与 Codebot 通过 models.connect 保存的本地 Provider 协议键一致；真正
+      # 访问宿主采样接口仍使用下方每进程随机令牌，二者不是同一安全边界。
+      RAKAZO_ADAPTER_SHARED_KEY: ${CODEBOT_RAKAZO_ADAPTER_SHARED_KEY:?Codebot local adapter key is required}
+      CODEBOT_RAKAZO_INTERNAL_URL: ${CODEBOT_RAKAZO_INTERNAL_URL:?Codebot internal sampling URL is required}
+      CODEBOT_RAKAZO_SAMPLING_TOKEN: ${CODEBOT_RAKAZO_SAMPLING_TOKEN:?Codebot sampling token is required}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - app
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # Rakazo 的 MCP 合同只允许非 TLS 的 localhost。两个最小权限 sidecar 分别
+  # 与 api/worker 共享网络命名空间，在各自容器中提供 127.0.0.1:8788；它们只
+  # 转发到宿主 Codebot 的项目范围 MCP，不挂载项目目录或 Docker Socket。
+  project-mcp-api:
+    build:
+      context: ${CODEBOT_RAKAZO_ADAPTER_CONTEXT:?Codebot adapter context is required}
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    network_mode: "service:api"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.25
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    environment:
+      HOST: "127.0.0.1"
+      PORT: "8788"
+      CODEBOT_RAKAZO_ADAPTER_MODE: "project-mcp"
+      CODEBOT_RAKAZO_INTERNAL_URL: ${CODEBOT_RAKAZO_PROJECT_MCP_URL:?Codebot project MCP URL is required}
+    depends_on:
+      api:
+        condition: service_started
+
+  project-mcp-worker:
+    build:
+      context: ${CODEBOT_RAKAZO_ADAPTER_CONTEXT:?Codebot adapter context is required}
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    network_mode: "service:worker"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 128m
+    cpus: 0.25
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid
+    environment:
+      HOST: "127.0.0.1"
+      PORT: "8788"
+      CODEBOT_RAKAZO_ADAPTER_MODE: "project-mcp"
+      CODEBOT_RAKAZO_INTERNAL_URL: ${CODEBOT_RAKAZO_PROJECT_MCP_URL:?Codebot project MCP URL is required}
+    depends_on:
+      worker:
+        condition: service_started
+
+  api:
+    image: ${CODEBOT_RAKAZO_APP_IMAGE:?Pinned Rakazo app image is required}
+    environment:
+      RAKAZO_LOCAL_MODELS: ${CODEBOT_RAKAZO_MODEL_IDS:?OpenCode model catalog is required}
+      RAKAZO_LOCAL_MODELS_URL: http://model-adapter:8787/v1
+      COREPACK_HOME: /corepack
+    volumes:
+      - corepack-cache:/corepack
+    # project-mcp-api 共享本服务的网络命名空间，host 映射必须声明在
+    # namespace 所有者上，Docker 不允许在 network_mode: service:* 的
+    # sidecar 上同时配置 extra_hosts。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      model-adapter:
+        condition: service_healthy
+
+  worker:
+    image: ${CODEBOT_RAKAZO_APP_IMAGE:?Pinned Rakazo app image is required}
+    environment:
+      RAKAZO_LOCAL_MODELS: ${CODEBOT_RAKAZO_MODEL_IDS:?OpenCode model catalog is required}
+      RAKAZO_LOCAL_MODELS_URL: http://model-adapter:8787/v1
+      COREPACK_HOME: /corepack
+    volumes:
+      - corepack-cache:/corepack
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      model-adapter:
+        condition: service_healthy
+
+  web:
+    image: ${CODEBOT_RAKAZO_APP_IMAGE:?Pinned Rakazo app image is required}
+    environment:
+      COREPACK_HOME: /corepack
+    volumes:
+      - corepack-cache:/corepack
+
+volumes:
+  corepack-cache:

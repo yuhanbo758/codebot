@@ -4,7 +4,7 @@
       <!-- 侧边栏 - 对话列表 -->
       <el-aside width="280px">
         <div class="conversation-header">
-          <el-button type="primary" @click="createNewConversation" class="new-conv-btn">
+          <el-button type="primary" @click="openNewConversationDialog" class="new-conv-btn">
             <el-icon><Plus /></el-icon>
             新建对话
           </el-button>
@@ -79,11 +79,12 @@
             :key="conv.id"
             class="conversation-item"
             :class="{ active: currentConversationId === conv.id, 'batch-selected': selectedConvIds.includes(conv.id), 'multi-agent-hub-item': isMultiAgentHub(conv) }"
-            @click="batchMode ? toggleConvSelection(conv.id) : selectConversation(conv.id)"
+            @click="batchMode ? (conv.executor !== 'rakazo' && toggleConvSelection(conv.id)) : selectConversation(conv.id)"
           >
             <div v-if="batchMode" class="batch-checkbox" @click.stop>
-              <el-checkbox 
+              <el-checkbox
                 :model-value="selectedConvIds.includes(conv.id)"
+                :disabled="conv.executor === 'rakazo'"
                 @change="toggleConvSelection(conv.id)"
               />
             </div>
@@ -93,6 +94,8 @@
                 <el-tag v-if="conv.is_pinned" size="small" type="info">置顶</el-tag>
                 <el-tag v-if="isMultiAgentHub(conv)" size="small" type="danger">多Agent</el-tag>
                 <el-tag v-else-if="conv.is_group" size="small" type="success">{{ conv.group_role || 'Agent' }}</el-tag>
+                <el-tag v-if="conv.executor === 'rakazo'" size="small" type="primary">Rakazo</el-tag>
+                <el-tag v-else-if="conv.executor === 'codex'" size="small" type="success">Codex</el-tag>
                 <el-tag v-if="conv.project_dir" size="small" type="warning" :title="conv.project_dir">📁</el-tag>
               </div>
               <div class="conversation-time">{{ formatDate(conv.updated_at) }}</div>
@@ -103,7 +106,8 @@
                 <template #dropdown>
                   <el-dropdown-menu>
                     <el-dropdown-item command="share">分享</el-dropdown-item>
-                    <el-dropdown-item v-if="!isMultiAgentHub(conv)" :command="conv.is_group ? 'ungroup' : 'group'">
+                    <el-dropdown-item v-if="!isMultiAgentHub(conv)" command="handoff">交接到其他执行器</el-dropdown-item>
+                    <el-dropdown-item v-if="!isMultiAgentHub(conv) && conv.executor !== 'rakazo'" :command="conv.is_group ? 'ungroup' : 'group'">
                       {{ conv.is_group ? '退出多Agent群聊' : '加入多Agent群聊' }}
                     </el-dropdown-item>
                     <el-dropdown-item v-if="!isMultiAgentHub(conv)" command="rename">重命名</el-dropdown-item>
@@ -112,7 +116,7 @@
                     </el-dropdown-item>
                     <el-dropdown-item v-if="!isMultiAgentHub(conv)" command="archive">归档</el-dropdown-item>
                     <el-dropdown-item :command="isMultiAgentHub(conv) ? 'clear' : 'delete'" divided>
-                      {{ isMultiAgentHub(conv) ? '清空' : '删除' }}
+                      {{ isMultiAgentHub(conv) ? '清空' : (conv.executor === 'rakazo' ? '删除并清理项目' : '删除') }}
                     </el-dropdown-item>
                   </el-dropdown-menu>
                 </template>
@@ -135,7 +139,79 @@
             <span v-if="multiAgentMembers.length === 0" class="empty-members">暂无成员，请在普通对话菜单中选择“加入多Agent群聊”。</span>
             <el-button size="small" text class="refresh-members-btn" @click="loadMultiAgentMembers">刷新成员</el-button>
           </div>
-          <div v-if="thirdPartyStatus" class="third-party-banner">
+          <div v-if="isRakazoConversation" class="rakazo-session-bar">
+            <div class="rakazo-session-identity">
+              <strong>Rakazo 主会话</strong>
+              <el-tag size="small" :type="rakazoProjectState?.active ? 'warning' : 'success'">{{ rakazoProjectState?.active ? '运行中' : '空闲' }}</el-tag>
+              <el-tag size="small" :type="rakazoProjectState?.computer?.state === 'running' ? 'success' : 'info'">{{ rakazoComputerStateLabel }}</el-tag>
+            </div>
+            <div class="rakazo-session-controls">
+              <span class="rakazo-model-label">模型</span>
+              <el-select
+                v-model="selectedModel"
+                class="rakazo-model-select"
+                size="small"
+                filterable
+                :filter-method="filterModels"
+                :loading="modelsLoading || rakazoModelSwitching"
+                :disabled="currentLoading || rakazoProjectState?.active || rakazoModelSwitching"
+                no-data-text="OpenCode 当前没有可用模型"
+                popper-class="model-select-popper"
+                @visible-change="onModelDropdownOpen"
+              >
+                <template v-if="modelSearchQuery">
+                  <el-option
+                    v-for="model in filteredModels"
+                    :key="model.id"
+                    :label="model.name"
+                    :value="model.id"
+                    :disabled="model.selectable === false || model.runnable === false"
+                  >
+                    <span class="model-option-name">{{ model.model }}</span>
+                    <span class="model-option-provider">{{ modelProviderLabel(model) }}</span>
+                  </el-option>
+                </template>
+                <template v-else>
+                  <el-option-group
+                    v-for="group in groupedModels"
+                    :key="group.provider"
+                    :label="group.providerLabel"
+                  >
+                    <el-option
+                      v-for="model in group.models"
+                      :key="model.id"
+                      :label="model.name"
+                      :value="model.id"
+                      :disabled="model.selectable === false || model.runnable === false"
+                    >
+                      <span class="model-option-name">{{ model.model }}</span>
+                      <span class="model-option-provider">{{ modelProviderLabel(model) }}</span>
+                    </el-option>
+                  </el-option-group>
+                </template>
+              </el-select>
+              <el-button
+                size="small"
+                text
+                :loading="modelsLoading"
+                :disabled="currentLoading || rakazoModelSwitching"
+                title="同步 OpenCode 当前模型"
+                @click="loadModels({ manual: true, rakazo: true })"
+              >
+                <el-icon><Refresh /></el-icon>
+              </el-button>
+              <el-button size="small" @click="openRakazoDrawer">Rakazo 状态</el-button>
+            </div>
+          </div>
+          <el-alert
+            v-if="isRakazoConversation && rakazoProjectState?.routeDrift"
+            class="rakazo-route-alert"
+            :title="rakazoProjectState.routeDriftReason"
+            type="error"
+            show-icon
+            :closable="false"
+          />
+          <div v-if="thirdPartyStatus && !isRakazoConversation" class="third-party-banner">
             <el-tag size="small" :type="thirdPartyStatus.opencode_connected ? 'success' : 'info'">
               {{ thirdPartyStatus.opencode_connected ? 'OpenCode 已连接' : 'OpenCode 未连接' }}
             </el-tag>
@@ -299,6 +375,7 @@
                 </div>
                 <div class="message-content">
                   <div v-if="msg.role === 'assistant' && msg.source === 'codex'" class="message-source-badge">Codex Agent Harness</div>
+                  <div v-else-if="msg.role === 'assistant' && msg.source === 'rakazo'" class="message-source-badge rakazo-source-badge">Rakazo</div>
                   <div v-if="isCliDisplayMessage(msg)" class="cli-output">{{ msg.content }}</div>
                   <div v-else-if="msg.streaming" class="message-text streaming-text">{{ msg.content }}</div>
                   <div v-else class="message-text markdown-body" v-html="renderMarkdown(msg.content)"></div>
@@ -444,6 +521,7 @@
                         <el-icon><CopyDocument /></el-icon>
                       </el-button>
                       <el-button
+                        v-if="!isRakazoConversation"
                         class="undo-btn"
                         link
                         size="small"
@@ -503,7 +581,7 @@
             </div>
 
             <!-- 工具栏：agent模式 + 模型选择 -->
-            <div class="input-toolbar">
+            <div v-if="!isRakazoConversation" class="input-toolbar">
               <div class="toolbar-left">
                 <span class="toolbar-label">模式</span>
                 <el-select
@@ -512,6 +590,7 @@
                   class="agent-mode-select"
                   popper-class="agent-mode-popper"
                   :placeholder="''"
+                  :disabled="isRakazoConversation"
                 >
                   <el-option value="build" label="Build">
                     <span class="agent-option-name">Build</span>
@@ -537,6 +616,7 @@
                   :filter-method="filterModels"
                   class="model-select"
                   :loading="modelsLoading"
+                  :disabled="isRakazoConversation && currentLoading"
                   no-data-text="暂无模型（OpenCode 未连接）"
                   popper-class="model-select-popper"
                   @visible-change="onModelDropdownOpen"
@@ -582,7 +662,7 @@
                 >
                   <el-icon><Refresh /></el-icon>
                 </el-button>
-                <template v-if="codexEnabled">
+                <template v-if="codexEnabled && !isRakazoConversation">
                   <el-divider direction="vertical" />
                   <span class="toolbar-label">推理</span>
                   <el-select
@@ -702,7 +782,7 @@
             <div class="input-actions">
               <div class="input-actions-left">
                 <el-tooltip :content="currentProjectDir ? ('项目: ' + currentProjectDir) : '选择项目文件夹'" placement="top">
-                  <el-button @click="selectProjectFolder" :type="currentProjectDir ? 'success' : 'default'">
+                  <el-button @click="selectProjectFolder" :type="currentProjectDir ? 'success' : 'default'" :disabled="isRakazoConversation">
                     <el-icon><FolderOpened /></el-icon>
                     {{ currentProjectDir ? projectDirName : '项目' }}
                   </el-button>
@@ -716,13 +796,14 @@
                   style="display:none"
                   @change="onFileInputChange"
                 />
-                <el-button @click="showSkillDialog = true">
+                <el-button v-if="!isRakazoConversation" @click="showSkillDialog = true">
                   <el-icon><MagicStick /></el-icon>
                   生成技能
                 </el-button>
-                <el-button :type="codexEnabled ? 'primary' : 'default'" @click="toggleCodexMode">
-                  Codex
-                </el-button>
+                <el-tag v-if="isConversationExecutorLocked" size="large" effect="plain" :type="conversationExecutor === 'rakazo' ? 'primary' : conversationExecutor === 'codex' ? 'success' : 'info'">
+                  {{ executorLabel(conversationExecutor) }}
+                </el-tag>
+                <el-button v-else :type="codexEnabled ? 'primary' : 'default'" @click="toggleCodexMode">Codex</el-button>
                 <el-button :type="obsidianEnabled ? 'primary' : 'default'" @click="toggleObsidianMode">
                   Obsidian
                 </el-button>
@@ -765,6 +846,168 @@
               </div>
             </div>
           </div>
+
+          <el-dialog v-model="showNewConversationDialog" title="新建对话" width="760px" :close-on-click-modal="false">
+            <div class="executor-picker">
+              <button
+                v-for="option in executorOptions"
+                :key="option.id"
+                type="button"
+                class="executor-card"
+                :class="{ active: newConversationForm.executor === option.id }"
+                @click="selectNewExecutor(option.id)"
+              >
+                <span class="executor-card-title">{{ option.name }}</span>
+                <span class="executor-card-desc">{{ option.description }}</span>
+              </button>
+            </div>
+            <el-form label-width="110px" class="new-conversation-form">
+              <el-form-item label="项目目录" :required="newConversationForm.executor === 'rakazo'">
+                <el-input v-model="newConversationForm.project_dir" readonly placeholder="选择项目后，对话将固定绑定到该目录">
+                  <template #append><el-button @click="selectNewConversationProject">选择</el-button></template>
+                </el-input>
+              </el-form-item>
+            </el-form>
+            <el-alert
+              v-if="newConversationForm.executor === 'rakazo'"
+              :title="newConversationRakazoExists ? '该项目已有 Rakazo 主会话，将直接恢复原 Bot、Thread、Computer、当前模型与记忆。' : `每个项目只创建一个 Rakazo 主会话；模型不与对话永久绑定。初始使用 ${newConversationInitialModelLabel}，创建后可在聊天顶部空闲时切换。`"
+              :type="newConversationRakazoExists ? 'success' : 'info'"
+              show-icon
+              :closable="false"
+            />
+            <template #footer>
+              <el-button @click="showNewConversationDialog = false">取消</el-button>
+              <el-button type="primary" :loading="creatingConversation" :disabled="!canCreateConversation" @click="createNewConversation">
+                {{ newConversationForm.executor === 'rakazo' ? (newConversationRakazoExists ? '打开 Rakazo 主会话' : '创建 Rakazo 主会话') : `创建 ${executorLabel(newConversationForm.executor)} 对话` }}
+              </el-button>
+            </template>
+          </el-dialog>
+
+          <el-dialog
+            v-model="handoffDialogVisible"
+            class="handoff-dialog"
+            title="显式交接执行器"
+            width="820px"
+            align-center
+            :close-on-click-modal="false"
+          >
+            <el-alert
+              title="原对话保持不变；只有点击“确认并交接”后，下面可编辑的摘要才会写入目标会话。"
+              type="info"
+              show-icon
+              :closable="false"
+            />
+            <div class="executor-picker handoff-executor-picker">
+              <button
+                v-for="option in handoffTargetOptions"
+                :key="option.id"
+                type="button"
+                class="executor-card"
+                :class="{ active: handoffForm.target_executor === option.id }"
+                @click="selectHandoffExecutor(option.id)"
+              >
+                <span class="executor-card-title">{{ option.name }}</span>
+                <span class="executor-card-desc">{{ option.description }}</span>
+              </button>
+            </div>
+            <el-form label-width="110px" class="new-conversation-form">
+              <el-form-item label="项目目录" :required="handoffForm.target_executor === 'rakazo'">
+                <el-input v-model="handoffForm.project_dir" readonly placeholder="目标会话使用的项目目录">
+                  <template #append><el-button @click="selectHandoffProject">选择</el-button></template>
+                </el-input>
+              </el-form-item>
+              <el-form-item v-if="handoffForm.target_executor === 'rakazo'" label="初始模型" :required="!handoffRakazoExists">
+                <el-select v-model="handoffForm.route_id" filterable style="width: 100%" placeholder="选择 OpenCode 当前可用模型；首次使用自动验证" :loading="handoffModelsLoading">
+                  <el-option
+                    v-for="model in handoffModels"
+                    :key="model.id"
+                    :label="model.displayName || model.name || model.id"
+                    :value="model.id"
+                    :disabled="model.selectable === false"
+                  />
+                </el-select>
+                <div class="field-tip">{{ handoffRakazoExists ? '该项目已有 Rakazo 主会话，将恢复原 Thread；不会创建第二个。' : '这里只选择首次进入时使用的模型；交接后仍可在聊天顶部切换，不会改写历史轮次。' }}</div>
+              </el-form-item>
+              <el-form-item label="交接摘要" required>
+                <el-input
+                  v-model="handoffForm.summary"
+                  type="textarea"
+                  :rows="12"
+                  resize="vertical"
+                  placeholder="正在生成只包含可见消息的脱敏摘要…"
+                  :disabled="handoffPreviewLoading"
+                />
+                <div class="field-tip">请删除不希望带入目标执行器的内容；摘要不含隐藏系统提示、审批内部对象、凭据或完整工具输出。</div>
+              </el-form-item>
+            </el-form>
+            <template #footer>
+              <el-button @click="handoffDialogVisible = false">取消</el-button>
+              <el-button :loading="handoffPreviewLoading" @click="loadHandoffPreview">重新生成摘要</el-button>
+              <el-button type="primary" :loading="handoffCommitting" :disabled="!canCommitHandoff" @click="commitHandoff">确认并交接</el-button>
+            </template>
+          </el-dialog>
+
+          <el-drawer v-model="rakazoDrawerVisible" title="Rakazo 状态" size="520px" @open="loadRakazoDrawer">
+            <div v-loading="rakazoDrawerLoading" class="rakazo-drawer-content">
+              <el-alert
+                v-if="rakazoProjectState?.routeDrift"
+                :title="rakazoProjectState.routeDriftReason"
+                type="error"
+                show-icon
+                :closable="false"
+              />
+              <el-descriptions :column="1" border size="small">
+                <el-descriptions-item label="Bot">{{ rakazoProjectState?.mapping?.bot_id || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="Thread">{{ rakazoProjectState?.mapping?.thread_id || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="Computer">{{ rakazoProjectState?.mapping?.computer_id || rakazoProjectState?.computer?.botId || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="模型路由">{{ rakazoProjectState?.mapping?.model_route_id || '-' }}</el-descriptions-item>
+                <el-descriptions-item label="路由指纹"><code>{{ rakazoProjectState?.mapping?.model_route_fingerprint || '-' }}</code></el-descriptions-item>
+                <el-descriptions-item label="运行时版本">{{ rakazoProjectState?.mapping?.runtime_version || '-' }}</el-descriptions-item>
+              </el-descriptions>
+
+              <el-divider content-position="left">Computer</el-divider>
+              <pre class="drawer-json">{{ JSON.stringify(rakazoProjectState?.computer || {}, null, 2) }}</pre>
+              <div class="drawer-actions">
+                <el-button size="small" @click="rakazoComputerAction('boot')">启动</el-button>
+                <el-button size="small" @click="rakazoComputerAction('restart')">重启</el-button>
+                <el-button size="small" type="danger" plain @click="rakazoComputerAction('stop')">停止</el-button>
+              </div>
+
+              <el-divider content-position="left">Memory</el-divider>
+              <pre class="drawer-json">{{ JSON.stringify(rakazoMemory || {}, null, 2) }}</pre>
+
+              <el-divider content-position="left">项目权限</el-divider>
+              <el-form v-if="rakazoPermissions" label-width="120px">
+                <el-form-item label="项目读取"><el-switch v-model="rakazoPermissions.projectRead" :disabled="rakazoPermissionSaving" @change="(value) => saveRakazoPermissions('projectRead', value)" /></el-form-item>
+                <el-form-item label="项目写入"><el-switch v-model="rakazoPermissions.projectWrite" :disabled="rakazoPermissionSaving" @change="(value) => saveRakazoPermissions('projectWrite', value)" /></el-form-item>
+                <el-form-item label="命令执行">
+                  <el-switch
+                    v-model="rakazoPermissions.commandExecution"
+                    :disabled="rakazoPermissionSaving || rakazoPermissions.commandSupported === false"
+                    @change="(value) => saveRakazoPermissions('commandExecution', value)"
+                  />
+                  <span class="permission-note">{{ rakazoPermissions.commandExecution ? '容器内命令已授权' : '关闭时每次 shell 调用需审批' }}</span>
+                </el-form-item>
+                <el-form-item label="外部网络">
+                  <el-switch
+                    v-model="rakazoPermissions.externalNetwork"
+                    :disabled="rakazoPermissionSaving || rakazoPermissions.externalNetworkSupported === false"
+                    @change="(value) => saveRakazoPermissions('externalNetwork', value)"
+                  />
+                  <span class="permission-note">{{ rakazoPermissions.externalNetwork ? '项目私有网络可访问外网' : 'Docker internal 网络已阻断外网' }}</span>
+                </el-form-item>
+                <div class="permission-note">{{ rakazoPermissions.permissionNote }}</div>
+              </el-form>
+
+              <el-divider content-position="left">最近审计日志</el-divider>
+              <el-timeline>
+                <el-timeline-item v-for="item in rakazoLogs" :key="item.id" :timestamp="formatDate(item.created_at)" :type="item.status === 'success' ? 'success' : 'danger'">
+                  <strong>{{ item.action }}</strong>
+                  <pre class="drawer-log-detail">{{ JSON.stringify(item.detail || {}, null, 2) }}</pre>
+                </el-timeline-item>
+              </el-timeline>
+            </div>
+          </el-drawer>
 
           <!-- 生成技能对话框（优先 find-skills，再按需走 skill-creator） -->
           <el-dialog v-model="showSkillDialog" title="生成技能" width="520px">
@@ -1038,6 +1281,100 @@ const inputRef = ref(null)
 const fileInputRef = ref(null)
 const conversationTitleRefreshTimers = new Map()
 
+const parseRuntimeMetadata = (conversation) => {
+  const raw = conversation?.runtime_metadata
+  if (raw && typeof raw === 'object') return raw
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw)
+      return parsed && typeof parsed === 'object' ? parsed : {}
+    } catch {}
+  }
+  return {}
+}
+const conversationRuntimeMetadata = computed(() => parseRuntimeMetadata(currentConversation.value))
+const conversationExecutor = computed(() => String(currentConversation.value?.executor || 'opencode').toLowerCase())
+const isRakazoConversation = computed(() => conversationExecutor.value === 'rakazo')
+const isConversationExecutorLocked = computed(() => Boolean(conversationRuntimeMetadata.value.executorLocked) || isRakazoConversation.value)
+const rakazoProjectId = computed(() => String(conversationRuntimeMetadata.value.projectId || ''))
+const executorLabel = (executor) => ({ opencode: 'OpenCode', codex: 'Codex', rakazo: 'Rakazo' }[executor] || executor || 'OpenCode')
+
+const showNewConversationDialog = ref(false)
+const creatingConversation = ref(false)
+const newConversationRakazoExists = ref(false)
+const newConversationForm = ref({ executor: 'opencode', project_dir: '', route_id: '' })
+const executorOptions = [
+  { id: 'opencode', name: 'OpenCode', description: '默认主链，使用 OpenCode Agent 与完整工具生态。' },
+  { id: 'codex', name: 'Codex', description: '官方 Codex Agent Harness，执行器在创建后固定。' },
+  { id: 'rakazo', name: 'Rakazo', description: '恢复项目唯一 Bot、Thread、Computer 与长期记忆。' },
+]
+const handoffDialogVisible = ref(false)
+const handoffPreviewLoading = ref(false)
+const handoffCommitting = ref(false)
+const handoffModelsLoading = ref(false)
+const handoffModels = ref([])
+const handoffRakazoExists = ref(false)
+const handoffForm = ref({
+  source_conversation_id: null,
+  source_title: '',
+  source_executor: 'opencode',
+  target_executor: 'codex',
+  project_dir: '',
+  route_id: '',
+  summary: '',
+})
+const handoffTargetOptions = computed(() => executorOptions.filter((item) => item.id !== handoffForm.value.source_executor))
+const pickInitialRakazoModel = (items, preferredId = '') => {
+  const selectable = (Array.isArray(items) ? items : []).filter((item) => item?.selectable !== false && item?.runnable !== false)
+  const preferred = normalizeModelId(preferredId)
+  return selectable.find((item) => normalizeModelId(item.id) === preferred)
+    || selectable.find((item) => item.compatibilityStatus === 'verified')
+    || selectable[0]
+    || null
+}
+const newConversationInitialModel = computed(() => {
+  if (newConversationRakazoExists.value) {
+    return availableModels.value.find((item) => item.id === newConversationForm.value.route_id) || null
+  }
+  return pickInitialRakazoModel(availableModels.value, newConversationForm.value.route_id || selectedModel.value)
+})
+const newConversationInitialModelLabel = computed(() => {
+  const model = newConversationInitialModel.value
+  return model?.model || model?.name || model?.id || 'OpenCode 当前已验证模型'
+})
+const canCreateConversation = computed(() => {
+  if (newConversationForm.value.executor !== 'rakazo') return true
+  if (!newConversationForm.value.project_dir) return false
+  if (newConversationRakazoExists.value) return true
+  return Boolean(newConversationInitialModel.value)
+})
+const canCommitHandoff = computed(() => {
+  if (!handoffForm.value.source_conversation_id || !handoffForm.value.summary.trim()) return false
+  if (handoffForm.value.target_executor === handoffForm.value.source_executor) return false
+  if (handoffForm.value.target_executor !== 'rakazo') return true
+  if (!handoffForm.value.project_dir) return false
+  return handoffRakazoExists.value || Boolean(handoffForm.value.route_id)
+})
+
+const rakazoDrawerVisible = ref(false)
+const rakazoDrawerLoading = ref(false)
+const rakazoModelSwitching = ref(false)
+const rakazoProjectState = ref(null)
+const rakazoMemory = ref(null)
+const rakazoLogs = ref([])
+const rakazoPermissions = ref(null)
+const rakazoPermissionSaving = ref(false)
+const rakazoComputerStateLabel = computed(() => {
+  const state = String(rakazoProjectState.value?.computer?.state || '').toLowerCase()
+  return ({
+    running: 'Computer 运行中',
+    suspended: 'Computer 已挂起',
+    stopped: 'Computer 已停止',
+    starting: 'Computer 启动中',
+    busy: 'Computer 忙碌',
+  })[state] || 'Computer 状态未知'
+})
+
 const isPlaceholderConversationTitle = (title) => {
   const normalized = String(title || '').trim()
   return !normalized || normalized === '新对话'
@@ -1147,7 +1484,7 @@ const projectDirName = computed(() => {
 })
 watch(currentProjectDir, async (val, oldVal) => {
   // 当项目目录变化时，同步到后端对话记录
-  if (currentConversationId.value && val !== oldVal) {
+  if (currentConversationId.value && val !== oldVal && !isRakazoConversation.value) {
     try {
       await axios.patch(`/api/chat/conversations/${currentConversationId.value}/project_dir`, {
         project_dir: val || null
@@ -1486,6 +1823,13 @@ const codexEnabled = ref(false)
 const obsidianEnabled = ref(false)
 
 const chatTarget = computed(() => {
+  if (isRakazoConversation.value) return 'rakazo'
+  if (isConversationExecutorLocked.value && conversationExecutor.value === 'codex') {
+    return obsidianEnabled.value ? 'codex_obsidian' : 'codex'
+  }
+  if (isConversationExecutorLocked.value && conversationExecutor.value === 'opencode') {
+    return obsidianEnabled.value ? 'obsidian' : 'codebot'
+  }
   if (codexEnabled.value && obsidianEnabled.value) return 'codex_obsidian'
   if (codexEnabled.value) return 'codex'
   if (obsidianEnabled.value) return 'obsidian'
@@ -1500,20 +1844,35 @@ const isCodexChatTarget = (target) => {
 const applyConversationTargetState = (conversationId) => {
   const state = loadConversationTargetMap()[String(conversationId)] || {}
   const target = state.target || 'codebot'
+  const persistedExecutor = conversationExecutor.value
+  const locked = isConversationExecutorLocked.value
   applyingConversationUiState = true
   try {
-    codexEnabled.value = Boolean(state.codex_enabled ?? isCodexChatTarget(target))
-    obsidianEnabled.value = Boolean(state.obsidian_enabled ?? (target === 'obsidian' || String(target || '').includes('obsidian') || (state.knowledge_bases || []).length > 0))
+    codexEnabled.value = locked ? persistedExecutor === 'codex' : Boolean(state.codex_enabled ?? isCodexChatTarget(target))
+    obsidianEnabled.value = persistedExecutor === 'rakazo'
+      ? false
+      : Boolean(state.obsidian_enabled ?? (target === 'obsidian' || String(target || '').includes('obsidian') || (state.knowledge_bases || []).length > 0))
     selectedKnowledgeBases.value = Array.isArray(state.knowledge_bases) ? state.knowledge_bases : []
     agentMode.value = state.mode || localStorage.getItem(AGENT_MODE_KEY) || 'build'
-    const model = normalizeModelId(state.model || localStorage.getItem(LAST_MODEL_KEY) || selectedModel.value || '')
+    const model = persistedExecutor === 'rakazo'
+      ? ''
+      : normalizeModelId(state.model || localStorage.getItem(LAST_MODEL_KEY) || selectedModel.value || '')
     selectedModel.value = model
     selectedReasoningEffort.value = state.reasoning_effort || ''
     ensureSelectedModelOption(model)
   } finally {
-    nextTick(() => {
+    nextTick(async () => {
       applyingConversationUiState = false
-      loadModels()
+      if (persistedExecutor === 'rakazo') {
+        await loadRakazoProjectState()
+        await loadModels({ rakazo: true })
+        const routeId = rakazoProjectState.value?.mapping?.model_route_id || ''
+        applyingConversationUiState = true
+        selectedModel.value = routeId
+        nextTick(() => { applyingConversationUiState = false })
+      } else {
+        loadModels()
+      }
     })
   }
 }
@@ -1552,6 +1911,10 @@ const resetCurrentConversationTargetState = () => {
 }
 
 const toggleCodexMode = async () => {
+  if (isConversationExecutorLocked.value) {
+    ElMessage.warning('该对话的执行器已固定，请从“新建对话”选择其他执行器')
+    return
+  }
   codexEnabled.value = !codexEnabled.value
   selectedReasoningEffort.value = ''
   saveCurrentConversationTargetState()
@@ -1797,7 +2160,7 @@ const syncChatDefaultModel = async (modelId) => {
   } catch {}
 }
 
-watch(selectedModel, (val) => {
+watch(selectedModel, async (val, previous) => {
   const normalized = normalizeModelId(val)
   if (normalized && normalized !== val) {
     selectedModel.value = normalized
@@ -1805,6 +2168,33 @@ watch(selectedModel, (val) => {
   }
   ensureSelectedModelOption(normalized)
   if (applyingConversationUiState) return
+  if (isRakazoConversation.value) {
+    const projectId = rakazoProjectId.value
+    const currentRoute = rakazoProjectState.value?.mapping?.model_route_id || ''
+    if (!projectId || !val || val === currentRoute) return
+    if (currentLoading.value) {
+      ElMessage.warning('Rakazo 正在执行任务，模型只能在空闲状态切换')
+      applyingConversationUiState = true
+      selectedModel.value = currentRoute || previous || ''
+      nextTick(() => { applyingConversationUiState = false })
+      return
+    }
+    try {
+      rakazoModelSwitching.value = true
+      await axios.put(`/api/rakazo/projects/${projectId}/model`, { route_id: val })
+      await loadRakazoProjectState()
+      await loadModels({ rakazo: true })
+      ElMessage.success('Rakazo 模型已切换；历史轮次仍保留原路由快照')
+    } catch (error) {
+      applyingConversationUiState = true
+      selectedModel.value = currentRoute || previous || ''
+      nextTick(() => { applyingConversationUiState = false })
+      ElMessage.error(error?.response?.data?.detail || '切换 Rakazo 模型失败')
+    } finally {
+      rakazoModelSwitching.value = false
+    }
+    return
+  }
   if (val) {
     localStorage.setItem(LAST_MODEL_KEY, val)
   } else {
@@ -1835,8 +2225,22 @@ const reasoningEffortLabel = (effort) => ({
   none: '关闭', minimal: '最少', low: '低', medium: '中', high: '高', xhigh: '超高', max: '最大', ultra: '自动委派'
 }[effort] || effort)
 
+const rakazoModelStatusLabel = (status, probeState = '') => {
+  if (status === 'verified') return '已自动验证'
+  if (status === 'probe_failed' && probeState === 'unprobed') return '首次使用自动验证'
+  if (status === 'probe_failed' && probeState === 'failed') return '上次失败，选择后重试'
+  return ({
+    authorization_required: '当前连接不可安全代理',
+    protocol_pending: '协议待适配',
+    probe_failed: '首次使用自动验证',
+  }[status] || status || '首次使用自动验证')
+}
+
 const modelProviderLabel = (model) => {
-  if (model?.runnable === false) return `${model?.provider || '模型'} · Codex 不兼容`
+  if (isRakazoConversation.value) {
+    return `${model?.provider || '模型'} · ${rakazoModelStatusLabel(model?.compatibilityStatus, model?.probeState)}`
+  }
+  if (model?.runnable === false) return `${model?.provider || '模型'} · 当前执行器不可用`
   if (model?.source === 'opencode') {
     const protocol = String(model?.protocol || '')
     const transport = protocol === 'chat-completions-bridge'
@@ -1928,7 +2332,7 @@ const isIndeterminate = computed(() => {
   return selectedConvIds.value.length > 0 && selectedConvIds.value.length < deletableConversations.value.length
 })
 
-const deletableConversations = computed(() => conversations.value.filter((conv) => !isMultiAgentHub(conv)))
+const deletableConversations = computed(() => conversations.value.filter((conv) => !isMultiAgentHub(conv) && conv.executor !== 'rakazo'))
 
 watch(selectedConvIds, (val) => {
   selectAll.value = val.length === deletableConversations.value.length && deletableConversations.value.length > 0
@@ -2040,7 +2444,8 @@ const notifyActionRequiredEvent = (event) => {
   const key = event.request_id || event?.data?.id || event?.data?.requestID || `${event.event_type}:${event.summary}`
   if (!key || actionRequiredEventSeen.value[key]) return
   actionRequiredEventSeen.value = { ...actionRequiredEventSeen.value, [key]: true }
-  const sourceLabel = eventSourceName(event) === 'codex' ? 'Codex' : 'OpenCode'
+  const source = eventSourceName(event)
+  const sourceLabel = source === 'rakazo' ? 'Rakazo' : source === 'codex' ? 'Codex' : 'OpenCode'
   ElMessage({
     type: 'warning',
     message: event.summary || `${sourceLabel} 正在等待你的选择`,
@@ -2057,7 +2462,7 @@ const looksLikeCliOutput = (content = '') => {
 
 const isCliDisplayMessage = (msg) => {
   if (msg?.role !== 'assistant') return false
-  if (msg?.source === 'codex') return false
+  if (msg?.source === 'codex' || msg?.source === 'rakazo') return false
   return Boolean(msg.cli_display || (opencodeCliDisplay.value && looksLikeCliOutput(msg.content)))
 }
 
@@ -2070,6 +2475,12 @@ const attachCliActionEvent = (assistantMsg, event) => {
 
 const shouldShowStructuredEvent = (event) => {
   if (!event) return false
+  if (eventSourceName(event) === 'rakazo') {
+    return [
+      'model.route', 'reasoning.delta', 'tool.started', 'tool.updated', 'tool.completed',
+      'computer.updated', 'memory.updated', 'permission.requested', 'usage'
+    ].includes(event?.event_type)
+  }
   if (
     eventSourceName(event) === 'codex'
     && ['session.status', 'session.idle', 'session.trace', 'session.retry', 'model.route'].includes(event?.event_type)
@@ -2251,6 +2662,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
   if (currentConversationId.value !== conversationId) return
   const seen = new Set(runtimeEventSeqSeen.value[conversationId] || [])
   const runtimeHasCodex = (events || []).some((event) => eventSourceName(event) === 'codex' || event?.source === 'codex')
+  const runtimeHasRakazo = (events || []).some((event) => eventSourceName(event) === 'rakazo' || event?.source === 'rakazo')
   let assistantMsg = null
   const newEventMsgs = []
   for (const event of (events || [])) {
@@ -2260,7 +2672,7 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
     if (event?.type === 'tool_event' || event?.type === 'meta_event') {
       resolvePendingActionEvents(conversationId, event)
       const eventSource = String(event?.source || event?.data?.source || '').toLowerCase()
-      const forceStructuredEvent = eventSource === 'codex' && !event?.requires_user_action
+      const forceStructuredEvent = ['codex', 'rakazo'].includes(eventSource) && !event?.requires_user_action
       if (shouldUseChatEventPanel(event)) {
         assistantMsg = assistantMsg || ensureRuntimeAssistant(conversationId)
         upsertStructuredEventMessage(conversationId, event, assistantMsg)
@@ -2341,6 +2753,9 @@ const applyRuntimeEvents = (conversationId, events, runtimeContent, running) => 
   if (assistantMsg) {
     if (runtimeHasCodex) {
       assistantMsg.source = 'codex'
+      assistantMsg.cli_display = false
+    } else if (runtimeHasRakazo) {
+      assistantMsg.source = 'rakazo'
       assistantMsg.cli_display = false
     }
     if (typeof runtimeContent === 'string' && runtimeContent) {
@@ -2464,14 +2879,23 @@ const loadConversations = async (autoSelect = false) => {
 // 加载可用模型列表
 const loadModels = async (options = {}) => {
   const manual = Boolean(options?.manual)
+  const useRakazo = Boolean(options?.rakazo || isRakazoConversation.value)
   modelsLoading.value = true
   try {
-    const res = await axios.get(codexEnabled.value ? '/api/codex/models' : '/api/chat/models')
+    const res = await axios.get(useRakazo ? '/api/rakazo/models' : codexEnabled.value ? '/api/codex/models' : '/api/chat/models', {
+      // Rakazo 直接镜像 OpenCode 当前连接的可选目录。未探测路由可以选择，
+      // 后端会在首次创建/切换时自动做真实文本、流式与工具门禁。
+      params: useRakazo
+        ? { refresh: manual ? true : undefined }
+        : undefined,
+    })
     if (manual && res.data?.success === false) {
       ElMessage.error(res.data?.message || '刷新模型列表失败')
     }
     const rawData = res.data?.data
-    const raw = codexEnabled.value
+    const raw = useRakazo
+      ? (Array.isArray(rawData) ? rawData : (rawData?.models || []))
+      : codexEnabled.value
       ? (Array.isArray(rawData) ? rawData : rawData?.models || [])
       : (rawData?.models || [])
     const newList = raw.map(m => {
@@ -2485,26 +2909,35 @@ const loadModels = async (options = {}) => {
         provider,
         model,
         source: m.source || '',
-        runnable: m.runnable !== false,
+        runnable: useRakazo ? m.selectable !== false : m.runnable !== false,
+        selectable: useRakazo ? m.selectable !== false : m.runnable !== false,
         protocol: m.protocol || '',
         transport: m.transport || '',
+        compatibilityStatus: m.compatibilityStatus || '',
+        probeState: m.probeState || '',
+        probeRequired: Boolean(m.probeRequired),
+        incompatibilityReason: m.incompatibilityReason || '',
+        routeFingerprint: m.routeFingerprint || '',
+        lastProbeAt: m.lastProbeAt || null,
         supportedReasoningEfforts: m.supportedReasoningEfforts || m.supported_reasoning_efforts || [],
       }
     }).filter(m => m.id)
 
     // 如果用户有已保存的模型，且新列表中没有对应条目，则保留一个占位条目以避免 el-select 显示空值
-    const saved = normalizeModelId(selectedModel.value)
+    const saved = useRakazo
+      ? normalizeModelId(rakazoProjectState.value?.mapping?.model_route_id || selectedModel.value)
+      : normalizeModelId(selectedModel.value)
     if (saved && saved !== selectedModel.value) {
       selectedModel.value = saved
     }
     if (saved && !newList.find(m => m.id === saved)) {
-      if (codexEnabled.value && saved.includes('/')) {
+      if (!useRakazo && codexEnabled.value && saved.includes('/')) {
         // 当前运行时没有返回该旧 OpenCode 模型时清空选择，阻止它误落到
         // ChatGPT 账号通道；支持桥接的 Chat/Anthropic 模型会正常出现在 newList。
         selectedModel.value = ''
         localStorage.removeItem(LAST_MODEL_KEY)
         ElMessage.warning(`模型 ${saved} 不支持 Codex Responses，已切换为 Codex 默认模型；关闭 Codex 后仍可继续使用原模型。`)
-      } else {
+      } else if (!useRakazo) {
         newList.push(makeModelOption(saved, { runnable: false, source: 'saved' }))
       }
     }
@@ -2514,7 +2947,7 @@ const loadModels = async (options = {}) => {
     }
   } catch {
     // 加载失败时，如果有已保存模型，保留其占位条目
-    const saved = normalizeModelId(selectedModel.value)
+    const saved = useRakazo ? '' : normalizeModelId(selectedModel.value)
     if (saved && saved !== selectedModel.value) {
       selectedModel.value = saved
     }
@@ -2552,16 +2985,339 @@ const refreshThirdPartyConnections = async () => {
   }
 }
 
-// 创建新对话
-const createNewConversation = async () => {
+const loadRakazoProjectState = async () => {
+  if (!rakazoProjectId.value) {
+    rakazoProjectState.value = null
+    return
+  }
   try {
-    const response = await axios.post('/api/chat/conversations')
-    const conversation = response.data.data
-    conversations.value.unshift(conversation)
-    await selectConversation(conversation.id)
-    resetCurrentConversationTargetState()
+    const response = await axios.get(`/api/rakazo/projects/${rakazoProjectId.value}`)
+    rakazoProjectState.value = response.data?.data || null
   } catch (error) {
-    ElMessage.error('创建对话失败')
+    rakazoProjectState.value = null
+    if (isRakazoConversation.value) ElMessage.error(error?.response?.data?.detail || '加载 Rakazo 项目状态失败')
+  }
+}
+
+const lookupNewRakazoProject = async () => {
+  newConversationRakazoExists.value = false
+  if (newConversationForm.value.executor !== 'rakazo' || !newConversationForm.value.project_dir) return
+  try {
+    const response = await axios.get('/api/rakazo/projects/lookup', { params: { project_dir: newConversationForm.value.project_dir } })
+    const data = response.data?.data || {}
+    newConversationRakazoExists.value = Boolean(data.exists)
+    if (data.project?.model_route_id) newConversationForm.value.route_id = data.project.model_route_id
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || '检查 Rakazo 项目失败')
+  }
+}
+
+const selectNewExecutor = async (executor) => {
+  const preferredModel = normalizeModelId(selectedModel.value)
+  newConversationForm.value.executor = executor
+  newConversationRakazoExists.value = false
+  newConversationForm.value.route_id = ''
+  if (executor === 'rakazo') {
+    await loadModels({ rakazo: true })
+    newConversationForm.value.route_id = pickInitialRakazoModel(availableModels.value, preferredModel)?.id || ''
+    await lookupNewRakazoProject()
+  }
+}
+
+const openNewConversationDialog = () => {
+  newConversationForm.value = { executor: 'opencode', project_dir: '', route_id: '' }
+  newConversationRakazoExists.value = false
+  showNewConversationDialog.value = true
+}
+
+const selectNewConversationProject = async () => {
+  let value = ''
+  if (window.electronAPI?.selectFolder) {
+    value = await window.electronAPI.selectFolder({ title: '选择新对话的项目文件夹' })
+  } else {
+    try {
+      const result = await ElMessageBox.prompt('请输入项目文件夹完整路径', '选择项目', {
+        inputValue: newConversationForm.value.project_dir,
+        confirmButtonText: '确定',
+        cancelButtonText: '取消',
+      })
+      value = result.value?.trim() || ''
+    } catch {
+      return
+    }
+  }
+  if (!value) return
+  newConversationForm.value.project_dir = value
+  await lookupNewRakazoProject()
+}
+
+// 创建普通固定执行器对话，或打开/恢复项目唯一的 Rakazo 主会话。
+const createNewConversation = async () => {
+  if (!canCreateConversation.value) return
+  creatingConversation.value = true
+  try {
+    let response
+    if (newConversationForm.value.executor === 'rakazo') {
+      response = await axios.post('/api/rakazo/projects/open', {
+        project_dir: newConversationForm.value.project_dir,
+        route_id: newConversationForm.value.route_id || null,
+      })
+    } else {
+      response = await axios.post('/api/chat/conversations', {
+        title: '新对话',
+        project_dir: newConversationForm.value.project_dir || null,
+        conversation_type: 'normal',
+        executor: newConversationForm.value.executor,
+      })
+    }
+    const conversation = newConversationForm.value.executor === 'rakazo'
+      ? response.data?.data?.conversation
+      : response.data?.data
+    if (!conversation?.id) throw new Error('后端未返回对话 ID')
+    showNewConversationDialog.value = false
+    await loadConversations()
+    await selectConversation(conversation.id)
+    ElMessage.success(response.data?.message || '对话已创建')
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || error?.message || '创建对话失败')
+  } finally {
+    creatingConversation.value = false
+  }
+}
+
+const loadHandoffPreview = async () => {
+  if (!handoffForm.value.source_conversation_id) return
+  handoffPreviewLoading.value = true
+  try {
+    const response = await axios.post('/api/chat/handoff/preview', {
+      source_conversation_id: handoffForm.value.source_conversation_id,
+      target_executor: handoffForm.value.target_executor,
+    })
+    const data = response.data?.data || {}
+    handoffForm.value.summary = data.summary || ''
+    if (!handoffForm.value.project_dir) handoffForm.value.project_dir = data.projectDir || ''
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || '生成交接摘要失败')
+  } finally {
+    handoffPreviewLoading.value = false
+  }
+}
+
+const loadHandoffModels = async () => {
+  handoffModelsLoading.value = true
+  try {
+    const response = await axios.get('/api/rakazo/models', {
+      params: { offset: 0, limit: 200 },
+    })
+    const payload = response.data?.data || {}
+    const catalog = Array.isArray(payload) ? payload : (payload.models || [])
+    handoffModels.value = catalog.filter((model) => model?.selectable !== false)
+    if (!handoffForm.value.route_id) {
+      handoffForm.value.route_id = pickInitialRakazoModel(handoffModels.value, selectedModel.value)?.id || ''
+    }
+  } catch (error) {
+    handoffModels.value = []
+    ElMessage.error(error?.response?.data?.detail || '加载 OpenCode 当前可用模型失败')
+  } finally {
+    handoffModelsLoading.value = false
+  }
+}
+
+const lookupHandoffRakazoProject = async () => {
+  handoffRakazoExists.value = false
+  if (handoffForm.value.target_executor !== 'rakazo' || !handoffForm.value.project_dir) return
+  try {
+    const response = await axios.get('/api/rakazo/projects/lookup', {
+      params: { project_dir: handoffForm.value.project_dir },
+    })
+    const data = response.data?.data || {}
+    handoffRakazoExists.value = Boolean(data.exists)
+    if (data.project?.model_route_id) handoffForm.value.route_id = data.project.model_route_id
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || '检查 Rakazo 主会话失败')
+  }
+}
+
+const selectHandoffExecutor = async (executor) => {
+  if (!executor || executor === handoffForm.value.source_executor) return
+  handoffForm.value.target_executor = executor
+  handoffForm.value.route_id = ''
+  handoffRakazoExists.value = false
+  await loadHandoffPreview()
+  if (executor === 'rakazo') {
+    await loadHandoffModels()
+    await lookupHandoffRakazoProject()
+  }
+}
+
+const openHandoffDialog = async (conversation) => {
+  const sourceExecutor = String(conversation?.executor || 'opencode').toLowerCase()
+  const targetExecutor = executorOptions.find((item) => item.id !== sourceExecutor)?.id || 'opencode'
+  handoffForm.value = {
+    source_conversation_id: conversation?.id || null,
+    source_title: conversation?.title || '新对话',
+    source_executor: sourceExecutor,
+    target_executor: targetExecutor,
+    project_dir: conversation?.project_dir || '',
+    route_id: '',
+    summary: '',
+  }
+  handoffModels.value = []
+  handoffRakazoExists.value = false
+  handoffDialogVisible.value = true
+  await loadHandoffPreview()
+  if (targetExecutor === 'rakazo') {
+    await loadHandoffModels()
+    await lookupHandoffRakazoProject()
+  }
+}
+
+const selectHandoffProject = async () => {
+  let value = ''
+  if (window.electronAPI?.selectFolder) {
+    value = await window.electronAPI.selectFolder({ title: '选择交接目标项目文件夹' })
+  } else {
+    try {
+      const result = await ElMessageBox.prompt('请输入项目文件夹完整路径', '选择交接项目', {
+        inputValue: handoffForm.value.project_dir,
+        confirmButtonText: '确定',
+        cancelButtonText: '取消',
+      })
+      value = result.value?.trim() || ''
+    } catch {
+      return
+    }
+  }
+  if (!value) return
+  handoffForm.value.project_dir = value
+  handoffForm.value.route_id = pickInitialRakazoModel(handoffModels.value, selectedModel.value)?.id || ''
+  await lookupHandoffRakazoProject()
+}
+
+const commitHandoff = async () => {
+  if (!canCommitHandoff.value) return
+  handoffCommitting.value = true
+  let targetConversationId = null
+  try {
+    let conversation
+    let rakazoRoute = ''
+    if (handoffForm.value.target_executor === 'rakazo') {
+      const response = await axios.post('/api/rakazo/projects/open', {
+        project_dir: handoffForm.value.project_dir,
+        route_id: handoffForm.value.route_id || null,
+      })
+      conversation = response.data?.data?.conversation
+      rakazoRoute = response.data?.data?.project?.model_route_id || handoffForm.value.route_id || ''
+    } else {
+      const response = await axios.post('/api/chat/conversations', {
+        title: `交接 · ${handoffForm.value.source_title || '新对话'}`,
+        project_dir: handoffForm.value.project_dir || null,
+        conversation_type: 'normal',
+        executor: handoffForm.value.target_executor,
+      })
+      conversation = response.data?.data
+    }
+    if (!conversation?.id) throw new Error('目标执行器没有返回会话 ID')
+    targetConversationId = conversation.id
+
+    const summary = handoffForm.value.summary.trim()
+    await axios.post(`/api/chat/conversations/${targetConversationId}/messages`, { content: summary })
+    const target = handoffForm.value.target_executor === 'opencode' ? 'codebot' : handoffForm.value.target_executor
+    const execution = await axios.post('/api/chat/send', {
+      conversation_id: targetConversationId,
+      message: summary,
+      model: handoffForm.value.target_executor === 'rakazo' ? rakazoRoute : null,
+      mode: handoffForm.value.target_executor === 'rakazo' ? null : 'agent',
+      project_dir: handoffForm.value.project_dir || null,
+      target,
+      user_already_saved: true,
+    })
+    handoffDialogVisible.value = false
+    await loadConversations()
+    await selectConversation(targetConversationId)
+    ElMessage.success(execution.data?.data?.queued ? '交接摘要已写入目标会话并排队' : '执行器交接完成；原对话保持不变')
+  } catch (error) {
+    if (targetConversationId) {
+      await loadConversations()
+      await selectConversation(targetConversationId)
+    }
+    ElMessage.error(error?.response?.data?.detail || error?.message || '执行器交接失败')
+  } finally {
+    handoffCommitting.value = false
+  }
+}
+
+const openRakazoDrawer = () => {
+  rakazoDrawerVisible.value = true
+}
+
+const loadRakazoDrawer = async () => {
+  if (!rakazoProjectId.value) return
+  rakazoDrawerLoading.value = true
+  try {
+    const projectId = rakazoProjectId.value
+    const [projectResult, memoryResult, permissionsResult, logsResult] = await Promise.allSettled([
+      axios.get(`/api/rakazo/projects/${projectId}`),
+      axios.get(`/api/rakazo/projects/${projectId}/memory`),
+      axios.get(`/api/rakazo/projects/${projectId}/permissions`),
+      axios.get(`/api/rakazo/projects/${projectId}/logs`),
+    ])
+    if (projectResult.status === 'fulfilled') rakazoProjectState.value = projectResult.value.data?.data || null
+    if (memoryResult.status === 'fulfilled') rakazoMemory.value = memoryResult.value.data?.data || null
+    if (permissionsResult.status === 'fulfilled') rakazoPermissions.value = permissionsResult.value.data?.data || null
+    if (logsResult.status === 'fulfilled') rakazoLogs.value = logsResult.value.data?.data || []
+  } finally {
+    rakazoDrawerLoading.value = false
+  }
+}
+
+const saveRakazoPermissions = async (field, value) => {
+  if (!rakazoProjectId.value || !rakazoPermissions.value) return
+  const requested = Boolean(value)
+  if (requested && ['projectWrite', 'commandExecution', 'externalNetwork'].includes(field)) {
+    const descriptions = {
+      projectWrite: '允许 Rakazo 通过受控项目工具写入该项目',
+      commandExecution: '允许 Rakazo 在项目专属 Computer 容器内执行命令',
+      externalNetwork: '允许该项目 Computer 访问外部网络；切换会重建容器与私有网络，但保留 home 数据',
+    }
+    try {
+      await ElMessageBox.confirm(
+        `${descriptions[field]}。是否继续？`,
+        '确认项目权限',
+        { confirmButtonText: '确认开启', cancelButtonText: '取消', type: 'warning' },
+      )
+    } catch {
+      rakazoPermissions.value[field] = false
+      return
+    }
+  }
+  rakazoPermissionSaving.value = true
+  try {
+    const response = await axios.put(`/api/rakazo/projects/${rakazoProjectId.value}/permissions`, {
+      projectRead: Boolean(rakazoPermissions.value.projectRead),
+      projectWrite: Boolean(rakazoPermissions.value.projectWrite),
+      commandExecution: Boolean(rakazoPermissions.value.commandExecution),
+      externalNetwork: Boolean(rakazoPermissions.value.externalNetwork),
+      networkPolicy: rakazoPermissions.value.externalNetwork ? 'allow' : 'deny',
+    })
+    rakazoPermissions.value = response.data?.data || rakazoPermissions.value
+    ElMessage.success('Rakazo 项目权限已更新')
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || '更新 Rakazo 权限失败')
+    await loadRakazoDrawer()
+  } finally {
+    rakazoPermissionSaving.value = false
+  }
+}
+
+const rakazoComputerAction = async (action) => {
+  if (!rakazoProjectId.value) return
+  try {
+    await axios.post(`/api/rakazo/projects/${rakazoProjectId.value}/computer`, { action })
+    ElMessage.success('Computer 操作已提交')
+    await loadRakazoDrawer()
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || 'Computer 操作失败')
   }
 }
 
@@ -2646,6 +3402,14 @@ const toolEventLabel = (event) => {
     'session.retry': '自动重试',
     'session.error': '会话错误',
     'model.route': '模型路由',
+    'reasoning.delta': '推理',
+    'tool.started': '工具开始',
+    'tool.updated': '工具进度',
+    'tool.completed': '工具完成',
+    'computer.updated': 'Computer',
+    'memory.updated': '记忆更新',
+    'permission.requested': '等待确认',
+    'usage': '用量',
     'message.updated': '消息状态',
     'message.part.updated': '消息片段',
     'file.edited': '文件编辑',
@@ -2681,7 +3445,14 @@ const toolEventDetail = (event) => {
 }
 
 const classifyCodexEventClass = (event) => {
-  if ((event?.source || event?.data?.source || '').toLowerCase() !== 'codex') return ''
+  const source = (event?.source || event?.data?.source || '').toLowerCase()
+  if (source === 'rakazo') {
+    if (event?.event_type === 'model.route' || event?.event_type === 'computer.updated' || event?.event_type === 'memory.updated') return 'codex-status'
+    if (event?.event_type?.includes('reasoning')) return 'codex-trace'
+    if (event?.event_type?.startsWith('tool.')) return 'codex-tool'
+    return ''
+  }
+  if (source !== 'codex') return ''
   if (event?.event_type === 'session.idle') return 'codex-idle'
   if (event?.event_type === 'session.status') return 'codex-status'
   if (event?.event_type === 'model.route') return 'codex-status'
@@ -2966,7 +3737,8 @@ const permissionReplyLabel = (reply) => {
 const replyQuestion = async (event, actionOrReply) => {
   const action = typeof actionOrReply === 'string' ? { reply: actionOrReply } : (actionOrReply || {})
   const requestId = event?.request_id || event?.data?.id || event?.data?.requestID
-  const sourceLabel = (event?.source || event?.data?.source || '').toLowerCase() === 'codex' ? 'Codex' : 'OpenCode'
+  const source = eventSourceName(event)
+  const sourceLabel = source === 'rakazo' ? 'Rakazo' : source === 'codex' ? 'Codex' : 'OpenCode'
   if (!requestId) {
     ElMessage.error(`缺少${sourceLabel}问题请求 ID`)
     return false
@@ -3007,16 +3779,25 @@ const replyQuestion = async (event, actionOrReply) => {
   }
 
   event.replying = toolEventActionKey(action)
+  const secretReply = (event?.questions?.[0]?.input_type || event?.data?.questions?.[0]?.input_type || event?.data?.input_type || '').toLowerCase() === 'password'
   try {
     await axios.post('/api/chat/question/reply', payload)
     event.replied = true
-    event.summary = payload.reject ? '你已取消/先不回答' : `你已选择：${payload.answer || (payload.answers || []).map((group) => (group || []).join(', ')).join('；')}`
+    event.summary = payload.reject
+      ? '你已取消/先不回答'
+      : secretReply
+        ? '已安全提交敏感回答'
+        : `你已选择：${payload.answer || (payload.answers || []).map((group) => (group || []).join(', ')).join('；')}`
     event.actions = []
     clearQuestionPanelState(event)
-    ElMessage.success(payload.source === 'codex' ? '已回复 Codex' : '已回复 OpenCode')
+    if (secretReply) {
+      payload.answer = ''
+      payload.answers = []
+    }
+    ElMessage.success(`已回复 ${sourceLabel}`)
     return true
   } catch (error) {
-    ElMessage.error(error?.response?.data?.detail || (payload.source === 'codex' ? '回复 Codex 问题失败' : '回复 OpenCode 问题失败'))
+    ElMessage.error(error?.response?.data?.detail || `回复 ${sourceLabel} 问题失败`)
     return false
   } finally {
     event.replying = ''
@@ -3027,7 +3808,8 @@ const replyPermission = async (event, actionOrReply) => {
   const action = typeof actionOrReply === 'string' ? { reply: actionOrReply } : (actionOrReply || {})
   const reply = action.reply
   const requestId = event?.request_id || event?.data?.id || event?.data?.requestID || event?.data?.permissionID
-  const sourceLabel = eventSourceName(event) === 'codex' ? 'Codex' : 'OpenCode'
+  const source = eventSourceName(event)
+  const sourceLabel = source === 'rakazo' ? 'Rakazo' : source === 'codex' ? 'Codex' : 'OpenCode'
   if (!requestId) {
     ElMessage.error(`缺少 ${sourceLabel} 权限请求 ID`)
     return
@@ -3041,6 +3823,7 @@ const replyPermission = async (event, actionOrReply) => {
       session_id: event?.data?.sessionID || null,
       conversation_id: currentConversationId.value,
       project_dir: currentProjectDir.value || null,
+      source,
     })
     event.replied = reply
     event.summary = `你已选择：${permissionReplyLabel(reply)}`
@@ -3103,7 +3886,12 @@ const streamChatResponse = async (payload, onEvent) => {
     body: JSON.stringify(payload)
   })
   if (!response.ok || !response.body) {
-    throw new Error(`HTTP ${response.status}`)
+    let message = `HTTP ${response.status}`
+    try {
+      const body = await response.json()
+      message = body?.detail || body?.message || message
+    } catch {}
+    throw new Error(message)
   }
   const reader = response.body.getReader()
   const decoder = new TextDecoder('utf-8')
@@ -3141,6 +3929,7 @@ const sendMessage = async () => {
   const filesToSend = [...attachedFiles.value]
   const targetToSend = chatTarget.value || 'codebot'
   const isCodexTargetToSend = isCodexChatTarget(targetToSend)
+  const isRakazoTargetToSend = targetToSend === 'rakazo'
   const knowledgePathsToSend = obsidianEnabled.value
     ? selectedKnowledgeBases.value.map((item) => item.id || item.path).filter(Boolean)
     : []
@@ -3162,7 +3951,9 @@ const sendMessage = async () => {
       return
     }
     clearPendingQuestionEvent(pendingQuestionEvent)
-    ElMessage.warning(`上一个${(pendingQuestionEvent?.source || pendingQuestionEvent?.data?.source || '').toLowerCase() === 'codex' ? 'Codex' : 'OpenCode'}问题已失效，已按普通消息发送`)
+    const pendingSource = eventSourceName(pendingQuestionEvent)
+    const pendingSourceLabel = pendingSource === 'rakazo' ? 'Rakazo' : pendingSource === 'codex' ? 'Codex' : 'OpenCode'
+    ElMessage.warning(`上一个${pendingSourceLabel}问题已失效，已按普通消息发送`)
   }
 
   inputMessage.value = ''
@@ -3289,11 +4080,11 @@ const sendMessage = async () => {
     assistantMessage = {
       id: Date.now() + 1,
       role: 'assistant',
-      content: isCodexTargetToSend ? 'Codex Agent Harness 已启动，正在处理...' : '',
-      rawContent: isCodexTargetToSend ? 'Codex Agent Harness 已启动，正在处理...' : '',
+      content: isRakazoTargetToSend ? 'Rakazo 已连接主 Thread，正在处理...' : isCodexTargetToSend ? 'Codex Agent Harness 已启动，正在处理...' : '',
+      rawContent: isRakazoTargetToSend ? 'Rakazo 已连接主 Thread，正在处理...' : isCodexTargetToSend ? 'Codex Agent Harness 已启动，正在处理...' : '',
       tool_events: [],
-      cli_display: isCodexTargetToSend ? false : opencodeCliDisplay.value,
-      source: isCodexTargetToSend ? 'codex' : '',
+      cli_display: (isCodexTargetToSend || isRakazoTargetToSend) ? false : opencodeCliDisplay.value,
+      source: isRakazoTargetToSend ? 'rakazo' : isCodexTargetToSend ? 'codex' : '',
       pendingActionEvent: null,
       streaming: true,
       created_at: new Date().toISOString()
@@ -3358,7 +4149,7 @@ const sendMessage = async () => {
         if (event?.type === 'tool_event' || event?.type === 'meta_event') {
           resolvePendingActionEvents(conversationId, event)
           const eventSource = String(event?.source || event?.data?.source || '').toLowerCase()
-          const forceStructuredEvent = eventSource === 'codex' && !event?.requires_user_action
+          const forceStructuredEvent = ['codex', 'rakazo'].includes(eventSource) && !event?.requires_user_action
           if (shouldUseChatEventPanel(event)) {
             upsertStructuredEventMessage(conversationId, event, assistantMessage)
             scheduleStreamScroll()
@@ -3413,6 +4204,10 @@ const sendMessage = async () => {
 
     queuedCount.value = Math.max(0, queuedCount.value - 1)
     await loadConversations()
+    if (isRakazoTargetToSend) {
+      await loadRakazoProjectState()
+      if (rakazoDrawerVisible.value) await loadRakazoDrawer()
+    }
     // Force-restart title polling after stream ends (loadConversations may have started
     // a poll with default params; cancel it and restart with a longer 30s window to cover
     // slow AI title generation which can take up to 30s on the backend).
@@ -3493,22 +4288,36 @@ const undoFromMessage = async (msg) => {
 
 const deleteConversation = async (conversationId) => {
   try {
-    await ElMessageBox.confirm('确定删除这个对话吗？', '删除对话', {
-      confirmButtonText: '删除',
+    const conversation = conversations.value.find((item) => Number(item.id) === Number(conversationId))
+    const isRakazo = conversation?.executor === 'rakazo'
+    const message = isRakazo
+      ? [
+          '确定删除这个 Rakazo 项目主会话吗？',
+          '',
+          '将清理：Codebot 对话与消息、Rakazo Bot/Thread/长期记忆、项目 MCP、项目专属 Computer 容器、私有网络和 Computer home。',
+          '',
+          '不会删除：你的项目目录和文件、Docker Desktop、共享 Rakazo 运行时/Postgres、镜像及其他项目。',
+          '',
+          '此操作不可恢复。',
+        ].join('\n')
+      : '确定删除这个对话吗？'
+    await ElMessageBox.confirm(message, isRakazo ? '删除并清理 Rakazo 项目' : '删除对话', {
+      confirmButtonText: isRakazo ? '删除并清理' : '删除',
       cancelButtonText: '取消',
-      type: 'warning'
+      type: 'warning',
+      customClass: isRakazo ? 'rakazo-delete-confirm' : '',
     })
-    await axios.delete(`/api/chat/conversations/${conversationId}`)
+    const response = await axios.delete(`/api/chat/conversations/${conversationId}`)
     stopConversationTitleRefresh(conversationId)
     if (currentConversationId.value === conversationId) {
       currentConversationId.value = null
       messages.value = []
     }
     await loadConversations()
-    ElMessage.success('对话已删除')
+    ElMessage.success(response.data?.message || (isRakazo ? 'Rakazo 项目已完整清理' : '对话已删除'))
   } catch (error) {
     if (error !== 'cancel') {
-      ElMessage.error('删除对话失败')
+      ElMessage.error(error?.response?.data?.detail || '删除对话失败')
     }
   }
 }
@@ -3621,6 +4430,7 @@ const shareConversation = async (conversationId) => {
 
 const handleConversationCommand = async (conv, command) => {
   if (command === 'share') { await shareConversation(conv.id); return }
+  if (command === 'handoff') { await openHandoffDialog(conv); return }
   if (command === 'group') { await setGroupConversation(conv.id, true); return }
   if (command === 'ungroup') { await setGroupConversation(conv.id, false); return }
   if (command === 'rename') { await renameConversation(conv.id, conv.title); return }
@@ -4848,5 +5658,114 @@ onUnmounted(() => {
 .hint-cat::after {
   content: '·';
   margin-left: 3px;
+}
+
+.rakazo-session-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  background: linear-gradient(90deg, rgba(99, 102, 241, 0.1), rgba(139, 92, 246, 0.04));
+}
+
+.rakazo-session-identity {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.rakazo-session-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.rakazo-model-label {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+.rakazo-model-select {
+  width: min(430px, 48vw);
+  min-width: 220px;
+}
+.rakazo-route-alert { margin: 0 16px 10px; }
+
+.rakazo-source-badge { color: #6d5bd0; }
+
+.executor-picker {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.handoff-executor-picker { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 18px; }
+
+/* 交接摘要可能较长。弹窗必须始终留在当前视口内，让正文区域滚动，
+ * 避免在小屏桌面窗口中把“确认并交接”按钮挤到屏幕之外。 */
+:deep(.handoff-dialog) {
+  display: flex;
+  max-height: calc(100vh - 40px);
+  margin: 20px auto !important;
+  flex-direction: column;
+}
+:deep(.handoff-dialog .el-dialog__header),
+:deep(.handoff-dialog .el-dialog__footer) { flex: 0 0 auto; }
+:deep(.handoff-dialog .el-dialog__body) {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.executor-card {
+  display: flex;
+  min-height: 112px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px;
+  text-align: left;
+  color: var(--el-text-color-primary);
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: border-color 0.18s, box-shadow 0.18s, transform 0.18s;
+}
+
+.executor-card:hover { border-color: var(--el-color-primary-light-3); transform: translateY(-1px); }
+.executor-card.active { border-color: var(--el-color-primary); box-shadow: 0 0 0 2px var(--el-color-primary-light-8); }
+.executor-card-title { font-size: 16px; font-weight: 650; }
+.executor-card-desc { color: var(--el-text-color-secondary); font-size: 12px; line-height: 1.55; }
+.new-conversation-form { margin-top: 4px; }
+.field-tip { width: 100%; margin-top: 5px; color: var(--el-text-color-secondary); font-size: 12px; line-height: 1.5; }
+
+.rakazo-drawer-content { min-height: 420px; }
+.drawer-json, .drawer-log-detail {
+  padding: 10px;
+  overflow: auto;
+  color: var(--el-text-color-regular);
+  background: var(--el-fill-color-light);
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.drawer-json { max-height: 220px; }
+.drawer-log-detail { max-height: 140px; margin: 6px 0 0; font-size: 11px; }
+.drawer-actions { display: flex; gap: 8px; margin-top: 10px; }
+.permission-note { margin-left: 8px; color: var(--el-text-color-secondary); font-size: 12px; }
+
+@media (max-width: 760px) {
+  .executor-picker { grid-template-columns: 1fr; }
+  .rakazo-session-bar { align-items: stretch; flex-direction: column; }
+  .rakazo-session-identity { flex-wrap: wrap; }
+  .rakazo-session-controls { justify-content: flex-start; width: 100%; }
+  .rakazo-model-select { width: 100%; min-width: 0; }
+  :deep(.handoff-dialog) { width: calc(100vw - 24px) !important; }
 }
 </style>

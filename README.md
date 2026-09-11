@@ -4,7 +4,7 @@
 
 > 成长候选说明：聊天识别到定时任务创建意图后，会先生成可编辑的成长候选，只有用户接受后才加入调度器。顶部按钮会显示待审数量并自动更新；记忆候选会过滤临时任务信息并合并重复或近义内容。
 
-以 OpenCode 为默认主链、可选 Codex Agent Harness 的第三方能力工作台。Codebot 负责 MCP、Skills、记忆、定时任务、编排与统一界面。
+以 OpenCode 为默认主链，并提供可选 Codex Agent Harness 与 Rakazo 受控试运行执行器的第三方能力工作台。Codebot 负责 MCP、Skills、记忆、定时任务、编排与统一界面。
 
 发布版本通过 GitHub Actions 在每次推送到 `main` 后自动递增并发布到 Releases。
 
@@ -12,6 +12,7 @@
 
 - 🤖 **OpenCode 主控**: 所有聊天消息统一交给 OpenCode 处理，支持多模型切换与原生工具流式事件展示
 - 🧩 **Codex Agent Harness**: 可按对话切换到官方 `openai-codex` SDK/App Server，复用其线程、代码工具、沙箱、审批、Skills、MCP、模型与 ChatGPT 账号
+- 🧪 **Rakazo 原生执行器**: 在原聊天页按项目创建或恢复唯一 Bot、Thread、Computer 与主会话；使用受门禁的 OpenCode 模型纯采样桥，不嵌套第二个 OpenCode Agent 循环
 - 🔗 **Codebot 第三方化**: Codebot 自身以第三方 MCP 形式注册到 OpenCode，OpenCode 可直接调用 Codebot 的记忆、任务、技能与会话工具
 - 🧭 **自主执行策略**: 默认优先自主决策与自动重试，减少把流程决策抛给用户
 - 💾 **记忆系统**: SQLite + ChromaDB 持久化存储，支持上下文记忆和长期记忆
@@ -44,9 +45,12 @@ Codebot 保持现有主界面和本地可控架构，不复制第三方产品界
 - Node.js 18+
 - OpenCode CLI
   - `opencode serve` 建议监听 `http://127.0.0.1:11200`
+- Docker Desktop（仅启用 Rakazo 时需要；Windows 桌面版可在“设置 → Rakazo”选择磁盘后一键安装）
 ### 安装
 
 #### Windows
+
+正式安装包使用可选目录的向导安装，不再强制写入默认程序目录。Codebot 自带的后端、OpenCode、前端资源和适配器随程序放在所选目录；Rakazo 设置页还能单独选择 Docker 程序、镜像和 WSL 虚拟磁盘的大文件目录。Windows/WSL 系统组件、Chromium 小型用户配置等受系统约束的内容仍保留在系统位置。
 
 ```bash
 # 下载项目后，双击运行
@@ -238,6 +242,8 @@ codebot/
 │   ├── requirements.txt        # Python 依赖
 │   ├── core/                   # 核心业务逻辑
 │   │   ├── opencode_ws.py      # OpenCode HTTP 客户端
+│   │   ├── model_route_registry.py # Codex / Rakazo 共享 OpenCode 模型路由注册表
+│   │   ├── rakazo_runtime.py   # Rakazo 生命周期、映射、权限、探测与更新门禁
 │   │   ├── memory_manager.py   # SQLite + ChromaDB 记忆管理
 │   │   ├── memory_extractor.py # 自动记忆提取（对话中识别习惯/偏好）
 │   │   ├── memory_organizer.py # AI 驱动的每日记忆整理（合并/去重）
@@ -249,6 +255,7 @@ codebot/
 │   │       └── manager.py      # 沙箱生命周期 & 工作目录隔离执行
 │   ├── api/routes/             # REST API 路由
 │   │   ├── chat.py             # OpenCode 会话 API（Codebot 只负责转发、展示与存储）
+│   │   ├── rakazo.py           # Rakazo 公共 API、内部采样 API 与项目级 MCP
 │   │   ├── memory.py           # 记忆 CRUD & 搜索 API
 │   │   ├── scheduler.py        # 定时任务 API
 │   │   ├── skills.py           # 第三方技能管理与同步 API
@@ -269,6 +276,9 @@ codebot/
 │   │   ├── components/         # 可复用组件
 │   │   └── stores/             # Pinia 状态管理
 │   └── dist/                   # 构建输出（由后端静态托管）
+├── integrations/
+│   ├── rakazo/                 # Compose 安全覆盖与版本兼容清单
+│   └── rakazo-adapter/         # 不侵入 Rakazo 源码的 TypeScript 模型适配服务
 ├── electron/                   # Electron 桌面应用
 │   ├── main.js                 # 主进程：启动 Python 后端 & 打开窗口
 │   ├── preload.js              # IPC 桥接（剪贴板 API）
@@ -390,7 +400,7 @@ codebot/
 ### 1.2 Codex / Obsidian / VS Code / 文档入口
 
 - **Codex 模式**: 聊天页点击 `Codex` 后使用官方 `openai-codex==0.147.0` Python SDK 和随包 Codex runtime。设置页可切换 SDK 内置或本机自定义 binary、选择审批策略、管理额外 Skill 根目录，并查看 App Server、账号、订阅、用量、速率限制，以及 Codex 原生模型和兼容的 OpenCode 模型。ChatGPT 浏览器登录为默认方式，设备码为回退；API Key 只在用户主动选择时单次传给 App Server，不写入 Codebot 配置、不回传前端
-- **OpenCode 模型中间层**: Codex 官方自定义 provider 只接受 Responses 协议。Codebot 因此读取当前 OpenCode `/provider` 元数据并通过可扩展协议注册表分流：`@ai-sdk/openai` 以及同地址已证明支持 Responses 的模型由 Codex 直连；`@ai-sdk/openai-compatible`（包括用户添加的官方 `deepseek/deepseek-v4-flash`）由本机 Responses → Chat Completions 适配器转换；`@ai-sdk/anthropic` 由本机 Responses → Anthropic Messages 适配器转换。凡用户当前已接入 OpenCode 且属于这些协议的模型都会自动加入 Codex 模型列表，不区分 OpenCode 自带、官方 provider 或用户自定义 provider。中间层只做一次模型采样并翻译输入、工具调用和输出 item，不嵌套 OpenCode Agent 循环，所以线程、命令、文件工具、沙箱和审批仍全部由 Codex Harness 控制
+- **OpenCode 模型中间层**: Codex 官方自定义 provider 只接受 Responses 协议。Codebot 因此读取当前 OpenCode `/provider` 元数据并逐模型服从其 SDK/协议声明：`@ai-sdk/openai` 使用 Responses；`@ai-sdk/openai-compatible`（包括 `opencode-go` 下的 DeepSeek、GLM 等）由本机 Responses → Chat Completions 适配器转换；`@ai-sdk/anthropic` 由本机 Responses → Anthropic Messages 适配器转换。即使多个模型共用同一个上游地址，也不会因为其中一个支持 Responses 就猜测其他模型采用相同协议。凡用户当前已接入 OpenCode 且属于这些协议的模型都会自动加入 Codex 模型列表，不区分 OpenCode 自带、官方 provider 或用户自定义 provider。中间层只做一次模型采样并翻译输入、工具调用和输出 item，不嵌套 OpenCode Agent 循环，所以线程、命令、文件工具、沙箱和审批仍全部由 Codex Harness 控制
 - **协议覆盖边界**: “模型兼容”不是修改模型名称，而是转换真实上游 wire protocol。设置页会展示各适配协议的模型数量和不兼容数量；OpenCode 全目录中的 Google/Vertex/Bedrock 等原生协议只有在 Codebot 注册并测试对应的请求、鉴权、工具调用和响应适配器后才会启用。未知协议不会猜成 Chat Completions，更不会静默改用 ChatGPT 账号；这可避免界面选中 A 模型、实际却由 B 模型回答
 - **模型身份与路由**: 每个 Codex turn 开始都会产生宿主控制的 `model.route` 事件，显示用户选择的模型、实际上游模型 ID、provider 和直连/桥接方式；同一权威路由也会作为 developer instruction 注入。模型被问“你是什么模型”时必须区分“Codex Agent Harness 执行器”和“本轮所选上游模型”，不能再因运行在 Codex 中就把 DeepSeek 等第三方模型误答成 OpenAI。该信息证明实际请求路由，不声称能从模型自述验证训练权重
 - **OpenCode 凭据安全与刷新**: 兼容 provider 复用本机已有的 OpenCode API 凭据。Responses 直连凭据通过唯一子进程环境变量传入；Chat/Anthropic 桥接时第三方密钥只留在 Codebot 后端内存，Codex 子进程只得到每次后端启动随机生成的本机桥令牌。任何凭据都不会写入 Codebot 配置、Codex 全局配置、模型 API 响应或前端。刷新模型列表时若检测到 OpenCode 新增/修改 provider 且没有活跃 turn，会自动重启 App Server 加载新路由；有任务运行时延后刷新，避免中断任务
@@ -405,6 +415,26 @@ codebot/
 - **命令搜索**: 聊天输入框中的 `/` 会搜索 OpenCode CLI 命令，并支持按描述、单词和多词进行匹配
 - **文档入口**: 设置页里的“文档”会直接渲染本 README，文档右上角可刷新，适合在改动配置、功能或使用方式后重新查看
 - **使用顺序**: 建议先看“快速开始”和“访问”，再用聊天页底部的 `项目`、`生成技能`、`Codex`、`Obsidian`、`VS Code` 按钮切换处理目标
+
+### 1.3 Rakazo 受控试运行
+
+- **界面形态**: Rakazo 不复制一套独立聊天页面。“新建对话”中选择项目和 `Rakazo` 后，Codebot 创建或恢复该项目唯一的 Rakazo 主会话；同一项目不会产生第二个 Bot、Thread、Computer 或 Codebot 主会话。执行器在创建后固定，OpenCode、Codex 与 Rakazo 的历史状态不会在同一对话中混用
+- **显式交接**: 对话菜单提供“交接到其他执行器”。Codebot 只从可见的用户/助手消息生成一次性的长度受限摘要，过滤内部系统提示、常见令牌、私钥和长工具输出；摘要必须由用户审阅、编辑并确认后，才会写入目标执行器的新会话或 Rakazo 项目主会话，源会话不会改写。隐藏提示、审批内部对象和完整工具结果不会被复制
+- **聊天、模型与状态**: 消息、推理、工具摘要、审批、用量和错误继续进入现有聊天流。Rakazo 对话只固定执行器、项目及唯一 Bot/Thread/Computer，不把首次模型永久锁定；创建窗口只显示初始模型，进入对话后可在聊天顶部像 OpenCode/Codex 一样切换当前可用模型。模型仅能在空闲状态切换，切换先取得远端 Bot 的精确 provider/model 确认，再更新本地映射；每轮消息仍保存实际路由快照，历史不会随当前模型改写。右上角状态抽屉展示运行状态、模型路由、长期记忆摘要、项目权限和脱敏日志；远端 Bot 与 Codebot 映射不一致时立即阻止发送，不会静默换模型
+- **统一模型目录与连接**: `ModelRouteRegistry` 以 OpenCode `/provider` 为唯一清单来源，Rakazo 选择器直接镜像当前 OpenCode Server 已连接、已启用的模型，包括 `opencode-go` 等由 OpenCode 管理的连接；未连接 Provider 的数千个静态模型不会进入 Rakazo。API Key 和 OpenCode 内置 OpenAI ChatGPT OAuth 都由 Codebot 宿主代理，OAuth 到期时按 OpenCode 同一合同刷新并通过本机 OpenCode `PUT /auth/{providerID}` 写回同一连接，用户无需给 Rakazo 重复配置模型账号。未知协议或无法安全代理的其他签名合同仍失败关闭，不根据模型名称猜协议
+- **首次使用自动门禁**: 可安全代理的 OpenCode 模型都会出现在 Rakazo 聊天选择器。首次创建主会话、交接或切换到尚未验证的模型时，Codebot 自动执行文本、上游原生 SSE、工具调用与结果续接、中断、限制、用量、结束原因和模型身份检查；无需先到设置页逐个点击。验证失败会停止本次选择并显示真实原因，不回退到默认模型。`response.incomplete` 会按合法的 `length` 终态处理，推理模型也不会再因 64 token 探测预算耗尽被误报成流协议故障
+- **上游本地 Provider 合同**: 固定实验版虽然会注册 `local` 模型 Provider，但其 `bots.update` 仍要求当前用户先存在 Provider 连接记录。上游执行任务时会优先采用该记录中的 `userModelCredential` 作为 Adapter Bearer，因此 Codebot 会在创建 Bot、切换模型以及已有会话发送前，通过 Rakazo 官方 `models.credentials/models.connect` 合同幂等写入版本化的 Codebot 私网桥协议键，并与 TypeScript Adapter 的入口校验值保持一致；Adapter 再将它替换为本次 Codebot 进程随机生成的内部采样令牌。该协议键不是模型密钥，不能直接访问 Codebot，也不会复制 OpenCode API Key、OAuth Token 或 Cookie；旧的占位记录会在首次发送前原位迁移，不删除 Bot、Thread、Computer 或历史数据库。若上游再次拒绝，界面会显示嵌套 oRPC 返回的真实原因，而不再只显示笼统的 HTTP 400/401
+- **纯采样边界**: Rakazo 通过 Codebot 内部 `/api/internal/model-sampling/v1` 服务执行单次上游采样，不创建 OpenCode Session，也不调用 OpenCode Agent。API Key、OAuth access/refresh token 和账号 header 只存在于 Codebot 后端内存，不进入响应、日志、数据库或 Rakazo 容器；容器只得到启动时随机令牌。Rakazo/Pi 启动时可看到 OpenCode 当前可安全代理的完整目录，但内部采样端点仍只放行已经自动验证的精确路由。TypeScript 侧车代理模型流，并为 Rakazo `api`、`worker` 各提供一个共享网络命名空间的 `127.0.0.1` 项目 MCP 回环端点；每项目 Bearer 仍由 Codebot 后端验证，sidecar 不挂载项目目录、凭据或 Docker Socket。Bot/Thread/Computer 与 oRPC/事件映射仍由 Codebot Python 运行时适配层负责；固定实验版已完成容器内真实非流式、SSE 和重启恢复实测，但在稳定契约的 Bot/Thread/Computer 全流程也通过前，不把它描述成已完成的全量 TypeScript Runtime Adapter
+- **重启自动恢复与一键启动**: 内部采样令牌每次 Codebot 启动都会随机重建。首次安装和本机授权完成后，桌面设置页提供“一键启动全部”，按 Docker Desktop、OpenCode 当前模型连接、Rakazo 运行时、本机加密授权的顺序统一检查和恢复；四项已经就绪时保持幂等，不会重复安装 Docker、重建账号或重建数据。打开“随 Codebot 启动”后开关立即保存，下一次桌面应用显示主界面后在后台执行同一恢复流程；自动启动只使用既有 Docker 安装和 `safeStorage` 授权，缺少任一首次安装/授权条件时明确提示并停止，不会静默安装系统组件或创建账号。若用户保留着正在运行的受管 Rakazo 容器，后端仍会只读确认 `model-adapter`，再执行幂等 `compose up -d` 让新令牌和最新 OpenCode 模型目录生效；不会删除数据库或 Docker volume
+- **项目权限**: 默认仅允许读取用户明确选择的项目根目录；“新项目默认权限”和已有项目的读取、写入、命令执行、外部网络开关都会即时保存，失败时恢复原状态。项目文件仍只通过带项目令牌的 MCP 读写，并持续拒绝根目录逃逸、符号链接逃逸、敏感文件和超过 2 MiB 的写入。命令只在该 Bot 的 dedicated Computer 容器内执行：固定上游的审批规则属于账号/工作区级而非 Bot 级，因此 Codebot 采用保守合并——只要任一现存项目未允许命令，`shell` 就继续逐次审批；只有全部项目都允许时才移除该规则。外部网络使用该 Bot 的精确加盐 Docker bridge 控制：关闭时网络以 `--internal` 创建，开启时重建为普通 bridge；切换前停止 Computer，清理精确容器和网络，保留专属 home 后重新启动，不挂载宿主 Docker Socket
+- **失效映射恢复**: 固定实验版会把已删除 Bot/MCP 的 `Resource not found` 包装成通用 HTTP 500。Codebot 只有在错误文本明确表示不存在，或再通过官方 `bots.list` / `mcp.servers.list` 复核目标确实缺失后，才会在项目锁内创建替代 Bot/Thread/Computer，复制旧 Computer home，保留原 Codebot 主会话、项目权限和模型路由。创建前还会按 Codebot 独占的确定性 MCP slug 精确删除失败重试留下的孤儿 MCP；认证、数据库或其他 500 不会触发自愈，避免误建第二套资源
+- **删除与项目清理**: Rakazo 对话菜单使用“删除并清理项目”，并在执行前明确列出不可逆范围。确认后先删除 Bot/Thread/长期记忆、项目 MCP、项目专属 Computer 容器、加盐私有网络和 Computer home，再删除 Codebot 映射、路由快照与本地对话；任一步失败都会保留本地对话以便重试。用户的项目目录和文件、Docker Desktop、共享 Rakazo Compose/Postgres、镜像及其他项目始终保留，不把“删除一个项目会话”扩大为卸载整套运行环境
+- **完全可选与一键安装**: Rakazo 默认 `enabled=false`、`auto_start=false`。未启用且用户没有主动打开安装向导时，设置页只读取 Rakazo 配置，不探测 Docker CLI、不下载或安装 Docker Desktop、不启用 WSL、不启动 Compose，也不加载 Rakazo 模型目录；现有 OpenCode/Codex 使用路径不受影响。只有用户点击“启用 Rakazo 安装向导”后才展示环境步骤，点击“一键安装 Docker”才会真正触发首次安装，打开向导本身不会修改启用配置或安装系统组件。安装完成后的“一键启动全部”和“随 Codebot 启动”是恢复已有环境，不会重新进入安装流程
+- **部署、目录与授权**: Windows 桌面版把“安装 Docker”和“启动 Docker”作为两个独立动作。只有尚未安装时，用户选择目录并点击“一键安装 Docker”，Codebot 才会从 Docker 官方域名下载安装包、校验 Docker Inc Authenticode 签名、准备 WSL 2 并执行安装；识别到已有安装但 Engine 未运行时，只显示“启动 Docker”，直接运行现有 `Docker Desktop.exe`，不弹安装确认、不下载或执行安装包，也不要求重新选择存储目录。Docker 程序、镜像与 WSL 数据根使用用户所选目录，首次启用 Windows 功能时仍可能出现 UAC 或要求重启。Docker Desktop 自身管理 `docker-desktop` WSL 2 Linux Engine，不需要、也不应在 Ubuntu 等发行版中重复安装 Docker Engine。Codebot 会通过用户所选目录、卸载注册表和随包 CLI 识别已有安装：安装器退出码 3 且确认“现有版本已是最新”时不再重装；若 Docker 异常退出遗留不可访问的 `Docker\run` 或 `docker-secrets-engine` socket，Codebot 仅在本轮日志、固定路径和两组目录的运行端点白名单全部匹配后关闭崩溃进程，同时将两组纯运行目录改名隔离并建立空目录重试，旧目录保留可回退，不删除镜像、容器、配置或 WSL 虚拟磁盘。Rakazo 运行后可“一键本机授权”，随机本机账号、密码和会话由 Electron `safeStorage` 加密保存并在后端重启后恢复，渲染页面不接收明文。高级自管场景仍可临时提交会话令牌。Rakazo Web/API、Postgres、采样桥与项目 MCP 均不暴露到局域网或公网
+- **Docker 签名校验与重试**: 签名检查固定调用 Windows 系统自带 PowerShell，并清除从 PowerShell 7 或开发终端继承的模块搜索路径，避免把有效安装包误报为无法验证；安装包路径通过子进程环境传递，不拼入命令。24 小时内已下载且重新验签有效的安装包会直接复用，失败或过期才重新下载。任何真实签名失败或发布者不是 Docker Inc 的文件仍会失败关闭，不能跳过验证执行
+- **固定实验运行时**: 官方 `v0.1.0-beta` 仍缺少本地模型 Provider、按 Bot 绑定模型和已发布镜像 Compose，所以稳定通道继续失败关闭。为避免“只能看、不能运行”，Codebot 可在用户主动选择后安装一个兼容清单固定的实验版本：只复制上游官方提交 `a4ebad0cae4f9d0d3f6e7b3c30316b2bf6d924db` 的原始 Compose，应用和 Computer 均使用不可变 `repo@sha256` 引用，并在启动后核对 OCI revision 与运行容器镜像 ID；不会自动跟踪后续 `main` 或 `edge`。Compose 所需密钥在 Windows 由 DPAPI 加密，`.env` 仅在单次 Compose 命令期间短暂生成并立即删除；官方镜像缺失的 pnpm 由一次性 Corepack 预热服务下载到持久 Docker volume，避免每次重建多个容器重复联网。实机已验证 WSL2 Docker、全部服务健康、容器内非流式/SSE 纯采样、固定模型身份与强制重建恢复；该通道仍明确显示“非生产就绪”
+- **更新边界**: Codebot 只提供官方稳定 Release 的只读检查；固定实验版不是“手动追随上游”，没有兼容清单的新提交仍不可安装。由于隔离候选环境、数据库副本迁移和完整故障回滚尚未实现并实测，当前不提供 Rakazo 更新、切换或回滚 API/按钮。Codex SDK 与 bundled runtime 仍只随 Codebot 正式版本升级，不提供在线热更新，也不修改用户全局 Codex 安装
+- **生产准入**: 该功能目前是本机单用户受控试运行。至少完成 Docker 实机 Bot/Thread/Computer、真实模型与工具调用、项目权限、重启恢复、更新回滚和连续 7 天无数据丢失/越权观察后，才能改为“生产可用”。缺少任一证据时保持失败关闭
 
 ### 2. 记忆系统
 

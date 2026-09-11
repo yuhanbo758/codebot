@@ -29,6 +29,36 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 选择文件夹（用于项目目录选择等）
   selectFolder: (options) => ipcRenderer.invoke('dialog:selectFolder', toPlainValue(options)),
 
+  // 安装与启动是两个独立的受控动作：渲染进程不能传入命令、下载地址、
+  // 安装器参数或可执行文件路径，只能选择数据根目录并接收脱敏进度。
+  dockerInstallerStatus: (options) => ipcRenderer.invoke('docker:status', toPlainValue(options)),
+  installDockerDesktop: (options) => ipcRenderer.invoke('docker:install', toPlainValue(options)),
+  startDockerDesktop: (options) => ipcRenderer.invoke('docker:start', toPlainValue(options)),
+  onDockerInstallProgress: (callback) => {
+    const listener = (_event, payload) => callback(toPlainValue(payload));
+    ipcRenderer.on('docker:install-progress', listener);
+    return () => ipcRenderer.removeListener('docker:install-progress', listener);
+  },
+  onDockerStartProgress: (callback) => {
+    const listener = (_event, payload) => callback(toPlainValue(payload));
+    ipcRenderer.on('docker:start-progress', listener);
+    return () => ipcRenderer.removeListener('docker:start-progress', listener);
+  },
+
+  // Rakazo 本机账号凭据由 Electron safeStorage 加密保存，任何方法都不向页面
+  // 返回会话令牌、邮箱或密码。
+  rakazoAuthorizationStatus: () => ipcRenderer.invoke('rakazo:authorization-status'),
+  bootstrapRakazoAuthorization: () => ipcRenderer.invoke('rakazo:bootstrap-authorization'),
+  clearRakazoAuthorization: () => ipcRenderer.invoke('rakazo:clear-authorization'),
+  // 四项一键启动只允许传入可选存储根目录；Docker 可执行文件、Compose 命令与
+  // safeStorage 凭据全部由主进程解析，渲染页面只能看到脱敏进度与最终状态。
+  startAllRakazo: (options) => ipcRenderer.invoke('rakazo:start-all', toPlainValue(options)),
+  onRakazoStartAllProgress: (callback) => {
+    const listener = (_event, payload) => callback(toPlainValue(payload));
+    ipcRenderer.on('rakazo:start-all-progress', listener);
+    return () => ipcRenderer.removeListener('rakazo:start-all-progress', listener);
+  },
+
   // 使用 VS Code 打开当前项目。路径校验与进程启动都在主进程完成。
   openProjectInVSCode: (projectPath) => ipcRenderer.invoke('vscode:open-project', projectPath),
 

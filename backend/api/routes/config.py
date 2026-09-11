@@ -3,6 +3,8 @@
 """
 from pathlib import Path
 import json
+import re
+from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Literal, Optional, List
@@ -12,6 +14,7 @@ from config import (
     save_config,
     SkillsConfig,
     CodexConfig,
+    RakazoConfig,
     ObsidianConfig,
     ObsidianKnowledgeBase,
     settings,
@@ -40,6 +43,20 @@ class CodexConfigUpdateRequest(BaseModel):
     share_memory: Optional[bool] = None
     share_scheduler: Optional[bool] = None
     skill_dirs: Optional[List[str]] = None
+
+
+class RakazoConfigUpdateRequest(BaseModel):
+    enabled: Optional[bool] = None
+    auto_start: Optional[bool] = None
+    api_url: Optional[str] = None
+    compose_file: Optional[str] = None
+    docker_project_name: Optional[str] = None
+    release_channel: Optional[Literal["stable", "experimental"]] = None
+    network_policy: Optional[Literal["ask", "deny", "allow"]] = None
+    default_project_read: Optional[bool] = None
+    default_project_write: Optional[bool] = None
+    default_command_execution: Optional[bool] = None
+    default_external_network: Optional[bool] = None
 
 
 class ObsidianKnowledgeBaseRequest(BaseModel):
@@ -212,6 +229,64 @@ async def update_codex_config(request: CodexConfigUpdateRequest):
         app_config.codex = CodexConfig(**current)
         save_config(app_config)
         return {"success": True, "data": app_config.codex.model_dump(), "message": "Codex 配置已保存；运行时设置变更将在重启 Codex 后生效"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/rakazo")
+async def get_rakazo_config():
+    """返回不含 Rakazo 会话令牌的可持久化配置。"""
+    return {"success": True, "data": app_config.rakazo.model_dump()}
+
+
+@router.patch("/rakazo")
+async def update_rakazo_config(request: RakazoConfigUpdateRequest):
+    """保存 Rakazo 本机运行时配置，并强制私有访问边界。"""
+    try:
+        updates = request.model_dump(exclude_unset=True)
+        # 实验运行权只能由 /api/rakazo/runtime 的显式安装动作授予。设置表单
+        # 可以显示当前通道，但不能靠普通 PATCH 打开或伪造确认状态。
+        if updates.get("release_channel") == "experimental" and not app_config.rakazo.experimental_runtime_enabled:
+            raise HTTPException(status_code=409, detail="请使用“安装并启动固定实验版”完成显式确认和不可变镜像校验")
+        if "api_url" in updates:
+            parsed = urlparse(str(updates["api_url"] or "").strip())
+            try:
+                parsed_port = parsed.port
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Rakazo API 端口无效") from exc
+            if (
+                parsed.scheme not in {"http", "https"}
+                or (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+                or parsed.path not in {"", "/"}
+                or (parsed_port is not None and not 1 <= parsed_port <= 65535)
+            ):
+                raise HTTPException(status_code=400, detail="Rakazo API 必须使用无凭据、无路径的本机回环地址")
+            updates["api_url"] = str(updates["api_url"]).rstrip("/")
+        if updates.get("compose_file"):
+            compose_file = Path(str(updates["compose_file"])).expanduser()
+            if not compose_file.is_absolute():
+                raise HTTPException(status_code=400, detail="Rakazo Compose 文件必须使用绝对路径")
+            updates["compose_file"] = str(compose_file)
+        if "docker_project_name" in updates:
+            project_name = str(updates["docker_project_name"] or "").strip()
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", project_name):
+                raise HTTPException(status_code=400, detail="Docker 项目名仅允许小写字母、数字、下划线和短横线")
+            updates["docker_project_name"] = project_name
+        current = app_config.rakazo.model_dump()
+        current.update(updates)
+        app_config.rakazo = RakazoConfig(**current)
+        save_config(app_config)
+        return {
+            "success": True,
+            "data": app_config.rakazo.model_dump(),
+            "message": "Rakazo 配置已保存；运行时地址或 Compose 变更将在下次启动时生效",
+        }
     except HTTPException:
         raise
     except Exception as e:

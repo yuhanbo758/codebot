@@ -23,6 +23,7 @@ from config import settings, app_config
 from database.init_db import conversations_db
 from core.memory_manager import MemoryManager
 from core.project_versioning import ProjectVersionManager
+from core.rakazo_runtime import RakazoRuntimeError, rakazo_runtime
 from utils.background_tasks import create_background_task
 from core.opencode_ws import OpenCodeClient, _conversation_current_session, _conversation_current_workspace, is_conversation_running, mark_conversation_running, unmark_conversation_running
 from core.memory_extractor import extract_and_save_background, extract_candidates
@@ -266,7 +267,7 @@ class SendMessageRequest(BaseModel):
     attached_files: Optional[List[AttachedFile]] = Field(default=None, max_length=10)
     user_already_saved: bool = False
     project_dir: Optional[str] = None  # 用户选择的项目文件夹路径
-    target: Optional[str] = None  # codebot | codex | obsidian | codex_obsidian
+    target: Optional[str] = None  # codebot | codex | rakazo | obsidian | codex_obsidian
     knowledge_paths: Optional[List[str]] = None
 
     @model_validator(mode="after")
@@ -284,6 +285,7 @@ class PermissionReplyRequest(BaseModel):
     session_id: Optional[str] = None
     conversation_id: Optional[int] = None
     project_dir: Optional[str] = None
+    source: Optional[str] = None
 
 
 class QuestionReplyRequest(BaseModel):
@@ -295,6 +297,12 @@ class QuestionReplyRequest(BaseModel):
     project_dir: Optional[str] = None
     source: Optional[str] = None
     response_dir: Optional[str] = None
+
+
+class HandoffPreviewRequest(BaseModel):
+    source_conversation_id: int
+    target_executor: Literal["opencode", "codex", "rakazo"]
+
 
 class UpdateTitleRequest(BaseModel):
     title: str
@@ -730,12 +738,19 @@ def _is_codex_target(target: Optional[str]) -> bool:
     return normalized == "codex" or normalized.startswith("codex_")
 
 
+def _is_rakazo_target(target: Optional[str]) -> bool:
+    """Rakazo 是独立 Agent 运行时，不能与 Codex/OpenCode 组合执行。"""
+    return _normalized_chat_target(target) == "rakazo"
+
+
 def _is_obsidian_target(target: Optional[str]) -> bool:
     normalized = _normalized_chat_target(target)
     return normalized == "obsidian" or "obsidian" in normalized.split("_")
 
 
 def _task_executor_from_target(target: Optional[str]) -> str:
+    if _is_rakazo_target(target):
+        return "rakazo"
     return "codex" if _is_codex_target(target) else "opencode"
 
 
@@ -749,7 +764,152 @@ def _task_execution_model_from_chat_model(model: Optional[str]) -> str:
 
 
 def _task_executor_label(executor: Optional[str]) -> str:
-    return "Codex Agent Harness" if _task_executor_from_target(executor) == "codex" else "OpenCode CLI"
+    resolved = _task_executor_from_target(executor)
+    if resolved == "rakazo":
+        return "Rakazo"
+    return "Codex Agent Harness" if resolved == "codex" else "OpenCode CLI"
+
+
+def _conversation_runtime_metadata(conversation: Dict[str, Any]) -> Dict[str, Any]:
+    """兼容数据库中的 JSON 字符串，并对损坏的旧值安全降级。"""
+    raw = conversation.get("runtime_metadata")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            value = json.loads(raw)
+            return dict(value) if isinstance(value, dict) else {}
+        except ValueError:
+            return {}
+    return {}
+
+
+def _redact_handoff_text(value: str) -> str:
+    """清理交接摘要中可能出现的系统提示、令牌和长原始输出。"""
+    text = str(value or "")
+    # Codebot/OpenCode 的内部提醒可能曾被旧版本保存到可见消息；交接时再次
+    # 过滤，避免把隐藏执行合同注入另一套 Agent 历史。
+    text = re.sub(r"(?is)<system-reminder>.*?</system-reminder>", "[已省略内部系统提示]", text)
+    text = re.sub(r"(?is)\[system-reminder\].*?(?=\n\n|\Z)", "[已省略内部系统提示]", text)
+    text = re.sub(r"(?is)-----BEGIN [^-]+ PRIVATE KEY-----.*?-----END [^-]+ PRIVATE KEY-----", "[REDACTED PRIVATE KEY]", text)
+    text = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{8,}", "Bearer [REDACTED]", text)
+    text = re.sub(r"\b(?:sk|ghp|github_pat|xox[baprs])-?[A-Za-z0-9_-]{16,}\b", "[REDACTED TOKEN]", text)
+    text = re.sub(
+        r"(?i)\b(authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|password|passwd|secret|cookie)\b\s*[:=]\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)",
+        r"\1=[REDACTED]",
+        text,
+    )
+    # 交接只携带上下文摘要；超长代码/命令输出保留开头供审阅，不复制全文。
+    def _shorten_fence(match: re.Match) -> str:
+        language = str(match.group(1) or "")
+        body = str(match.group(2) or "")
+        if len(body) <= 700:
+            return match.group(0)
+        return f"```{language}\n{body[:700].rstrip()}\n…[已省略长代码或工具输出]\n```"
+
+    text = re.sub(r"(?is)```([^\r\n`]*)\r?\n(.*?)```", _shorten_fence, text)
+    return text.strip()
+
+
+def _build_handoff_summary(conversation: Dict[str, Any], messages: List[Dict[str, Any]], target_executor: str) -> str:
+    """生成一次性、可审阅的可见上下文摘要，不调用任何 Agent。"""
+    visible = [item for item in messages if str(item.get("role") or "") in {"user", "assistant"}]
+    selected = visible[-16:]
+    sections: List[str] = [
+        "# Codebot 执行器交接摘要",
+        "",
+        f"- 来源执行器：{str(conversation.get('executor') or 'opencode')}",
+        f"- 目标执行器：{target_executor}",
+        f"- 原对话：{str(conversation.get('title') or '未命名对话')[:160]}",
+    ]
+    project_dir = str(conversation.get("project_dir") or "").strip()
+    if project_dir:
+        sections.append(f"- 项目目录：{project_dir}")
+    sections.extend([
+        "",
+        "> 以下内容只来自 Codebot 中可见的用户/助手消息，已脱敏并限制长度；不含隐藏系统提示、审批内部对象、凭据或完整工具输出。请在确认前编辑或删除不希望交接的内容。",
+        "",
+        "## 最近上下文",
+    ])
+    total = sum(len(item) for item in sections)
+    for item in selected:
+        role = "用户" if item.get("role") == "user" else "助手"
+        content = _redact_handoff_text(str(item.get("content") or ""))
+        if not content:
+            continue
+        excerpt = content[:1400].rstrip()
+        if len(content) > len(excerpt):
+            excerpt += "\n…[该消息其余内容已省略]"
+        block = f"\n### {role}\n\n{excerpt}"
+        if total + len(block) > 14_000:
+            sections.append("\n…[更早上下文已省略]")
+            break
+        sections.append(block)
+        total += len(block)
+    sections.extend([
+        "",
+        "## 交接要求",
+        "",
+        "请先核对上述上下文，再从当前项目实际状态继续；不要假定旧执行器未展示的内部步骤已经完成。",
+    ])
+    return "\n".join(sections).strip()
+
+
+async def _resolve_conversation_execution(request: SendMessageRequest) -> Dict[str, Any]:
+    """以服务端持久绑定为准，阻止前端把同一历史切换到另一 Agent。
+
+    旧版本未保存执行器；这类对话会在升级后的第一次发送时按当次明确选择锁定，
+    从第二次开始即遵守不可切换规则。Rakazo 主会话始终由项目映射强制锁定。
+    """
+    conversations_db.connect()
+    manager = _get_chat_memory_manager()
+    conversation = await manager.get_conversation(request.conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="对话不存在")
+
+    metadata = _conversation_runtime_metadata(conversation)
+    stored_executor = str(conversation.get("executor") or "opencode").strip().lower()
+    requested_target = _normalized_chat_target(request.target or "codebot")
+    requested_executor = _task_executor_from_target(requested_target)
+    locked = bool(metadata.get("executorLocked")) or stored_executor == "rakazo"
+
+    if not locked:
+        # 无法从旧库推断历史到底使用 OpenCode 还是 Codex，因此仅在升级后第一次
+        # 发送时采用用户当前明确选择并固化，避免错误改写已有消息。
+        stored_executor = requested_executor
+        metadata.update({"executorLocked": True, "lockedAfterMigration": True})
+        await manager.bind_conversation_runtime(
+            request.conversation_id,
+            executor=stored_executor,
+            external_thread_id=conversation.get("external_thread_id"),
+            runtime_metadata=metadata,
+        )
+        conversation = await manager.get_conversation(request.conversation_id) or conversation
+    elif requested_executor != stored_executor:
+        raise HTTPException(
+            status_code=409,
+            detail=f"该对话已固定使用 {stored_executor}，请新建对应执行器的对话或使用显式交接",
+        )
+
+    if stored_executor == "rakazo":
+        mapping = rakazo_runtime.mapping_by_conversation(request.conversation_id)
+        if not mapping:
+            raise HTTPException(status_code=409, detail="Rakazo 主会话映射缺失，已拒绝创建第二个 Thread")
+        selected_route = str(mapping.get("model_route_id") or "")
+        if request.model and str(request.model) != selected_route:
+            raise HTTPException(status_code=409, detail="Rakazo 模型只能在空闲状态通过项目模型接口切换")
+        request.target = "rakazo"
+        request.project_dir = str(mapping.get("project_dir") or conversation.get("project_dir") or "")
+        request.model = selected_route
+    elif stored_executor == "codex":
+        request.target = requested_target if _is_codex_target(requested_target) else "codex"
+        request.project_dir = str(conversation.get("project_dir") or request.project_dir or "") or None
+    else:
+        # Obsidian 是 OpenCode 的上下文目标，不改变底层执行器。
+        request.target = requested_target if _is_obsidian_target(requested_target) else "codebot"
+        request.project_dir = str(conversation.get("project_dir") or request.project_dir or "") or None
+
+    return conversation
 
 
 def _looks_like_codebot_schedule_creation_request(message: str) -> bool:
@@ -1919,6 +2079,22 @@ async def _execute_opencode(
     knowledge_paths: Optional[List[str]] = None,
     user_message_id: Optional[int] = None,
 ) -> str:
+    # Rakazo 自己拥有持久 Thread 与长期记忆；这里只转发用户原文，不注入
+    # OpenCode system prompt，也绝不创建 OpenCode Session/Agent 双循环。
+    if _is_rakazo_target(target):
+        if not str(conversation_id or "").isdigit():
+            raise RakazoRuntimeError("Rakazo 执行需要已绑定的 Codebot 主会话", status_code=409)
+        content = ""
+        async for event in rakazo_runtime.run_turn_stream(
+            conversation_id=int(str(conversation_id)),
+            message=message,
+        ):
+            if event.get("type") == "content_delta":
+                content = str(event.get("content") or content)
+            elif event.get("type") == "done":
+                content = str(event.get("content") or content)
+        return _sanitize_assistant_output(content, user_message=message)
+
     schedule_result = await _handle_codebot_schedule_creation_request(
         message,
         target=target,
@@ -1981,6 +2157,23 @@ async def _execute_opencode_with_meta(
     knowledge_paths: Optional[List[str]] = None,
     user_message_id: Optional[int] = None,
 ) -> Tuple[str, List[dict]]:
+    if _is_rakazo_target(target):
+        if not str(conversation_id or "").isdigit():
+            raise RakazoRuntimeError("Rakazo 执行需要已绑定的 Codebot 主会话", status_code=409)
+        content = ""
+        parts: List[dict] = []
+        async for event in rakazo_runtime.run_turn_stream(
+            conversation_id=int(str(conversation_id)),
+            message=message,
+        ):
+            if event.get("type") == "content_delta":
+                content = str(event.get("content") or content)
+            elif event.get("type") == "tool_event":
+                parts.append(dict(event))
+            elif event.get("type") == "done":
+                content = str(event.get("content") or content)
+        return _sanitize_assistant_output(content, user_message=message), parts
+
     schedule_result = await _handle_codebot_schedule_creation_request(
         message,
         target=target,
@@ -2052,6 +2245,17 @@ async def _stream_execute_opencode_with_meta(
     knowledge_paths: Optional[List[str]] = None,
     user_message_id: Optional[int] = None,
 ):
+    if _is_rakazo_target(target):
+        if not str(conversation_id or "").isdigit():
+            raise RakazoRuntimeError("Rakazo 执行需要已绑定的 Codebot 主会话", status_code=409)
+        yield {"type": "internal_prompt", "prompt": "[rakazo] 用户原文通过固定 Rakazo Thread 发送；未注入 OpenCode Agent 提示词。"}
+        async for event in rakazo_runtime.run_turn_stream(
+            conversation_id=int(str(conversation_id)),
+            message=message,
+        ):
+            yield event
+        return
+
     schedule_intent = await _classify_codebot_schedule_creation_request(message, model=model)
     if schedule_intent:
         executor = _task_executor_from_target(target)
@@ -3464,11 +3668,49 @@ def _write_skill(skill_id: str, data: dict):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+@router.post("/handoff/preview")
+async def preview_executor_handoff(request: HandoffPreviewRequest):
+    """生成不落库的一次性交接摘要，由用户审阅确认后再发送到目标会话。"""
+    try:
+        conversations_db.connect()
+        manager = _get_chat_memory_manager()
+        conversation = await manager.get_conversation(request.source_conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="源对话不存在")
+        if _is_multi_agent_hub(conversation) or conversation.get("is_group"):
+            raise HTTPException(status_code=409, detail="多 Agent 群聊不能直接交接，请先选择一个普通成员对话")
+        source_executor = str(conversation.get("executor") or "opencode").strip().lower()
+        if source_executor == request.target_executor:
+            raise HTTPException(status_code=409, detail="目标执行器与当前对话相同，无需交接")
+        messages = await manager.get_messages(request.source_conversation_id, limit=1000)
+        summary = _build_handoff_summary(conversation, messages, request.target_executor)
+        return {
+            "success": True,
+            "data": {
+                "summary": summary,
+                "sourceConversationId": request.source_conversation_id,
+                "sourceExecutor": source_executor,
+                "targetExecutor": request.target_executor,
+                "projectDir": str(conversation.get("project_dir") or ""),
+                "visibleMessageCount": sum(
+                    1 for item in messages if str(item.get("role") or "") in {"user", "assistant"}
+                ),
+                "expiresOnClose": True,
+            },
+            "message": "交接摘要仅在当前界面预览，确认前不会写入任何目标会话",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @router.post("/conversations", response_model=MessageResponse)
 async def create_conversation(
     title: str = Body("新对话"),
     project_dir: Optional[str] = Body(None),
-    conversation_type: str = Body("normal")
+    conversation_type: str = Body("normal"),
+    executor: Literal["opencode", "codex", "rakazo"] = Body("opencode"),
 ):
     """创建对话"""
     try:
@@ -3484,13 +3726,30 @@ async def create_conversation(
                 message="多Agent群聊已就绪"
             )
 
-        conversation_id = await memory_manager.create_conversation(title, project_dir=project_dir)
+        if executor == "rakazo":
+            raise HTTPException(
+                status_code=409,
+                detail="Rakazo 每个项目只能有一个主会话，请使用 /api/rakazo/projects/open 创建或恢复",
+            )
+
+        conversation_id = await memory_manager.create_conversation(
+            title,
+            project_dir=project_dir,
+            executor=executor,
+        )
+        await memory_manager.bind_conversation_runtime(
+            conversation_id,
+            executor=executor,
+            runtime_metadata={"executorLocked": True},
+        )
         
         return MessageResponse(
             success=True,
-            data={"id": conversation_id, "title": title, "project_dir": project_dir},
+            data={"id": conversation_id, "title": title, "project_dir": project_dir, "executor": executor},
             message="对话创建成功"
         )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3560,6 +3819,8 @@ async def update_conversation_project_dir(
         conversation = await memory_manager.get_conversation(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="对话不存在")
+        if str(conversation.get("executor") or "opencode") == "rakazo":
+            raise HTTPException(status_code=409, detail="Rakazo 主会话的项目绑定不可修改，请从项目入口恢复原会话")
         await memory_manager.update_conversation_project_dir(conversation_id, project_dir)
         return {"success": True, "data": {"project_dir": project_dir}, "message": "项目目录已更新"}
     except HTTPException:
@@ -3570,7 +3831,7 @@ async def update_conversation_project_dir(
 
 @router.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: int):
-    """删除对话"""
+    """删除对话；Rakazo 主会话同时清理该项目的专属运行资源。"""
     try:
         conversations_db.connect()
         memory_manager = MemoryManager()
@@ -3580,13 +3841,28 @@ async def delete_conversation(conversation_id: int):
             raise HTTPException(status_code=404, detail="对话不存在")
         if _is_multi_agent_hub(conversation):
             raise HTTPException(status_code=400, detail="多Agent群聊不能删除，请使用清空")
+        cleanup = None
+        if str(conversation.get("executor") or "opencode") == "rakazo":
+            mapping = rakazo_runtime.mapping_by_conversation(conversation_id)
+            if not mapping:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Rakazo 主会话缺少项目映射；为避免遗留 Docker 资源，已拒绝只删除本地对话",
+                )
+            try:
+                cleanup = await rakazo_runtime.delete_project(str(mapping["project_id"]))
+            except RakazoRuntimeError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
         await memory_manager.delete_conversation(conversation_id)
         
         return {
             "success": True,
-            "message": "对话已删除"
+            "data": {"rakazoCleanup": cleanup} if cleanup else None,
+            "message": "Rakazo 项目主会话及其专属运行资源已清理" if cleanup else "对话已删除",
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3643,6 +3919,8 @@ async def toggle_conversation_group(conversation_id: int, request: ToggleGroupRe
             raise HTTPException(status_code=404, detail="对话不存在")
         if _is_multi_agent_hub(conversation):
             raise HTTPException(status_code=400, detail="多Agent群聊工作台不能退出群聊")
+        if str(conversation.get("executor") or "opencode") == "rakazo":
+            raise HTTPException(status_code=409, detail="Rakazo 主会话不能加入 Codebot 多Agent群聊")
         role = request.group_role or conversation.get("group_role") or conversation.get("title")
         await memory_manager.set_conversation_group(conversation_id, request.is_group, role)
         return {
@@ -3665,6 +3943,8 @@ async def clear_conversation(conversation_id: int, request: ClearConversationReq
             raise HTTPException(status_code=404, detail="对话不存在")
         if not request.confirm:
             raise HTTPException(status_code=400, detail="需要确认清空")
+        if str(conversation.get("executor") or "opencode") == "rakazo":
+            raise HTTPException(status_code=409, detail="Rakazo 主 Thread 仍保留完整历史，不能只清空 Codebot 镜像消息；请归档主会话")
         await memory_manager.clear_conversation_messages(conversation_id)
         return {"success": True, "message": "对话内容已清空"}
     except HTTPException:
@@ -4622,6 +4902,7 @@ async def read_file_content(path: str = Body(..., embed=True), abs_path: str = B
 @router.post("/send")
 async def send_to_opencode(request: SendMessageRequest):
     """发送消息到 OpenCode。支持多任务排队：如果该对话已有任务在运行，新任务会加入队列。"""
+    await _resolve_conversation_execution(request)
     conv_id = str(request.conversation_id)
 
     # 构建包含附件内容的完整消息
@@ -4635,7 +4916,11 @@ async def send_to_opencode(request: SendMessageRequest):
     if conv_id not in _task_queues:
         _task_queues[conv_id] = asyncio.Queue(maxsize=MAX_CONVERSATION_QUEUE_SIZE)
 
-    if is_conversation_running(conv_id) or not _task_queues[conv_id].empty():
+    if (
+        is_conversation_running(conv_id)
+        or bool(_runtime_stream_state.get(conv_id, {}).get("running"))
+        or not _task_queues[conv_id].empty()
+    ):
         try:
             _task_queues[conv_id].put_nowait({
                 "message": full_message,
@@ -4686,15 +4971,16 @@ async def send_to_opencode(request: SendMessageRequest):
                     create_background_task(_update_title_bg(request.conversation_id, request.message, content, request.model))
 
             # 后台运行完整学习闭环：记忆、定时任务、技能和成长候选。
-            create_background_task(
-                _run_chat_post_processing(
-                    user_message=request.message,
-                    assistant_response=content,
-                    conversation_id=request.conversation_id,
-                    target=request.target,
-                    execution_model=request.model,
+            if not _is_rakazo_target(request.target):
+                create_background_task(
+                    _run_chat_post_processing(
+                        user_message=request.message,
+                        assistant_response=content,
+                        conversation_id=request.conversation_id,
+                        target=request.target,
+                        execution_model=request.model,
+                    )
                 )
-            )
 
         # 处理队列中等待的任务（非阻塞，后台运行）
         create_background_task(_drain_queue(conv_id, request.conversation_id))
@@ -4704,6 +4990,10 @@ async def send_to_opencode(request: SendMessageRequest):
             "data": {"content": content, "queued": False},
             "message": "消息已处理"
         }
+    except HTTPException:
+        raise
+    except RakazoRuntimeError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -5412,6 +5702,7 @@ def _format_cli_opencode_event(stream_event: dict, seen: set[str]) -> str:
 @router.post("/send_stream")
 async def send_to_opencode_stream(request: SendMessageRequest):
     _prune_finished_chat_runtime()
+    await _resolve_conversation_execution(request)
     conv_id = str(request.conversation_id)
     full_message = request.message
     if request.attached_files:
@@ -5422,7 +5713,11 @@ async def send_to_opencode_stream(request: SendMessageRequest):
     if conv_id not in _task_queues:
         _task_queues[conv_id] = asyncio.Queue(maxsize=MAX_CONVERSATION_QUEUE_SIZE)
 
-    if is_conversation_running(conv_id) or not _task_queues[conv_id].empty():
+    if (
+        is_conversation_running(conv_id)
+        or bool(_runtime_stream_state.get(conv_id, {}).get("running"))
+        or not _task_queues[conv_id].empty()
+    ):
         try:
             _task_queues[conv_id].put_nowait({
                 "message": full_message,
@@ -5453,6 +5748,8 @@ async def send_to_opencode_stream(request: SendMessageRequest):
         _runtime_start(conv_id)
         version_manager = None
         version_message_id = None
+        is_codex_runtime = _is_codex_target(request.target)
+        is_rakazo_runtime = _is_rakazo_target(request.target)
         try:
             conversations_db.connect()
             memory_manager = MemoryManager()
@@ -5460,7 +5757,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
             user_messages = [item for item in recent if item.get("role") == "user"]
             if user_messages:
                 version_message_id = int(user_messages[-1]["id"])
-                if request.project_dir and request.project_dir.strip():
+                if request.project_dir and request.project_dir.strip() and not is_rakazo_runtime:
                     version_manager = ProjectVersionManager(settings.DATA_DIR)
                     await asyncio.to_thread(
                         version_manager.snapshot, request.project_dir,
@@ -5474,8 +5771,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
             internal_prompt: str = ""
             tool_events_log: List[dict] = []
             session_error_message = ""
-            is_codex_target = _is_codex_target(request.target)
-            cli_display = _opencode_cli_display_enabled() and not is_codex_target
+            cli_display = _opencode_cli_display_enabled() and not is_codex_runtime and not is_rakazo_runtime
             cli_seen: set[str] = set()
             cli_text_started = False
             async for stream_event in _stream_execute_opencode_with_meta(
@@ -5511,7 +5807,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                             "delta": delta,
                             "content": content,
                             "cli_display": True,
-                            "source": stream_event.get("source") or ("codex" if is_codex_target else None),
+                            "source": stream_event.get("source") or ("rakazo" if is_rakazo_runtime else "codex" if is_codex_runtime else None),
                         })
                         continue
                     next_content = _sanitize_assistant_output(raw_content, user_message=request.message)
@@ -5524,7 +5820,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                         "type": "content_delta",
                         "delta": delta,
                         "content": content,
-                        "source": stream_event.get("source") or ("codex" if is_codex_target else "opencode"),
+                        "source": stream_event.get("source") or ("rakazo" if is_rakazo_runtime else "codex" if is_codex_runtime else "opencode"),
                     })
                     continue
                 if event_type == "tool_event":
@@ -5624,7 +5920,12 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                                         })
                     continue
                 if event_type == "error":
-                    raise RuntimeError(stream_event.get("error") or "Agent 流式调用失败")
+                    raise RuntimeError(
+                        stream_event.get("error")
+                        or stream_event.get("message")
+                        or stream_event.get("content")
+                        or "Agent 流式调用失败"
+                    )
 
             # OpenCode 有时先发 session.error，随后仍以空 done 结束。此前该路径会被
             # 误判为成功，客户端只能看到空白助手气泡。没有正文时应提升为真正的流错误。
@@ -5652,15 +5953,18 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                                 logger.debug(f"后台更新对话标题失败(stream): {e}")
                         create_background_task(_update_title_bg_stream(request.conversation_id, request.message, content, request.model))
 
-                create_background_task(
-                    _run_chat_post_processing(
-                        user_message=request.message,
-                        assistant_response=content,
-                        conversation_id=request.conversation_id,
-                        target=request.target,
-                        execution_model=request.model,
+                # Rakazo 自己维护长期记忆；不把同一轮再送入 Codebot 自动记忆提取，
+                # 避免两套记忆系统互相重复和回灌。
+                if not is_rakazo_runtime:
+                    create_background_task(
+                        _run_chat_post_processing(
+                            user_message=request.message,
+                            assistant_response=content,
+                            conversation_id=request.conversation_id,
+                            target=request.target,
+                            execution_model=request.model,
+                        )
                     )
-                )
 
             if version_manager and version_message_id:
                 await asyncio.to_thread(
@@ -5687,7 +5991,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                 "type": "done",
                 "content": content or "",
                 "cli_display": cli_display,
-                "source": "codex" if is_codex_target else "opencode",
+                "source": "rakazo" if is_rakazo_runtime else "codex" if is_codex_runtime else "opencode",
             }
             _runtime_append_event(conv_id, done_event)
             await event_queue.put(done_event)
@@ -5737,6 +6041,26 @@ async def reply_opencode_permission(request: PermissionReplyRequest):
     if reply not in {"once", "always", "reject"}:
         raise HTTPException(status_code=400, detail="无效的权限回复")
 
+    if (request.source or "").strip().lower() == "rakazo" or request_id.startswith("rakazo-"):
+        try:
+            await rakazo_runtime.reply_permission(
+                request_id,
+                reply,
+                conversation_id=request.conversation_id,
+            )
+        except RakazoRuntimeError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        if request.conversation_id:
+            _runtime_append_event(str(request.conversation_id), {
+                "type": "meta_event",
+                "source": "rakazo",
+                "event_type": "permission.local_reply",
+                "summary": f"你已选择：{reply}",
+                "detail": "",
+                "data": {"request_id": request_id, "reply": reply, "source": "rakazo"},
+            })
+        return {"success": True, "message": "已回复 Rakazo 权限请求"}
+
     if request_id.startswith("codex-"):
         from core.codex_runtime import codex_runtime
 
@@ -5784,6 +6108,40 @@ async def reply_opencode_question(request: QuestionReplyRequest):
     request_id = (request.request_id or "").strip()
     if not request_id:
         raise HTTPException(status_code=400, detail="缺少 question 请求 ID")
+
+    if (request.source or "").strip().lower() == "rakazo" or request_id.startswith("rakazo-"):
+        try:
+            result = await rakazo_runtime.reply_question(
+                request_id,
+                answer=(request.answer or "").strip(),
+                answers=request.answers,
+                reject=request.reject,
+                conversation_id=request.conversation_id,
+            )
+        except RakazoRuntimeError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        if request.reject:
+            reply_text = "已取消并停止本轮 Rakazo 任务"
+        elif result.get("secret"):
+            # 敏感回答不能重新写进 Codebot 运行态事件或浏览器历史。
+            reply_text = "已安全提交敏感回答"
+        else:
+            reply_text = str(result.get("reply") or "已回复")
+        if request.conversation_id:
+            _runtime_append_event(str(request.conversation_id), {
+                "type": "meta_event",
+                "event_type": "question.local_reply",
+                "summary": reply_text,
+                "detail": "",
+                "source": "rakazo",
+                "data": {
+                    "request_id": request_id,
+                    "rejected": request.reject,
+                    "secret": bool(result.get("secret")),
+                    "source": "rakazo",
+                },
+            })
+        return {"success": True, "message": reply_text}
 
     if (request.source or "").strip().lower() == "codex" or request_id.startswith("codex-"):
         from core.codex_runtime import codex_runtime
@@ -5913,15 +6271,16 @@ async def _drain_queue(conv_id: str, conversation_id: int):
                     role="assistant",
                     content=content
                 )
-                create_background_task(
-                    _run_chat_post_processing(
-                        user_message=task["message"],
-                        assistant_response=content,
-                        conversation_id=conversation_id,
-                        target=task.get("target"),
-                        execution_model=task.get("model"),
+                if not _is_rakazo_target(task.get("target")):
+                    create_background_task(
+                        _run_chat_post_processing(
+                            user_message=task["message"],
+                            assistant_response=content,
+                            conversation_id=conversation_id,
+                            target=task.get("target"),
+                            execution_model=task.get("model"),
+                        )
                     )
-                )
             if queued_version_manager and queued_version_message_id:
                 await asyncio.to_thread(
                     queued_version_manager.snapshot, queued_project_dir,
@@ -5971,7 +6330,16 @@ async def abort_task(request: AbortRequest):
     # 终止当前正在运行的 OpenCode session
     aborted_sessions = 0
     aborted_codex = 0
+    aborted_rakazo = 0
     for target_id in target_conv_ids:
+        mapping = rakazo_runtime.mapping_by_conversation(target_id) if str(target_id).isdigit() else None
+        if mapping:
+            try:
+                await rakazo_runtime.interrupt_project(str(mapping["project_id"]))
+                aborted_rakazo += 1
+                logger.info(f"已终止对话 {target_id} 的 Rakazo run")
+            except Exception as e:
+                logger.warning(f"终止 Rakazo run 出错: {e}")
         try:
             from core.codex_runtime import codex_runtime
             if str(target_id).isdigit() and await codex_runtime.abort_conversation(int(target_id)):
@@ -6002,7 +6370,12 @@ async def abort_task(request: AbortRequest):
     return {
         "success": True,
         "message": "已发送终止信号",
-        "data": {"conversations": target_conv_ids, "aborted_sessions": aborted_sessions, "aborted_codex": aborted_codex}
+        "data": {
+            "conversations": target_conv_ids,
+            "aborted_sessions": aborted_sessions,
+            "aborted_codex": aborted_codex,
+            "aborted_rakazo": aborted_rakazo,
+        }
     }
 
 
@@ -6052,6 +6425,8 @@ async def undo_message(conversation_id: int, request: UndoMessageRequest):
             raise HTTPException(status_code=404, detail="消息不存在")
 
         conversation = await memory_manager.get_conversation(conversation_id)
+        if str((conversation or {}).get("executor") or "opencode") == "rakazo":
+            raise HTTPException(status_code=409, detail="Rakazo 上游 Thread 不支持与 Codebot 消息镜像同步回滚，已拒绝撤销")
         project_dir = str((conversation or {}).get("project_dir") or "").strip()
         target_message = messages[target_idx]
         version_message_id = target_message.get("id") if target_message.get("role") == "user" else None

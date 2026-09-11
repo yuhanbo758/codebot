@@ -51,6 +51,7 @@ data/hermes/
 /hermes-agent-residue-*/
 /vscode-extension/*.vsix
 data/sandbox/
+data/rakazo-runtime/
 *.qcow2
 data/backups/*.zip
 data/export_*/

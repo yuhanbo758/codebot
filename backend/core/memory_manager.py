@@ -138,6 +138,12 @@ class MemoryManager:
             cursor.execute("ALTER TABLE conversations ADD COLUMN conversation_type TEXT DEFAULT 'normal'")
         if "group_role" not in existing:
             cursor.execute("ALTER TABLE conversations ADD COLUMN group_role TEXT")
+        if "executor" not in existing:
+            cursor.execute("ALTER TABLE conversations ADD COLUMN executor TEXT DEFAULT 'opencode'")
+        if "external_thread_id" not in existing:
+            cursor.execute("ALTER TABLE conversations ADD COLUMN external_thread_id TEXT")
+        if "runtime_metadata" not in existing:
+            cursor.execute("ALTER TABLE conversations ADD COLUMN runtime_metadata TEXT")
 
     def _ensure_long_term_memory_columns(self, cursor: sqlite3.Cursor):
         columns = cursor.execute("PRAGMA table_info(long_term_memories)").fetchall()
@@ -150,12 +156,24 @@ class MemoryManager:
                 "WHERE updated_at IS NULL"
             )
     
-    async def create_conversation(self, title: str = "新对话", project_dir: str = None, conversation_type: str = "normal") -> int:
+    async def create_conversation(
+        self,
+        title: str = "新对话",
+        project_dir: str = None,
+        conversation_type: str = "normal",
+        executor: str = "opencode",
+        external_thread_id: str = None,
+    ) -> int:
         """创建对话"""
+        normalized_executor = str(executor or "opencode").strip().lower()
+        if normalized_executor not in {"opencode", "codex", "rakazo"}:
+            raise ValueError(f"不支持的对话执行器：{executor}")
         cursor = self.sqlite_db.cursor()
         cursor.execute(
-            "INSERT INTO conversations (title, project_dir, conversation_type) VALUES (?, ?, ?)",
-            (title, project_dir, conversation_type)
+            """INSERT INTO conversations
+               (title, project_dir, conversation_type, executor, external_thread_id)
+               VALUES (?, ?, ?, ?, ?)""",
+            (title, project_dir, conversation_type, normalized_executor, external_thread_id)
         )
         self.sqlite_db.commit()
         conversation_id = cursor.lastrowid
@@ -252,6 +270,33 @@ class MemoryManager:
         cursor.execute(
             "UPDATE conversations SET project_dir = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (project_dir, conversation_id)
+        )
+        self.sqlite_db.commit()
+
+    async def bind_conversation_runtime(
+        self,
+        conversation_id: int,
+        *,
+        executor: str,
+        external_thread_id: str = None,
+        runtime_metadata: Optional[Dict] = None,
+    ):
+        """把对话固定绑定到一个运行时；现有消息历史不会被改写。"""
+        normalized_executor = str(executor or "opencode").strip().lower()
+        if normalized_executor not in {"opencode", "codex", "rakazo"}:
+            raise ValueError(f"不支持的对话执行器：{executor}")
+        cursor = self.sqlite_db.cursor()
+        cursor.execute(
+            """UPDATE conversations
+               SET executor = ?, external_thread_id = ?, runtime_metadata = ?,
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (
+                normalized_executor,
+                external_thread_id,
+                json.dumps(runtime_metadata or {}, ensure_ascii=False),
+                conversation_id,
+            ),
         )
         self.sqlite_db.commit()
 

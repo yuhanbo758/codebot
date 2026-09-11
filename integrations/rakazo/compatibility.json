@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 2,
+  "entries": [
+    {
+      "rakazoVersion": "v0.1.0",
+      "sourceRelease": "v0.1.0-beta",
+      "channel": "beta",
+      "contractVersion": "v0.1.0",
+      "minimumAdapterVersion": "0.2.0",
+      "runtimeCompatible": false,
+      "installable": false,
+      "productionReady": false,
+      "reason": "官方 v0.1.0-beta 不包含 Codebot 所需的本地模型 Provider、Bot 模型绑定和已发布镜像 Compose，因此稳定通道继续失败关闭。"
+    },
+    {
+      "rakazoVersion": "v0.1.0",
+      "sourceRelease": "main@a4ebad0cae4f9d0d3f6e7b3c30316b2bf6d924db",
+      "sourceRevision": "a4ebad0cae4f9d0d3f6e7b3c30316b2bf6d924db",
+      "channel": "experimental",
+      "contractVersion": "v0.1.0",
+      "minimumAdapterVersion": "0.2.0",
+      "runtimeCompatible": true,
+      "installable": true,
+      "productionReady": false,
+      "architectures": ["linux/amd64"],
+      "composeResource": "docker-compose.images.a4ebad0.yml",
+      "composeSha256": "a0b661cdbe692be1223ffb8bc273c9c3f17a43deac671d84b61620d40bd5d2dc",
+      "appImage": "ghcr.io/elie222/rakazo/app@sha256:e0383bd79b661951f69aec41efe67165bb32b0888557907f2ec61530700dc104",
+      "appImagePlatformDigest": "sha256:8fd021051be30b4a05d41e4004a869c50c8ee20a2ceab407616d24dbd0b9b07c",
+      "appImageRevision": "a4ebad0cae4f9d0d3f6e7b3c30316b2bf6d924db",
+      "computerImage": "ghcr.io/elie222/rakazo/computer@sha256:8687a20b5737b8298a50af741b85b18c67abf52ada50a48f50a8c2ce7af133d7",
+      "computerImagePlatformDigest": "sha256:0d29940c4f1b71b3c92369aa9e0ffc01b4221ebfc386dc1899d92080c84075d4",
+      "computerImageRevision": "00967fc4f8daa01aeb8325deb0abcadda9c0aad7",
+      "reason": "官方 main 已具备本地模型 Provider、Bot 模型绑定和镜像 Compose。Codebot 仅允许用户显式启动此固定提交与固定镜像摘要的实验通道；它不会自动跟踪 edge，也不标记为生产可用。"
+    }
+  ]
+}

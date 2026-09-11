@@ -1,10 +1,17 @@
 const { app, BrowserWindow, Menu, dialog, ipcMain, clipboard, shell, session, safeStorage } = require('electron');
 const path = require('path');
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const os = require('os');
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
+const {
+  getDockerInstallerStatus,
+  installDockerDesktop,
+  startInstalledDockerDesktop,
+} = require('./docker-installer');
+const { startRakazoDesktopStack } = require('./rakazo-startup');
 let autoUpdater = null;
 try {
   autoUpdater = require('electron-updater').autoUpdater;
@@ -26,6 +33,7 @@ const CODEBOT_GITHUB_OWNER = 'yuhanbo758';
 const CODEBOT_GITHUB_REPO = 'codebot';
 const CODEBOT_GITHUB_RELEASES_API = `https://api.github.com/repos/${CODEBOT_GITHUB_OWNER}/${CODEBOT_GITHUB_REPO}/releases`;
 const ACCOUNT_TOKEN_FILE = 'account-token.bin';
+const RAKAZO_AUTH_FILE = 'rakazo-auth.bin';
 const BUILTIN_BROWSER_PARTITION = 'persist:builtin-browser';
 const SHOP_HOSTNAME = new URL(SHOP_BASE_URL).hostname;
 let cachedAccount = null;
@@ -33,6 +41,15 @@ let lastUpdateSource = 'github';
 let builtinSessionEventsBound = false;
 let pendingManualUpdate = null;
 let lastCheckedUpdateInfo = null;
+// 安装和启动使用不同 IPC，但共享同一个互斥任务，防止用户在安装器运行期间再次
+// 启动 Desktop，或在 Engine 启动期间并发执行安装器。
+let dockerDesktopOperationPromise = null;
+// “一键启动全部”和随 Codebot 自动启动共享同一任务，避免用户连续点击后重复
+// 拉起 Docker、Compose 或本机授权。该互斥不包含任何凭据。
+let rakazoDesktopStartPromise = null;
+// 只在本次 Electron/后端进程间使用，拒绝网页或局域网客户端调用包含明文
+// Rakazo 凭据的桌面专用接口。令牌不会传给渲染进程或写入磁盘。
+const desktopBridgeToken = crypto.randomBytes(32).toString('base64url');
 
 function toSerializable(value) {
   if (value == null) return value;
@@ -503,6 +520,120 @@ ipcMain.handle('dialog:selectFolder', async (_event, options) => {
   return result.filePaths[0];
 });
 
+ipcMain.handle('docker:status', async (_event, rawOptions) => {
+  const storageRoot = String(rawOptions?.storageRoot || '').trim();
+  const status = await getDockerInstallerStatus(storageRoot ? { storageRoot } : {});
+  return {
+    ...status,
+    codebotInstallDir: path.dirname(process.execPath),
+    codebotDataDir: app.getPath('userData'),
+    installerSupportsCustomDirectory: process.platform === 'win32',
+  };
+});
+
+ipcMain.handle('docker:install', async (_event, rawOptions) => {
+  if (dockerDesktopOperationPromise || rakazoDesktopStartPromise) throw new Error('Docker Desktop 正在执行另一项操作，请等待当前任务完成');
+  const storageRoot = String(rawOptions?.storageRoot || '').trim();
+  if (!storageRoot) throw new Error('请先选择 Docker 与 Rakazo 的大文件存储目录');
+  // 在显示安装确认前先复核真实状态。已经安装的机器必须改走 docker:start，
+  // 不能因为前端状态过期而再次向用户展示“开始安装”或调用安装器。
+  const currentStatus = await getDockerInstallerStatus({ storageRoot });
+  if (currentStatus.installed) {
+    throw new Error(currentStatus.ready
+      ? 'Docker Engine 已经就绪，无需重复安装或启动'
+      : 'Docker Desktop 已安装，请使用“启动 Docker”');
+  }
+  const confirmation = await dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    buttons: ['开始安装', '取消'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+    title: '安装 Docker Desktop',
+    message: 'Codebot 将安装 Docker Desktop，并把镜像与 WSL 数据放入你选择的目录。',
+    detail: [
+      `存储根目录：${storageRoot}`,
+      '',
+      '安装包只从 Docker 官方域名下载，并在执行前校验 Docker Inc 数字签名。',
+      'Windows 可能弹出管理员确认；若首次启用 WSL 2，系统可能要求重启。',
+      'Docker Desktop 的商业使用须遵守 Docker 官方许可条款。',
+    ].join('\n'),
+  });
+  if (confirmation.response !== 0) return { success: false, cancelled: true };
+
+  const emit = (payload) => sendRendererEvent('docker:install-progress', payload);
+  dockerDesktopOperationPromise = installDockerDesktop({ storageRoot }, emit);
+  try {
+    const result = await dockerDesktopOperationPromise;
+    emit({
+      phase: result.rebootRequired ? 'reboot-required' : 'done',
+      percent: result.rebootRequired ? 6 : 100,
+      message: result.message || 'Docker Desktop 已安装并就绪',
+    });
+    return toSerializable(result);
+  } catch (error) {
+    const message = error?.message || String(error);
+    emit({ phase: 'error', percent: 0, message });
+    throw error;
+  } finally {
+    dockerDesktopOperationPromise = null;
+  }
+});
+
+ipcMain.handle('docker:start', async (_event, rawOptions) => {
+  if (dockerDesktopOperationPromise || rakazoDesktopStartPromise) throw new Error('Docker Desktop 正在执行另一项操作，请等待当前任务完成');
+  const storageRoot = String(rawOptions?.storageRoot || '').trim();
+  const emit = (payload) => sendRendererEvent('docker:start-progress', payload);
+  // 启动现有安装不需要安装确认，也不要求重新选择存储目录。安装位置由用户所选
+  // 目录和 Windows 卸载注册表共同识别，实际启动程序仍由受控主进程解析。
+  dockerDesktopOperationPromise = startInstalledDockerDesktop(
+    storageRoot ? { storageRoot } : {},
+    emit,
+  );
+  try {
+    const result = await dockerDesktopOperationPromise;
+    emit({ phase: 'done', percent: 100, message: result.message || 'Docker Desktop 已启动，Engine 已就绪' });
+    return toSerializable(result);
+  } catch (error) {
+    const message = error?.message || String(error);
+    emit({ phase: 'error', percent: 0, message });
+    throw error;
+  } finally {
+    dockerDesktopOperationPromise = null;
+  }
+});
+
+ipcMain.handle('rakazo:authorization-status', async () => ({
+  stored: Boolean(readRakazoAuthBundle()),
+  encryptionAvailable: Boolean(safeStorage && safeStorage.isEncryptionAvailable()),
+}));
+
+ipcMain.handle('rakazo:bootstrap-authorization', async () => bootstrapRakazoAuthorization());
+
+ipcMain.handle('rakazo:start-all', async (_event, rawOptions) => {
+  if (rakazoDesktopStartPromise || dockerDesktopOperationPromise) {
+    throw new Error('Rakazo 正在启动，请等待当前任务完成');
+  }
+  const storageRoot = String(rawOptions?.storageRoot || '').trim();
+  rakazoDesktopStartPromise = runRakazoDesktopStartAll({
+    storageRoot,
+    // 用户主动点击“一键启动全部”即明确授权在尚无凭据时创建本机账号；
+    // 随 Codebot 自动启动则会传 false，只恢复已有 safeStorage 凭据。
+    createAuthorization: true,
+  }, (payload) => sendRendererEvent('rakazo:start-all-progress', payload));
+  try {
+    return toSerializable(await rakazoDesktopStartPromise);
+  } finally {
+    rakazoDesktopStartPromise = null;
+  }
+});
+
+ipcMain.handle('rakazo:clear-authorization', async () => {
+  await desktopBackendRequest('/api/rakazo/authorization/desktop-bootstrap', { method: 'DELETE' });
+  clearRakazoAuthBundle();
+  return { configured: false };
+});
+
 function findVSCodeCommands() {
   if (process.platform !== 'win32') return ['code'];
   const commands = [];
@@ -747,6 +878,131 @@ function readAccountToken() {
 
 function clearAccountToken() {
   try { fs.unlinkSync(tokenPath()); } catch (_) {}
+}
+
+function rakazoAuthPath() {
+  return path.join(app.getPath('userData'), RAKAZO_AUTH_FILE);
+}
+
+function saveRakazoAuthBundle(bundle) {
+  if (!safeStorage || !safeStorage.isEncryptionAvailable()) {
+    throw new Error('Windows 安全存储当前不可用，已拒绝把 Rakazo 授权写入磁盘');
+  }
+  const serialized = JSON.stringify(bundle || {});
+  const encrypted = safeStorage.encryptString(serialized);
+  fs.mkdirSync(path.dirname(rakazoAuthPath()), { recursive: true });
+  fs.writeFileSync(rakazoAuthPath(), encrypted, { flag: 'w' });
+}
+
+function readRakazoAuthBundle() {
+  const file = rakazoAuthPath();
+  if (!fs.existsSync(file) || !safeStorage || !safeStorage.isEncryptionAvailable()) return null;
+  try {
+    const decrypted = safeStorage.decryptString(fs.readFileSync(file));
+    const payload = JSON.parse(decrypted);
+    return payload && typeof payload === 'object' ? payload : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function clearRakazoAuthBundle() {
+  try { fs.unlinkSync(rakazoAuthPath()); } catch (_) {}
+}
+
+async function desktopBackendRequest(apiPath, options = {}) {
+  const response = await fetch(`${BACKEND_URL}${apiPath}`, {
+    method: options.method || 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Codebot-Desktop-Token': desktopBridgeToken,
+    },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    redirect: 'error',
+  });
+  const text = await response.text();
+  let payload = {};
+  try { payload = text ? JSON.parse(text) : {}; } catch (_) { payload = {}; }
+  if (!response.ok) {
+    throw new Error(payload?.detail || payload?.message || `Codebot 后端返回 HTTP ${response.status}`);
+  }
+  return payload?.data || payload;
+}
+
+async function bootstrapRakazoAuthorization() {
+  const data = await desktopBackendRequest('/api/rakazo/authorization/desktop-bootstrap', {
+    body: { mode: 'create' },
+  });
+  if (!data?.secretBundle) throw new Error('Rakazo 自动授权没有返回可持久化凭据');
+  saveRakazoAuthBundle(data.secretBundle);
+  return {
+    configured: true,
+    restored: false,
+    health: data.health || {},
+  };
+}
+
+async function restoreRakazoAuthorization() {
+  const bundle = readRakazoAuthBundle();
+  if (!bundle) return { configured: false, restored: false };
+  const data = await desktopBackendRequest('/api/rakazo/authorization/desktop-bootstrap', {
+    body: { mode: 'restore', secretBundle: bundle },
+  });
+  if (data?.secretBundle) saveRakazoAuthBundle(data.secretBundle);
+  return {
+    configured: true,
+    restored: true,
+    health: data?.health || {},
+  };
+}
+
+function rakazoDesktopStartupDependencies() {
+  return {
+    getDockerStatus: (options) => getDockerInstallerStatus(options),
+    startDocker: async (options, onProgress) => {
+      if (dockerDesktopOperationPromise) throw new Error('Docker Desktop 正在执行另一项操作，请稍后重试');
+      dockerDesktopOperationPromise = startInstalledDockerDesktop(options, onProgress);
+      try {
+        return await dockerDesktopOperationPromise;
+      } finally {
+        dockerDesktopOperationPromise = null;
+      }
+    },
+    getRuntimeStatus: () => desktopBackendRequest('/api/rakazo/status', { method: 'GET' }),
+    startRuntime: () => desktopBackendRequest('/api/rakazo/runtime', { body: { action: 'start' } }),
+    getAuthorizationStatus: async () => ({
+      stored: Boolean(readRakazoAuthBundle()),
+      encryptionAvailable: Boolean(safeStorage && safeStorage.isEncryptionAvailable()),
+    }),
+    restoreAuthorization: () => restoreRakazoAuthorization(),
+    bootstrapAuthorization: () => bootstrapRakazoAuthorization(),
+  };
+}
+
+async function runRakazoDesktopStartAll(options = {}, onProgress) {
+  return startRakazoDesktopStack(options, onProgress, rakazoDesktopStartupDependencies());
+}
+
+async function autoStartRakazoDesktopIfConfigured() {
+  const config = await desktopBackendRequest('/api/config/rakazo', { method: 'GET' });
+  if (!config?.enabled) return { skipped: true, reason: 'disabled' };
+  if (!config?.auto_start) {
+    // 未启用自动启动时仍尝试恢复已经存在且当前可连接的授权，保持原有行为；
+    // 失败只说明运行时尚未启动，不会拉起 Docker 或 Compose。
+    return restoreRakazoAuthorization();
+  }
+  if (rakazoDesktopStartPromise || dockerDesktopOperationPromise) {
+    return { skipped: true, reason: 'busy' };
+  }
+  rakazoDesktopStartPromise = runRakazoDesktopStartAll(
+    { createAuthorization: false },
+    (payload) => sendRendererEvent('rakazo:start-all-progress', payload),
+  );
+  try {
+    return await rakazoDesktopStartPromise;
+  } finally {
+    rakazoDesktopStartPromise = null;
+  }
 }
 
 async function shopRequest(apiPath, options = {}) {
@@ -1167,6 +1423,13 @@ function createWindow() {
       const localIP = getLocalIP();
       const url = await resolveRendererUrl();
       await mainWindow.loadURL(url);
+      // 先显示 Codebot 主界面，再在后台按用户保存的 auto_start 编排 Docker、模型、
+      // Rakazo 运行时和既有加密授权；启动慢或失败都不会让整个应用停在加载页。
+      autoStartRakazoDesktopIfConfigured()
+        .then((result) => {
+          if (!result?.skipped) console.log('[rakazo] 随 Codebot 启动编排完成');
+        })
+        .catch((error) => console.warn(`[rakazo] 随 Codebot 启动暂未完成: ${error.message || error}`));
       
       console.log(`
 ╔════════════════════════════════════════╗
@@ -1309,6 +1572,7 @@ async function startBackend() {
     CODEBOT_OPENCODE_SERVER_URL: `http://127.0.0.1:${opencodePort}`,
     CODEBOT_OPENCODE_PREFERRED_PORT: opencodePort,
     CODEBOT_OPENCODE_FALLBACK_PORT: opencodePort,
+    CODEBOT_DESKTOP_BRIDGE_TOKEN: desktopBridgeToken,
   };
   // 清除可能污染 PyInstaller 运行时的 Python 环境变量
   delete env.PYTHONHOME;

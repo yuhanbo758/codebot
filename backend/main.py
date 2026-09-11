@@ -31,7 +31,7 @@ from utils.background_tasks import create_background_task, cancel_background_tas
 from core.lan_auth import path_is_auth_exempt, request_is_authenticated
 
 # 导入 API 路由
-from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router, growth as growth_router, codex as codex_router, security as security_router
+from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router, growth as growth_router, codex as codex_router, rakazo as rakazo_router, security as security_router
 
 
 # 全局组件实例
@@ -222,6 +222,7 @@ async def lifespan(app: FastAPI):
     memory_manager = MemoryManager()
     memory.memory_manager = memory_manager
     lark.memory_manager = memory_manager
+    rakazo_router.memory_manager = memory_manager
     notification_service = NotificationService(app_config.notification)
     notifications.notification_service = notification_service
 
@@ -322,6 +323,19 @@ async def lifespan(app: FastAPI):
                 logger.warning(f"Codex App Server 预热失败，将在首次使用时重试：{exc}")
 
         create_background_task(prepare_codex_runtime(), name="codex-prepare")
+
+    # Rakazo 默认关闭。用户显式启用后，自动启动模式会拉起受管 Compose；
+    # 自动启动关闭时只收敛原本已经运行的容器，使新进程随机采样令牌生效，
+    # 绝不启动用户已经停止的运行时，也不安装 Docker Desktop 或系统功能。
+    if app_config.rakazo.enabled:
+        async def prepare_rakazo_runtime():
+            try:
+                await rakazo_router.prepare_if_enabled()
+                logger.info("Rakazo 本机运行时已准备")
+            except Exception as exc:
+                logger.warning(f"Rakazo 自动启动失败，将在用户操作时重试：{exc}")
+
+        create_background_task(prepare_rakazo_runtime(), name="rakazo-prepare")
 
     # 9. 启动记忆自动整理循环
     global _organize_loop_task
@@ -519,6 +533,17 @@ app.include_router(sandbox_router.router, prefix="/api/sandbox", tags=["沙箱"]
 app.include_router(security_router.router, prefix="/api/security", tags=["安全与配对"])
 app.include_router(growth_router.router, prefix="/api/growth", tags=["成长沉淀"])
 app.include_router(codex_router.router, prefix="/api/codex", tags=["Codex"])
+app.include_router(rakazo_router.router, prefix="/api/rakazo", tags=["Rakazo"])
+app.include_router(
+    rakazo_router.internal_router,
+    prefix="/api/internal/model-sampling",
+    tags=["内部模型采样"],
+)
+app.include_router(
+    rakazo_router.project_mcp_router,
+    prefix="/api/internal/rakazo-project-mcp",
+    tags=["Rakazo 项目工具"],
+)
 app.include_router(gateway_router.router, prefix="/v1", tags=["模型网关"])
 
 

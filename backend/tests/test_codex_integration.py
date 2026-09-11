@@ -251,6 +251,10 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route.reasoning_efforts, ("low", "high"))
         self.assertNotIn("api_key", route.public_model())
         self.assertIn("opencode-go/deepseek-v4-flash", routes)
+        self.assertEqual(
+            routes["opencode-go/deepseek-v4-flash"].upstream_protocol,
+            "chat_completions",
+        )
         self.assertEqual(routes["opencode-go/chat-only"].upstream_protocol, "chat_completions")
         self.assertEqual(routes["opencode-go/claude-compatible"].upstream_protocol, "anthropic")
         self.assertEqual(routes["opencode-go/chat-only"].adapter_package, "@ai-sdk/openai-compatible")
@@ -286,8 +290,8 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             item["protocol"]: item["models"]
             for item in status["openCodeProtocolCoverage"]
         }
-        self.assertEqual(counts["responses"], 2)
-        self.assertEqual(counts["chat_completions"], 2)
+        self.assertEqual(counts["responses"], 1)
+        self.assertEqual(counts["chat_completions"], 3)
         self.assertEqual(counts["anthropic"], 1)
 
     async def test_bridge_protocol_registry_is_explicit_and_extensible(self):

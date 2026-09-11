@@ -76,12 +76,19 @@ def request_is_authenticated(request: Request) -> bool:
 
 
 def path_is_auth_exempt(path: str) -> bool:
-    """配对入口、健康检查和显式只读分享可以在认证前访问。"""
+    """返回由独立鉴权边界保护、无需 LAN 会话的路径。
+
+    内部模型采样入口使用每次后端启动随机生成的独立 Bearer Token；如果先套
+    LAN Token 校验，Docker 私有适配器的 Authorization 会在到达采样路由前被
+    误拒绝。
+    """
     return (
         path == "/api/health"
         or path == "/api/security/status"
         or path == "/api/security/pair"
         or path.startswith("/api/chat/share/")
+        or path.startswith("/api/internal/model-sampling/")
+        or path.startswith("/api/internal/rakazo-project-mcp/")
     )
 
 

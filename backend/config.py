@@ -157,6 +157,32 @@ class CodexConfig(BaseModel):
     skill_dirs: List[str] = []
 
 
+class RakazoConfig(BaseModel):
+    """Rakazo 本机受控运行时配置。
+
+    会话令牌、模型 API Key 和更新器一次性令牌均不属于该模型，避免被写入
+    ``data/config.json``。首版默认关闭，仅允许显式启用的本机 Docker 运行时。
+    """
+
+    enabled: bool = False
+    auto_start: bool = False
+    api_url: str = "http://127.0.0.1:3100"
+    compose_file: str = ""
+    docker_project_name: str = "codebot-rakazo"
+    # stable 只接受正式 Release；experimental 只接受 Codebot 兼容清单中同时
+    # 固定了上游提交、官方镜像摘要和 Compose 摘要的受控实验版本。绝不直接
+    # 跟踪会漂移的 main/edge 标签。
+    release_channel: Literal["stable", "experimental"] = "stable"
+    # 只有用户点击“安装并启动固定实验版”后才会置为 True。单纯手改 channel
+    # 不能绕过显式风险确认，也不会让旧配置在升级后自动进入实验通道。
+    experimental_runtime_enabled: bool = False
+    network_policy: Literal["ask", "deny", "allow"] = "ask"
+    default_project_read: bool = True
+    default_project_write: bool = False
+    default_command_execution: bool = False
+    default_external_network: bool = False
+
+
 class ObsidianKnowledgeBase(BaseModel):
     """A configured Obsidian vault or Markdown knowledge folder."""
     id: str = ""
@@ -224,6 +250,7 @@ class AppConfig(BaseModel):
     integration: IntegrationConfig = IntegrationConfig()
     skills: SkillsConfig = SkillsConfig()
     codex: CodexConfig = CodexConfig()
+    rakazo: RakazoConfig = RakazoConfig()
     obsidian: ObsidianConfig = ObsidianConfig()
     sandbox: SandboxConfig = SandboxConfig()
 
@@ -256,6 +283,7 @@ class Settings(BaseSettings):
     CONVERSATIONS_DB: Path = DATA_DIR / "conversations.db"
     SCHEDULED_TASKS_DB: Path = DATA_DIR / "scheduled_tasks.db"
     TASK_LOGS_DB: Path = DATA_DIR / "task_logs.db"
+    RAKAZO_DB: Path = DATA_DIR / "rakazo.db"
     CHROMA_DIR: Path = DATA_DIR / "chroma"
     BACKUPS_DIR: Path = DATA_DIR / "backups"
     MCP_SERVERS_FILE: Path = DATA_DIR / "mcp_servers.json"
