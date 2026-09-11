@@ -42,7 +42,7 @@ Codebot 保持现有主界面和本地可控架构，不复制第三方产品界
 ### 系统要求
 
 - Python 3.11+
-- Node.js 18+
+- Node.js 22.12+（Electron 43 及当前构建工具链要求）
 - OpenCode CLI
   - `opencode serve` 建议监听 `http://127.0.0.1:11200`
 - Docker Desktop（仅启用 Rakazo 时需要；Windows 桌面版可在“设置 → Rakazo”选择磁盘后一键安装）

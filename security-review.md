@@ -66,7 +66,7 @@
    当前 Electron 更新链主要依赖 GitHub Release/HTTPS，仓库未配置稳定的 Windows 代码签名证书和应用层独立摘要校验。建议为正式安装包配置代码签名，并在自定义下载路径校验服务端签名或固定摘要。
 
 3. **已修复 — Python 运行时依赖 CVE**
-   首次 CI 门禁实际发现旧版 FastAPI/Starlette、python-multipart、python-dotenv，以及未使用的 aiosmtplib、python-jose/ecdsa 等依赖漏洞。现升级实际运行依赖，删除源码未导入的认证和异步邮件死依赖及对应 PyInstaller hidden imports；CI 改为直接审计 `backend/requirements.txt`，不再把 pip-audit 自身环境中的 setuptools 等包误算为应用运行时依赖。2026-09-11 新增的 `PYSEC-2026-3813`、`PYSEC-2026-3814` 覆盖 ChromaDB 当前全部可用版本且上游尚无修复版；Codebot 只使用本地进程内 `PersistentClient`，不启动或连接 Chroma HTTP 服务，因此流水线在源码边界检查通过后精确豁免这两个公告。若后续出现 `HttpClient`、Chroma 服务端命令或 v2 HTTP API 路径，门禁会失败并要求重新评估；其他新漏洞仍保持阻断。
+   首次 CI 门禁实际发现旧版 FastAPI/Starlette、python-multipart、python-dotenv，以及未使用的 aiosmtplib、python-jose/ecdsa 等依赖漏洞。现升级实际运行依赖，删除源码未导入的认证和异步邮件死依赖及对应 PyInstaller hidden imports；CI 改为直接审计 `backend/requirements.txt`，不再把 pip-audit 自身环境中的 setuptools 等包误算为应用运行时依赖。2026-09-11 新增的 `PYSEC-2026-3813`、`PYSEC-2026-3814` 覆盖 ChromaDB 当前全部可用版本且上游尚无修复版；Codebot 只使用本地进程内 `PersistentClient`，不启动或连接 Chroma HTTP 服务，因此流水线在源码边界检查通过后精确豁免这两个公告。若后续出现 `HttpClient`、Chroma 服务端命令或 v2 HTTP API 路径，门禁会失败并要求重新评估；其他新漏洞仍保持阻断。同轮 Electron 审计发现的 `@xmldom/xmldom`、`fast-uri`、`js-yaml` 高危漏洞均已有修复，已更新锁文件而未做豁免；CI Node 运行时同步升级到 Electron 43 所需的 Node 22，并使用当前 `setup-python` Action，避免旧 Node 运行时兼容警告。
 
 ## 验证记录
 
