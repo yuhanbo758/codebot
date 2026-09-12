@@ -45,6 +45,7 @@ from core.codex_model_bridge import (  # noqa: E402
     responses_proxy_to_result,
 )
 from core.prompt_optimizer import optimize_agent_prompt  # noqa: E402
+from core.model_route_registry import ModelRoute, model_route_registry  # noqa: E402
 from core.scheduler import TaskScheduler, normalize_task_executor  # noqa: E402
 from main import app  # noqa: E402
 
@@ -131,6 +132,29 @@ class _FakeNotificationClient:
 
 
 class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_opencode_oauth_is_listed_and_refreshed_in_host_bridge(self):
+        """安装版同样列出授权模型，调用时取新令牌而非启动时的旧快照。"""
+        from dataclasses import replace
+        route = ModelRoute(
+            display_id="openai/test", display_name="Test", opencode_provider="openai",
+            opencode_model="test", codex_provider="bridge_test", codex_model="test",
+            base_url="https://example.invalid/v1", env_key="", api_key="old-test-token",
+            upstream_protocol="responses_proxy", credential_mode="opencode_oauth", connected=True,
+        )
+        fresh = replace(route, api_key="fresh-test-token")
+        with patch.object(model_route_registry, "discover_sync", return_value=({route.route_id: route}, {})):
+            discovered, incompatible = self.runtime._discover_opencode_models_sync()
+        self.assertIn(route.route_id, discovered)
+        self.assertFalse(incompatible)
+        self.runtime._opencode_models = discovered
+        with (
+            patch.object(model_route_registry, "ensure_fresh_credentials", return_value=fresh) as refresh,
+            patch("core.codex_model_bridge.bridge_responses_request", new=AsyncMock()) as bridge,
+        ):
+            await self.runtime.bridge_responses(route.codex_provider, {"model": "test"})
+        refresh.assert_called_once_with(route.route_id)
+        bridge.assert_awaited_once_with(fresh, {"model": "test"})
+
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.original_db = settings.CONVERSATIONS_DB

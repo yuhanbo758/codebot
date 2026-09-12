@@ -304,6 +304,8 @@ build.bat
 
 ## 变更日志
 
+2026-09-12：Rakazo 模型选择移除前置采样探测，改为复用当前 OpenCode 连接；设置页改为全目录搜索、筛选和滚动。Codex 接入 OpenCode 内置 OpenAI OAuth 宿主刷新桥；聊天目录增加请求顺序保护，目录暂缺时保留模型选择。发布流程增加 Windows 后端集成测试，三平台产物检查增加 PYZ 模型路由模块完整性检查。该检查不等价于所有上游模型的真实调用验收。
+
 | 日期 | 变更内容 | 影响范围 |
 |------|----------|---------|
 | 2026-09-12 | 修复 Rakazo/Codex 选择 `opencode-go/*` 模型时报 `Request is missing x-opencode-session`：OpenCode Go（Console Go）网关合同要求客户端携带稳定 `x-opencode-session` 会话头，OpenCode Server 代理时会自动注入而 Codebot 直连采样未补齐。现由模型路由注册表在构建 `opencode-go` 路由时进程级注入该 header，Responses 模型随之正确升级为 `responses_proxy` 桥并由 Codebot 注入；同时按 OpenCode 请求身份合同给所有桥接厂商直连请求补默认 `Codebot/<版本>` User-Agent（Provider 自定义 header 优先），覆盖 Chat/Anthropic/Responses 全协议；修订 Codex 集成测试断言，后端 89 项测试通过 | backend/core/model_route_registry.py, backend/tests/test_codex_integration.py, backend/core/codex_model_bridge.py, AGENTS.md |

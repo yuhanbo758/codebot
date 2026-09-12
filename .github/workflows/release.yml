@@ -145,6 +145,9 @@ jobs:
           pip install -r backend/requirements.txt
           pip install pyinstaller
 
+      - name: Test backend model integrations
+        run: python -m unittest discover -s backend/tests -p "test_*integration.py"
+
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci

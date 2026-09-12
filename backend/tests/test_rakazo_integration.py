@@ -1065,18 +1065,18 @@ class RakazoRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
         with patch.object(model_route_registry, "catalog", return_value={self.route.route_id: self.route}):
             current = self.runtime.models()[0]
-        self.assertEqual(current["compatibilityStatus"], "verified")
+        self.assertEqual(current["compatibilityStatus"], "available")
 
         changed = make_route(base_url="https://changed.example/v1")
         with patch.object(model_route_registry, "catalog", return_value={changed.route_id: changed}):
             invalidated = self.runtime.models()[0]
-        self.assertEqual(invalidated["compatibilityStatus"], "probe_failed")
+        self.assertEqual(invalidated["compatibilityStatus"], "available")
         self.assertEqual(invalidated["probeState"], "unprobed")
         self.assertTrue(invalidated["selectable"])
-        self.assertIn("首次选择", invalidated["incompatibilityReason"])
+        self.assertFalse(invalidated["probeRequired"])
 
-    async def test_first_selection_automatically_probes_once(self):
-        """聊天选择 OpenCode 模型时自动探测，不再要求用户先去设置页逐个点。"""
+    async def test_first_selection_reuses_connection_without_probe(self):
+        """首次使用不发额外模型请求，也不依赖旧探测记录。"""
         with patch.object(model_route_registry, "ensure_fresh_credentials", return_value=self.route):
             with patch.object(
                 self.runtime,
@@ -1095,8 +1095,21 @@ class RakazoRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     route = await self.runtime.ensure_route_ready(self.route.route_id)
 
         self.assertEqual(route.route_id, self.route.route_id)
-        probe.assert_awaited_once_with(self.route.route_id)
-        self.assertEqual(verified.call_count, 3)
+        probe.assert_not_awaited()
+        self.assertEqual(verified.call_count, 0)
+
+    async def test_failed_probe_does_not_block_connected_route_but_disconnect_does(self):
+        """历史诊断失败不能阻止调用，已断开的连接仍必须拒绝。"""
+        with (
+            patch.object(model_route_registry, "get", return_value=self.route),
+            patch.object(self.runtime, "_probe_row", return_value={"status": "probe_failed"}) as old_probe,
+        ):
+            self.assertEqual(self.runtime.verified_route(self.route.route_id), self.route)
+        old_probe.assert_not_called()
+        disconnected = make_route(connected=False)
+        with patch.object(model_route_registry, "get", return_value=disconnected):
+            with self.assertRaises(RakazoRuntimeError):
+                self.runtime.verified_route(disconnected.route_id)
 
     async def test_models_only_include_models_enabled_in_current_opencode_server(self):
         """未连接 Provider 的静态模型不能再污染 Rakazo 兼容性列表。"""

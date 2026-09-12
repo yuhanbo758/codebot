@@ -171,19 +171,9 @@ class CodexRuntime:
     def _discover_opencode_models_sync(self) -> tuple[Dict[str, OpenCodeResponsesModel], Dict[str, str]]:
         """读取本机 OpenCode 的公开 provider 元数据；失败时只禁用兼容扩展。"""
         routes, incompatible = model_route_registry.discover_sync(force=True)
-        # OpenCode OAuth 的短期 access token 由 Rakazo 宿主采样桥按请求刷新；
-        # Codex App Server 的 provider 配置是进程启动快照，无法安全轮换它。
-        # Codex 自身已有官方 ChatGPT 账号通道，因此这里继续只注入稳定 API/
-        # loopback 路由，避免 OAuth 到期后把 Codex 历史线程变成失效 provider。
-        filtered = {
-            route_id: route
-            for route_id, route in routes.items()
-            if route.credential_mode != "opencode_oauth"
-        }
-        for route_id, route in routes.items():
-            if route.credential_mode == "opencode_oauth":
-                incompatible[route_id] = "该 OpenCode OAuth 路由由 Rakazo 宿主桥动态刷新；Codex 使用自身官方账号通道"
-        return filtered, incompatible
+        # OAuth 路由由本机 Responses 桥承接，短期令牌只在宿主按请求刷新，
+        # 不注入 App Server 的启动配置；开发态与安装包共用同一目录。
+        return routes, incompatible
 
     @staticmethod
     def _route_signature(route: OpenCodeResponsesModel) -> tuple[Any, ...]:
@@ -347,6 +337,9 @@ class CodexRuntime:
         if not model:
             raise ValueError("Responses 请求缺少 model")
         route = self._bridge_route(codex_provider, model)
+        if route.credential_mode == "opencode_oauth":
+            # 使用共享凭据刷新锁，避免 Codex/Rakazo 并发消费旋转令牌。
+            route = await asyncio.to_thread(model_route_registry.ensure_fresh_credentials, route.route_id)
         return await bridge_responses_request(route, payload)
 
     def _build_sdk_config(self) -> Any:

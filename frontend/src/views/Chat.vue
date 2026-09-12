@@ -917,7 +917,7 @@
                 </el-input>
               </el-form-item>
               <el-form-item v-if="handoffForm.target_executor === 'rakazo'" label="初始模型" :required="!handoffRakazoExists">
-                <el-select v-model="handoffForm.route_id" filterable style="width: 100%" placeholder="选择 OpenCode 当前可用模型；首次使用自动验证" :loading="handoffModelsLoading">
+                <el-select v-model="handoffForm.route_id" filterable style="width: 100%" placeholder="搜索并选择 OpenCode 当前可用模型" :loading="handoffModelsLoading">
                   <el-option
                     v-for="model in handoffModels"
                     :key="model.id"
@@ -2226,6 +2226,7 @@ const reasoningEffortLabel = (effort) => ({
 }[effort] || effort)
 
 const rakazoModelStatusLabel = (status, probeState = '') => {
+  if (status === 'available') return '可直接使用'
   if (status === 'verified') return '已自动验证'
   if (status === 'probe_failed' && probeState === 'unprobed') return '首次使用自动验证'
   if (status === 'probe_failed' && probeState === 'failed') return '上次失败，选择后重试'
@@ -2877,25 +2878,29 @@ const loadConversations = async (autoSelect = false) => {
 }
 
 // 加载可用模型列表
+let modelLoadSequence = 0
 const loadModels = async (options = {}) => {
+  const sequence = ++modelLoadSequence
   const manual = Boolean(options?.manual)
   const useRakazo = Boolean(options?.rakazo || isRakazoConversation.value)
+  const useCodex = codexEnabled.value
   modelsLoading.value = true
   try {
-    const res = await axios.get(useRakazo ? '/api/rakazo/models' : codexEnabled.value ? '/api/codex/models' : '/api/chat/models', {
-      // Rakazo 直接镜像 OpenCode 当前连接的可选目录。未探测路由可以选择，
-      // 后端会在首次创建/切换时自动做真实文本、流式与工具门禁。
+    const res = await axios.get(useRakazo ? '/api/rakazo/models' : useCodex ? '/api/codex/models' : '/api/chat/models', {
+      // 复用 OpenCode 当前连接，不发送首次使用探测请求。
       params: useRakazo
         ? { refresh: manual ? true : undefined }
         : undefined,
     })
+    // 切换执行器期间旧请求可能后返回，不能覆盖新执行器的目录。
+    if (sequence !== modelLoadSequence) return
     if (manual && res.data?.success === false) {
       ElMessage.error(res.data?.message || '刷新模型列表失败')
     }
     const rawData = res.data?.data
     const raw = useRakazo
       ? (Array.isArray(rawData) ? rawData : (rawData?.models || []))
-      : codexEnabled.value
+      : useCodex
       ? (Array.isArray(rawData) ? rawData : rawData?.models || [])
       : (rawData?.models || [])
     const newList = raw.map(m => {
@@ -2931,12 +2936,10 @@ const loadModels = async (options = {}) => {
       selectedModel.value = saved
     }
     if (saved && !newList.find(m => m.id === saved)) {
-      if (!useRakazo && codexEnabled.value && saved.includes('/')) {
-        // 当前运行时没有返回该旧 OpenCode 模型时清空选择，阻止它误落到
-        // ChatGPT 账号通道；支持桥接的 Chat/Anthropic 模型会正常出现在 newList。
-        selectedModel.value = ''
-        localStorage.removeItem(LAST_MODEL_KEY)
-        ElMessage.warning(`模型 ${saved} 不支持 Codex Responses，已切换为 Codex 默认模型；关闭 Codex 后仍可继续使用原模型。`)
+      if (!useRakazo && useCodex && saved.includes('/')) {
+        // 目录暂不可用不等于协议不支持；保留选择并禁止自动落到原生账号。
+        newList.push(makeModelOption(saved, { runnable: false, source: 'saved' }))
+        if (manual) ElMessage.warning(`当前目录未返回模型 ${saved}，请检查 OpenCode 连接后刷新；已保留您的选择。`)
       } else if (!useRakazo) {
         newList.push(makeModelOption(saved, { runnable: false, source: 'saved' }))
       }
@@ -2946,6 +2949,7 @@ const loadModels = async (options = {}) => {
       ElMessage.warning(res.data.message)
     }
   } catch {
+    if (sequence !== modelLoadSequence) return
     // 加载失败时，如果有已保存模型，保留其占位条目
     const saved = useRakazo ? '' : normalizeModelId(selectedModel.value)
     if (saved && saved !== selectedModel.value) {
@@ -2960,7 +2964,7 @@ const loadModels = async (options = {}) => {
       ElMessage.error('刷新模型列表失败')
     }
   } finally {
-    modelsLoading.value = false
+    if (sequence === modelLoadSequence) modelsLoading.value = false
   }
 }
 

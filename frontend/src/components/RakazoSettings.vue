@@ -52,7 +52,7 @@
         <div class="step-index">2</div>
         <div class="step-copy">
           <strong>OpenCode 模型连接</strong>
-          <span>{{ modelsReady ? `已同步 ${status?.selectableModelCount} 个可选模型；首次使用自动验证` : '等待 OpenCode 当前连接的可选模型' }}</span>
+          <span>{{ modelsReady ? `已同步 ${status?.selectableModelCount} 个可选模型，可直接使用` : '等待 OpenCode 当前连接的可选模型' }}</span>
         </div>
         <el-tag :type="modelsReady ? 'success' : 'warning'">{{ modelsReady ? '已同步' : '待连接' }}</el-tag>
       </article>
@@ -187,7 +187,7 @@
       <div><span>项目</span><code>{{ status?.projectCount ?? 0 }}</code></div>
       <div><span>OpenCode 已启用</span><code>{{ status?.openCodeEnabledModelCount ?? 0 }}</code></div>
       <div><span>Rakazo 可选择</span><code>{{ status?.selectableModelCount ?? 0 }}</code></div>
-      <div><span>已自动验证</span><code>{{ status?.verifiedModelCount ?? 0 }}</code></div>
+      <div><span>可用模型</span><code>{{ status?.selectableModelCount ?? 0 }}</code></div>
     </div>
     <el-alert v-if="displayRuntimeError" class="section-alert" :title="displayRuntimeError" type="error" show-icon :closable="false" />
     <el-alert
@@ -318,18 +318,18 @@
 
     <el-divider content-position="left">OpenCode 已启用模型</el-divider>
     <div class="table-toolbar">
-      <span>OpenCode 当前已启用 {{ modelCatalogTotal }} 个；可代理模型可直接在聊天中选择，首次使用由 Codebot 自动验证。</span>
+      <span>OpenCode 当前已启用 {{ modelCatalogTotal }} 个；复用已有授权，可代理模型可直接在聊天中选择。</span>
       <div class="table-actions">
         <el-select v-model="statusFilter" clearable placeholder="全部状态" style="width: 180px">
-          <el-option label="已自动验证" value="verified" />
-          <el-option label="待自动验证/上次失败" value="probe_failed" />
+          <el-option label="可直接使用" value="available" />
           <el-option label="当前连接不可安全代理" value="authorization_required" />
           <el-option label="协议待适配" value="protocol_pending" />
         </el-select>
+        <el-input v-model="modelSearch" clearable placeholder="搜索模型或 Provider" style="width: 240px" />
         <el-button :loading="modelsLoading" @click="loadModels(true)">刷新目录</el-button>
       </div>
     </div>
-    <el-table :data="models" max-height="460" stripe>
+    <el-table :data="filteredModels" max-height="460" stripe>
       <el-table-column prop="name" label="模型" min-width="230" show-overflow-tooltip />
       <el-table-column prop="provider" label="Provider" width="140" />
       <el-table-column prop="protocol" label="协议" width="150" />
@@ -339,30 +339,9 @@
         </template>
       </el-table-column>
       <el-table-column prop="incompatibilityReason" label="说明" min-width="300" show-overflow-tooltip />
-      <el-table-column prop="lastProbeAt" label="最近探测" width="180">
-        <template #default="scope">{{ formatTime(scope.row.lastProbeAt) }}</template>
-      </el-table-column>
-      <el-table-column label="操作" width="120" fixed="right">
-        <template #default="scope">
-          <el-button
-            size="small"
-            :loading="probingRoute === scope.row.id"
-            :disabled="!canProbe(scope.row)"
-            @click="probe(scope.row.id)"
-          >{{ scope.row.probeState === 'unprobed' ? '立即验证' : '重新验证' }}</el-button>
-        </template>
-      </el-table-column>
     </el-table>
     <div class="model-pagination">
-      <span>第 {{ modelPage }} 页，每页 {{ modelPageSize }} 个</span>
-      <el-pagination
-        v-model:current-page="modelPage"
-        :page-size="modelPageSize"
-        :total="modelTotal"
-        layout="prev, pager, next"
-        background
-        @current-change="loadModels(false)"
-      />
+      <span>显示 {{ filteredModels.length }} / {{ modelCatalogTotal }} 个模型，可滚动查看</span>
     </div>
 
     <el-divider content-position="left">版本观察</el-divider>
@@ -392,14 +371,19 @@ const saving = ref(false)
 const authSaving = ref(false)
 const modelsLoading = ref(false)
 const runtimeAction = ref('')
-const probingRoute = ref('')
 const updateLoading = ref(false)
 const status = ref(null)
 const models = ref([])
 const statusFilter = ref('')
-const modelPage = ref(1)
-const modelPageSize = 20
-const modelTotal = ref(0)
+const modelSearch = ref('')
+// 全目录本地搜索，避免只搜索当前分页导致漏掉已授权模型。
+const filteredModels = computed(() => {
+  const query = modelSearch.value.trim().toLowerCase()
+  return models.value.filter(model =>
+    (!statusFilter.value || model.compatibilityStatus === statusFilter.value) &&
+    (!query || [model.id, model.name, model.provider].some(value => String(value || '').toLowerCase().includes(query)))
+  )
+})
 const modelCatalogTotal = ref(0)
 const sessionToken = ref('')
 const updateInfo = ref(null)
@@ -473,6 +457,7 @@ const displayRuntimeError = computed(() => {
 const formatTime = (value) => value ? new Date(value).toLocaleString('zh-CN') : '-'
 const modelStatusLabel = (model) => {
   const statusValue = model?.compatibilityStatus
+  if (statusValue === 'available') return '可直接使用'
   if (statusValue === 'verified') return '已自动验证'
   if (statusValue === 'probe_failed' && model?.probeState === 'unprobed') return '首次使用自动验证'
   if (statusValue === 'probe_failed') return '上次验证失败'
@@ -482,15 +467,11 @@ const modelStatusLabel = (model) => {
   }[statusValue] || statusValue || '等待验证')
 }
 const modelStatusType = (model) => {
+  if (model?.compatibilityStatus === 'available') return 'success'
   if (model?.compatibilityStatus === 'verified') return 'success'
   if (model?.compatibilityStatus === 'probe_failed' && model?.probeState === 'unprobed') return 'warning'
   return ({ authorization_required: 'warning', protocol_pending: 'info', probe_failed: 'danger' }[model?.compatibilityStatus] || 'info')
 }
-const canProbe = (model) => !['authorization_required', 'protocol_pending'].includes(model?.compatibilityStatus)
-watch(statusFilter, async () => {
-  modelPage.value = 1
-  await loadModels(false)
-})
 
 const loadModels = async (refresh = false) => {
   modelsLoading.value = true
@@ -498,14 +479,10 @@ const loadModels = async (refresh = false) => {
     const response = await axios.get('/api/rakazo/models', {
       params: {
         refresh,
-        status: statusFilter.value || undefined,
-        offset: (modelPage.value - 1) * modelPageSize,
-        limit: modelPageSize,
       },
     })
     const payload = response.data?.data || {}
     models.value = Array.isArray(payload) ? payload : (payload.models || [])
-    modelTotal.value = Array.isArray(payload) ? payload.length : Number(payload.total || 0)
     modelCatalogTotal.value = Array.isArray(payload)
       ? payload.length
       : Number(payload.openCodeEnabledTotal ?? payload.catalogTotal ?? 0)
@@ -861,20 +838,6 @@ const startDocker = async () => {
     ElMessage.error(message)
   } finally {
     dockerStarting.value = false
-  }
-}
-
-const probe = async (routeId) => {
-  probingRoute.value = routeId
-  try {
-    const response = await axios.post('/api/rakazo/models/probe', { route_id: routeId })
-    const probeResult = response.data?.data
-    ElMessage[probeResult?.status === 'verified' ? 'success' : 'error'](probeResult?.status === 'verified' ? '模型兼容探测通过' : (probeResult?.errorSummary || '模型兼容探测失败'))
-    await loadModels(false)
-  } catch (error) {
-    ElMessage.error(detail(error, '模型兼容探测失败'))
-  } finally {
-    probingRoute.value = ''
   }
 }
 

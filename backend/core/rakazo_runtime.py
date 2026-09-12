@@ -2603,17 +2603,19 @@ if (action === 'copy') {
                     probe_state = "verified" if status == "verified" else "failed"
                 else:
                     status = "probe_failed"
-                    reason = "首次选择时由 Codebot 自动验证文本、流式、工具调用、取消和模型身份。"
+                    reason = ""
+                # 诊断结果不作为聊天准入门槛；复用当前 OpenCode 连接和协议。
+                status = "available"
+                reason = "复用 OpenCode 授权，可直接选择使用"
             public = route.public_model(
                 compatibility_status=status,
                 incompatibility_reason=reason,
                 last_probe_at=last_probe_at,
             )
             public.update({
-                # selectable 表示“可选择并自动验证”，verified 才表示已经可以
-                # 进入内部采样端点；两者分离避免继续要求用户手工逐个探测。
+                # 当前连接和协议决定可用性，历史探测仅保留为诊断记录。
                 "selectable": selectable,
-                "probeRequired": bool(selectable and status != "verified"),
+                "probeRequired": False,
                 "probeState": probe_state,
                 "runnable": selectable,
             })
@@ -2626,13 +2628,12 @@ if (action === 'copy') {
             raise RakazoRuntimeError("所选模型不在当前 OpenCode 目录中", status_code=400)
         if route.compatibility_status != "probe_required":
             raise RakazoRuntimeError(route.incompatibility_reason or "所选模型不可用于 Rakazo", status_code=409)
-        probe = self._probe_row(route.route_id)
-        if not probe or probe.get("route_fingerprint") != route.route_fingerprint or probe.get("status") != "verified":
-            raise RakazoRuntimeError("所选模型尚未通过当前路由指纹的 Rakazo 真实兼容探测", status_code=409)
+        if not route.connected:
+            raise RakazoRuntimeError("所选模型已不在 OpenCode 当前连接中", status_code=409)
         return route
 
     async def ensure_route_ready(self, route_id: str) -> ModelRoute:
-        """保证 OpenCode 当前可选模型在第一次 Rakazo 使用前完成真实验证。"""
+        """复用 OpenCode 连接；刷新授权但不发送额外探测请求。"""
         try:
             route = await asyncio.to_thread(model_route_registry.ensure_fresh_credentials, route_id)
         except Exception as exc:
@@ -2641,22 +2642,7 @@ if (action === 'copy') {
             raise RakazoRuntimeError("所选模型已不在 OpenCode 当前连接中", status_code=409)
         if route.compatibility_status != "probe_required":
             raise RakazoRuntimeError(route.incompatibility_reason or "所选模型不能用于 Rakazo", status_code=409)
-        try:
-            return self.verified_route(route_id)
-        except RakazoRuntimeError:
-            pass
-
-        async with self._automatic_probe_lock:
-            # 等待锁期间可能已由另一条选择请求完成探测，先再次检查再调用模型。
-            try:
-                return self.verified_route(route_id)
-            except RakazoRuntimeError:
-                pass
-            result = await self.probe_model(route_id)
-            if str(result.get("status") or "") != "verified":
-                reason = str(result.get("errorSummary") or "未知兼容错误")
-                raise RakazoRuntimeError(f"模型首次自动验证失败：{reason}", status_code=409)
-            return self.verified_route(route_id)
+        return route
 
     async def sample(self, route_id: str, payload: Mapping[str, Any], *, require_verified: bool = True) -> BridgedChatResult:
         try:
@@ -2959,10 +2945,9 @@ if (action === 'copy') {
     def select_initial_route(self, preferred_route_id: str = "") -> str:
         """为新项目选择一次性的初始模型，不把模型永久固定到对话。
 
-        优先采用调用方当前选择，其次采用 Codebot 通用默认模型，再选择已经
-        通过 Rakazo 门禁的路由；只有完全没有已验证路由时才选第一个可探测
-        路由。真正创建前仍会调用 ``ensure_route_ready``，因此不会把未验证模型
-        偷偷当作可用模型，也不会在失败后静默换模。
+        优先采用调用方当前选择，其次采用 Codebot 通用默认模型，再选当前
+        可用目录中的路由。创建前只刷新授权和检查连接，不发送探测请求，
+        也不会在实际调用失败后静默换模。
         """
         selectable = [item for item in self.models() if bool(item.get("selectable"))]
         if not selectable:

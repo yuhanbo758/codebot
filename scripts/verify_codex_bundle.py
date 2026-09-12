@@ -12,6 +12,23 @@ def main() -> int:
     if len(sys.argv) != 2:
         raise SystemExit("usage: verify_codex_bundle.py <pyinstaller-dist-dir>")
     root = Path(sys.argv[1]).resolve()
+    # 仅确认 codex 子进程存活不足以证明 Codebot 的第三方模型链路被打包。
+    # 直接检查最终可执行文件的 PYZ，而不是源码目录或开发环境的导入结果。
+    from PyInstaller.archive.readers import CArchiveReader
+    backend_bin = root / ("codebot-backend.exe" if os.name == "nt" else "codebot-backend")
+    archive = CArchiveReader(str(backend_bin))
+    pyz_name = next((name for name in archive.toc if name.endswith(".pyz")), None)
+    if pyz_name is None:
+        raise RuntimeError("后端产物缺少 PYZ 模块归档")
+    bundled_modules = archive.open_embedded_archive(pyz_name).toc
+    required_modules = {
+        "core.codex_runtime", "core.codex_model_bridge", "core.model_route_registry",
+        "core.rakazo_runtime", "api.routes.codex", "api.routes.rakazo",
+    }
+    missing = required_modules.difference(bundled_modules)
+    if missing:
+        raise RuntimeError(f"后端产物缺少模型路由模块：{sorted(missing)}")
+    print("Codebot bundled model routing modules verified")
     candidates = [
         path
         for path in root.rglob("codex.exe" if os.name == "nt" else "codex")

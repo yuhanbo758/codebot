@@ -151,8 +151,8 @@ class ModelRoute:
             if self.upstream_protocol == "responses"
             else adapter.public_protocol if adapter else self.upstream_protocol
         )
-        # Codex 既有调用不传状态，仍按“路由已可装载”展示为可运行；Rakazo 会
-        # 显式传入真实探测状态，在通过文本、流式和工具回环前保持禁用。
+        # Codex 保留既有状态兼容；Rakazo 显式传 available 表示连接可代理，
+        # 不把协议可用误报为已经完成真实模型探测。
         status = (
             compatibility_status
             if compatibility_status is not None
@@ -167,7 +167,7 @@ class ModelRoute:
             "provider": self.opencode_provider,
             "model": self.opencode_model,
             "source": "opencode",
-            "runnable": status == "verified",
+            "runnable": status in {"verified", "available"},
             "protocol": public_protocol,
             "transport": "codebot-bridge" if self.uses_bridge else "direct",
             "modelProvider": self.codex_provider,
@@ -177,8 +177,8 @@ class ModelRoute:
             "maxOutputTokens": self.max_output_tokens,
             "capabilities": {
                 "reasoning": self.reasoning,
-                # Agent 模型必须通过探测后才声明工具调用可用。
-                "tools": status == "verified",
+                # available 表示路由支持工具协议，不代表已对上游做实测。
+                "tools": status in {"verified", "available"},
             },
             "routeFingerprint": self.route_fingerprint,
             "credentialMode": self.credential_mode,

@@ -67,6 +67,8 @@ backend/dist/
 backend/dist_build/
 backend/build_tmp/
 backend/build_tmp2/
+backend/build_model_routing/
+backend/dist_model_routing/
 
 # 环境配置
 .env
