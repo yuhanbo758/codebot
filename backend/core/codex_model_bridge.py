@@ -854,11 +854,11 @@ def _apply_opencode_oauth_responses_contract(
     """复用 OpenCode 内置 OpenAI OAuth 的纯 Responses 传输合同。
 
     这只调整一次模型请求的端点合同，不调用 OpenCode Session/Agent。OAuth
-    token 与账号 header 均来自宿主内存中的精确路由，绝不传给 Rakazo 容器。
+    token 与账户 header 均来自宿主内存中的精确路由，绝不传给 Rakazo 容器。
     """
     if str(getattr(route, "credential_mode", "") or "") != "opencode_oauth":
         return
-    # OpenCode 的 ``chat.params`` 会清除 maxOutputTokens 以匹配 Codex 后端；
+    # OpenCode 的 ``chat.params`` 会清空 maxOutputTokens 以匹配 Codex 后端，
     # 同时每次请求提供独立 session-id。探测仍会核验真实 usage 与结束原因。
     request.pop("max_output_tokens", None)
     request["store"] = False

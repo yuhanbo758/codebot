@@ -2122,6 +2122,72 @@ if (action === 'copy') {
                     logger.warning(f"清理 Rakazo 临时 Compose 环境文件失败：{_safe_error(exc)}")
 
     @staticmethod
+    def _is_postgres_auth_failure(result: subprocess.CompletedProcess[str]) -> bool:
+        """识别 Prisma P1000：Compose .env 密钥与既有 Postgres volume 密码失配。"""
+        output = f"{result.stderr or ''}\n{result.stdout or ''}"
+        return "P1000" in output or "Authentication failed against database server" in output
+
+    async def _realign_postgres_password(self) -> bool:
+        """把既有 Postgres volume 内的数据库密码对齐到当前受管密钥。
+
+        Postgres 只在 volume 首次初始化时写入密码；Codebot 密钥存储重建后
+        新凭证会被旧 volume 拒绝（P1000），api 容器陷入重启循环。这里通过
+        容器本地 trust socket 执行 ``ALTER USER``，保留全部数据；非受管
+        Compose、密钥异常或容器不可达时一律失败关闭，不猜测旧密码。
+        """
+        if not self._is_managed_compose():
+            return False
+        docker = self._docker_executable()
+        if not docker:
+            return False
+        try:
+            secrets_payload = self._runtime_secrets()
+        except RakazoRuntimeError:
+            return False
+        password = str(secrets_payload.get("POSTGRES_PASSWORD") or "")
+        if not password or "'" in password:
+            return False
+        project_name = str(app_config.rakazo.docker_project_name or "")
+        if not _COMPOSE_PROJECT_RE.fullmatch(project_name):
+            return False
+        listed = await self._run_process(
+            [
+                docker,
+                "ps",
+                "--filter",
+                f"label=com.docker.compose.project={project_name}",
+                "--filter",
+                "label=com.docker.compose.service=postgres",
+                "--format",
+                "{{.ID}}",
+            ],
+            timeout=30,
+            environment=self._docker_environment(),
+        )
+        if listed.returncode != 0:
+            return False
+        container_id = next((line.strip() for line in (listed.stdout or "").splitlines() if line.strip()), "")
+        if not container_id:
+            return False
+        realigned = await self._run_process(
+            [
+                docker,
+                "exec",
+                container_id,
+                "psql",
+                "-U",
+                "rakazo",
+                "-d",
+                "rakazo",
+                "-c",
+                f"ALTER USER rakazo WITH PASSWORD '{password}';",
+            ],
+            timeout=60,
+            environment=self._docker_environment(),
+        )
+        return realigned.returncode == 0
+
+    @staticmethod
     def _is_transient_compose_network_failure(result: subprocess.CompletedProcess[str]) -> bool:
         """只识别可安全重试的 Docker Registry/传输层临时错误。
 
@@ -2318,6 +2384,7 @@ if (action === 'copy') {
             raise RakazoRuntimeError("仍有 Rakazo 任务运行，拒绝停止或重启", status_code=409)
         max_attempts = 4 if action in {"start", "restart"} else 1
         result: Optional[subprocess.CompletedProcess[str]] = None
+        realigned_auth_failure = False
         for attempt in range(1, max_attempts + 1):
             # restart 首次失败后只做 ``up -d`` 收敛，不再次强制重建整套容器；
             # 这可恢复镜像拉取或健康检查瞬断留下的 Created 服务。
@@ -2327,6 +2394,25 @@ if (action === 'copy') {
                 timeout=1800 if compose_action in {"start", "restart"} else 180,
             )
             if result.returncode == 0:
+                break
+            if (
+                action in {"start", "restart"}
+                and not realigned_auth_failure
+                and self._is_postgres_auth_failure(result)
+            ):
+                # Postgres volume 保留首次初始化密码，密钥存储重建后新凭证会被
+                # 拒绝（P1000）；对齐受管密码后只重试一次，其余失败关闭不变。
+                realigned_auth_failure = True
+                realigned = await self._realign_postgres_password()
+                self.audit(
+                    None,
+                    f"runtime.{action}.postgres-realign",
+                    "success" if realigned else "failed",
+                    {"attempt": attempt},
+                )
+                if realigned:
+                    await asyncio.sleep(2)
+                    continue
                 break
             if attempt >= max_attempts or not self._is_transient_compose_network_failure(result):
                 break

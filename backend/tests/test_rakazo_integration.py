@@ -1394,5 +1394,177 @@ class RakazoRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ids = {item["id"] for item in response.json()["data"]}
         self.assertEqual(ids, {"p/verified", "p/first-use"})
 
+    async def test_start_realigns_stale_postgres_volume_password_and_retries_once(self):
+        """旧 pgdata volume 保留首次初始化密码；P1000 时对齐受管密钥并只重试一次。"""
+        entry = self.enable_fixed_experimental_runtime()
+        compose_auth_failure = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "Error: P1000: Authentication failed against database server, "
+                "the provided database credentials for `rakazo` are not valid.\n"
+                "dependency failed to start: container codebot-rakazo-api-1 is unhealthy"
+            ),
+        )
+        compose_success = subprocess.CompletedProcess(args=[], returncode=0, stdout="started", stderr="")
+        postgres_container = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="postgres-container-id\n", stderr=""
+        )
+        alter_role = subprocess.CompletedProcess(args=[], returncode=0, stdout="ALTER ROLE", stderr="")
+
+        async def run_process(argv, **kwargs):
+            joined = " ".join(str(item) for item in argv)
+            if " compose " in joined:
+                calls["compose"] += 1
+                return compose_auth_failure if calls["compose"] == 1 else compose_success
+            if "exec" in joined and "ALTER USER" in joined:
+                self.assertIn("postgres-container-id", joined)
+                self.assertIn("psql", joined)
+                return alter_role
+            if "ps" in joined and "label=com.docker.compose.service=postgres" in joined:
+                return postgres_container
+            raise AssertionError(f"unexpected docker invocation: {joined}")
+
+        calls = {"compose": 0}
+        with (
+            patch.object(self.runtime, "models", return_value=[{"id": "p/one", "selectable": True}]),
+            patch.object(self.runtime, "docker_status", new=AsyncMock(return_value={"ready": True})),
+            patch.object(
+                self.runtime,
+                "_validate_compose_for_entry",
+                return_value={
+                    "appImage": "ghcr.io/elie222/rakazo/app@sha256:" + ("a" * 64),
+                    "computerImage": "ghcr.io/elie222/rakazo/computer@sha256:" + ("b" * 64),
+                },
+            ),
+            patch.object(self.runtime, "_run_process", new=AsyncMock(side_effect=run_process)) as run,
+            patch.object(
+                self.runtime,
+                "health",
+                new=AsyncMock(return_value={"ok": True, "version": "0.1.0", "revision": entry["sourceRevision"]}),
+            ),
+            patch.object(
+                self.runtime,
+                "verify_running_runtime_identity",
+                new=AsyncMock(return_value={"verified": True}),
+            ),
+        ):
+            result = await self.runtime.control_runtime("start")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(calls["compose"], 2)
+        alter_calls = [
+            call for call in run.await_args_list
+            if "exec" in " ".join(str(item) for item in call.args[0])
+            and "ALTER USER" in " ".join(str(item) for item in call.args[0])
+        ]
+        self.assertEqual(len(alter_calls), 1)
+        alter_statement = " ".join(str(item) for item in alter_calls[0].args[0])
+        self.assertIn("ALTER USER rakazo WITH PASSWORD", alter_statement)
+        self.assertNotIn("codebot-stop-placeholder", alter_statement)
+
+    async def test_start_fails_closed_when_postgres_realign_is_unavailable(self):
+        """P1000 但无法对齐（找不到运行中的 postgres 容器）时保持失败关闭，不无限重试。"""
+        self.enable_fixed_experimental_runtime()
+        compose_auth_failure = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "Error: P1000: Authentication failed against database server\n"
+                "dependency failed to start: container codebot-rakazo-api-1 is unhealthy"
+            ),
+        )
+        no_container = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        async def run_process(argv, **kwargs):
+            joined = " ".join(str(item) for item in argv)
+            if " compose " in joined:
+                calls["compose"] += 1
+                return compose_auth_failure
+            return no_container
+
+        calls = {"compose": 0}
+        with (
+            patch.object(self.runtime, "models", return_value=[{"id": "p/one", "selectable": True}]),
+            patch.object(self.runtime, "docker_status", new=AsyncMock(return_value={"ready": True})),
+            patch.object(
+                self.runtime,
+                "_validate_compose_for_entry",
+                return_value={
+                    "appImage": "ghcr.io/elie222/rakazo/app@sha256:" + ("a" * 64),
+                    "computerImage": "ghcr.io/elie222/rakazo/computer@sha256:" + ("b" * 64),
+                },
+            ),
+            patch.object(self.runtime, "_run_process", new=AsyncMock(side_effect=run_process)),
+        ):
+            with self.assertRaisesRegex(RakazoRuntimeError, "Rakazo start 失败"):
+                await self.runtime.control_runtime("start")
+
+        self.assertEqual(calls["compose"], 1)
+
+    async def test_non_auth_compose_failures_do_not_trigger_postgres_realign(self):
+        """普通 compose 失败（非 P1000）不会触碰数据库密码。"""
+        self.enable_fixed_experimental_runtime()
+        compose_failure = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="port is already allocated"
+        )
+
+        async def run_process(argv, **kwargs):
+            joined = " ".join(str(item) for item in argv)
+            if " compose " in joined:
+                return compose_failure
+            raise AssertionError(f"unexpected docker invocation: {joined}")
+
+        with (
+            patch.object(self.runtime, "models", return_value=[{"id": "p/one", "selectable": True}]),
+            patch.object(self.runtime, "docker_status", new=AsyncMock(return_value={"ready": True})),
+            patch.object(
+                self.runtime,
+                "_validate_compose_for_entry",
+                return_value={
+                    "appImage": "ghcr.io/elie222/rakazo/app@sha256:" + ("a" * 64),
+                    "computerImage": "ghcr.io/elie222/rakazo/computer@sha256:" + ("b" * 64),
+                },
+            ),
+            patch.object(self.runtime, "_run_process", new=AsyncMock(side_effect=run_process)),
+        ):
+            with self.assertRaisesRegex(RakazoRuntimeError, "Rakazo start 失败"):
+                await self.runtime.control_runtime("start")
+
+    async def test_realign_postgres_password_requires_managed_compose_and_safe_secret(self):
+        """非受管 Compose、密钥含引号或 postgres 未运行时一律拒绝执行 ALTER USER。"""
+        with patch.object(self.runtime, "_is_managed_compose", return_value=False):
+            self.assertFalse(await self.runtime._realign_postgres_password())
+
+        entry = self.enable_fixed_experimental_runtime()
+        self.assertTrue(self.runtime._is_managed_compose())
+
+        with patch.object(self.runtime, "_runtime_secrets", return_value={"POSTGRES_PASSWORD": "bad'quote"}):
+            self.assertFalse(await self.runtime._realign_postgres_password())
+
+        empty_ps = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with (
+            patch.object(self.runtime, "_docker_executable", return_value="docker.exe"),
+            patch.object(self.runtime, "_run_process", new=AsyncMock(return_value=empty_ps)),
+        ):
+            self.assertFalse(await self.runtime._realign_postgres_password())
+
+        failing_ps = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="docker down")
+        with (
+            patch.object(self.runtime, "_docker_executable", return_value="docker.exe"),
+            patch.object(self.runtime, "_run_process", new=AsyncMock(return_value=failing_ps)),
+        ):
+            self.assertFalse(await self.runtime._realign_postgres_password())
+
+        self.assertIn("P1000", "P1000: Authentication failed against database server")
+        self.assertTrue(self.runtime._is_postgres_auth_failure(
+            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="P1000: x")
+        ))
+        self.assertFalse(self.runtime._is_postgres_auth_failure(
+            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="port is already allocated")
+        ))
+
 if __name__ == "__main__":
     unittest.main()
