@@ -12,6 +12,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -36,6 +37,17 @@ _OPENAI_OAUTH_ISSUER = "https://auth.openai.com"
 # 路由，不创建 OpenCode Session，也不进入 OpenCode Agent 循环。
 _OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 _OAUTH_REFRESH_SKEW_MS = 60_000
+OPENCODE_GO_PROVIDER = "opencode-go"
+
+
+class _OpenCodeGoSession:
+    """OpenCode Go 稳定会话头：每个后端进程生命周期内保持不变。
+
+    Console Go 网关要求 ``x-opencode-session`` 是每个会话的稳定 ID；按进程
+    生成一个 UUID 即可通过路由与缓存亲和，不会绑定任何用户身份。
+    """
+
+    value = uuid.uuid4().hex
 
 
 @dataclass(frozen=True)
@@ -96,7 +108,14 @@ class ModelRoute:
     @property
     def route_fingerprint(self) -> str:
         """返回不含凭据、Cookie、header/query 值的稳定路由指纹。"""
-        payload = {
+        payload = self.route_fingerprint_payload
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    @property
+    def route_fingerprint_payload(self) -> Dict[str, Any]:
+        """不含凭据、Cookie、header/query 值的路由指纹载荷。"""
+        return {
             "provider": self.opencode_provider,
             "model": self.opencode_model,
             "upstreamModel": self.codex_model,
@@ -112,8 +131,6 @@ class ModelRoute:
             "credentialMode": self.credential_mode,
             "connected": self.connected,
         }
-        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def public_model(
         self,
@@ -452,6 +469,23 @@ class ModelRouteRegistry:
                     if residency:
                         oauth_headers.append(("x-openai-internal-codex-residency", residency))
                     request_headers = tuple([*request_headers, *oauth_headers])
+                existing_header_names = {key.lower() for key, _ in request_headers}
+                if provider_id == OPENCODE_GO_PROVIDER:
+                    # OpenCode Go（Console Go）合同要求客户端在请求头携带稳定
+                    # 会话 ID 用于路由与提示缓存亲和；OpenCode Server 代理时会
+                    # 自动注入，Codebot 直连采样必须自己补齐，否则网关拒绝路由。
+                    if "x-opencode-session" not in existing_header_names:
+                        request_headers = tuple(
+                            [*request_headers, ("x-opencode-session", _OpenCodeGoSession.value)]
+                        )
+                # 会话头属于 Console Go 专属合同；以下请求身份则覆盖所有桥接
+                # 厂商：OpenCode 自己发起请求时会标识客户端身份，Codebot 直连
+                # 采样也要带同等身份，避免按“泛用 SDK/httpx 默认 UA”的特征被
+                # 网关风控拒绝。Provider 在 OpenCode 配置里声明的 header 优先。
+                if "user-agent" not in existing_header_names:
+                    request_headers = tuple(
+                        [*request_headers, ("User-Agent", f"Codebot/{app_config.version}")]
+                    )
                 raw_query = (
                     provider_options.get("queryParams")
                     if isinstance(provider_options.get("queryParams"), dict)

@@ -250,6 +250,21 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route.codex_model, "gpt-response")
         self.assertEqual(route.reasoning_efforts, ("low", "high"))
         self.assertNotIn("api_key", route.public_model())
+        # OpenCode Go 网关要求稳定 x-opencode-session 会话头；公开指纹只记录头名。
+        headers = dict(route.request_headers)
+        self.assertIn("x-opencode-session", headers)
+        self.assertIn("x-opencode-session", route.route_fingerprint_payload["headerNames"])
+        # 所有桥接厂商直连请求都要带 Codebot 身份 UA，不暴露泛用 SDK httpx 特征；
+        # 该修复覆盖 x-opencode-go 之外的全部 Provider（Chat/Anthropic/Responses）。
+        for other_id in (
+            "opencode-go/chat-only",
+            "opencode-go/claude-compatible",
+        ):
+            other_headers = dict(routes[other_id].request_headers)
+            self.assertEqual(
+                other_headers.get("User-Agent"),
+                f"Codebot/{app_config.version}",
+            )
         self.assertIn("opencode-go/deepseek-v4-flash", routes)
         self.assertEqual(
             routes["opencode-go/deepseek-v4-flash"].upstream_protocol,
@@ -281,7 +296,8 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             return_value={"CodexConfig": lambda **kwargs: SimpleNamespace(**kwargs)},
         ):
             sdk_config = self.runtime._build_sdk_config()
-        self.assertIn("super-secret-provider-key", sdk_config.env.values())
+        # 全部 opencode-go 模型走 Codebot 桥后，第三方 Key 不再进入 Codex 子进程环境。
+        self.assertNotIn("super-secret-provider-key", sdk_config.env.values())
         self.assertNotIn("super-secret-provider-key", "\n".join(sdk_config.config_overrides))
         self.assertTrue(any("/api/codex/compat/" in item for item in sdk_config.config_overrides))
 
@@ -290,7 +306,10 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             item["protocol"]: item["models"]
             for item in status["openCodeProtocolCoverage"]
         }
-        self.assertEqual(counts["responses"], 1)
+        # opencode-go 全部模型现需注入 x-opencode-session，Responses 模型
+        # 升级为 responses_proxy 桥接，由 Codebot 内存中补齐该 header。
+        self.assertEqual(counts["responses_proxy"], 1)
+        self.assertEqual(counts["responses"], 0)
         self.assertEqual(counts["chat_completions"], 3)
         self.assertEqual(counts["anthropic"], 1)
 
