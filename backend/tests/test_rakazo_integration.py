@@ -1231,6 +1231,20 @@ class RakazoRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app_config.rakazo.release_channel, "experimental")
         self.assertTrue(app_config.rakazo.experimental_runtime_enabled)
 
+    async def test_compose_digest_tolerates_crlf_from_windows_checkout(self):
+        """Windows CI autocrlf 检出会把随包 Compose 转成 CRLF；摘要必须仍能对齐。"""
+        entry = next(
+            item for item in self.runtime._compatibility_entries()
+            if item.get("channel") == "experimental" and item.get("composeSha256")
+        )
+        source = self.runtime._rakazo_resource_path(str(entry["composeResource"]))
+        crlf_copy = Path(source.parent) / f".crlf-{source.name}.tmp"
+        try:
+            crlf_copy.write_bytes(source.read_bytes().replace(b"\n", b"\r\n"))
+            self.assertEqual(self.runtime._sha256_file(crlf_copy), entry["composeSha256"])
+        finally:
+            crlf_copy.unlink(missing_ok=True)
+
     async def test_compose_exposes_all_selectable_opencode_models_and_restart_recreates_services(self):
         self.enable_fixed_experimental_runtime()
         catalog = [

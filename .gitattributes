@@ -1,0 +1,8 @@
+# 统一换行符：仓库与检出一律 LF。
+# 背景：GitHub Windows runner 默认 core.autocrlf=true，检出时会把文本文件
+# 转成 CRLF；electron-builder extraResources 原样打包工作区文件，导致随包
+# Rakazo Compose 的固定 SHA256 摘要校验失败。此规则保证打包字节与摘要基准一致。
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

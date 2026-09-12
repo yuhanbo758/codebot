@@ -1439,10 +1439,24 @@ class RakazoRuntime:
 
     @staticmethod
     def _sha256_file(path: Path) -> str:
+        """计算 Compose 摘要；兼容清单以 LF 原文为基准。
+
+        Windows CI 检出或打包链路可能把 LF 转成 CRLF，语义内容并未改变；
+        归一化后再计算，避免把换行符差异误判为资源被篡改。
+        """
         digest = hashlib.sha256()
         with path.open("rb") as stream:
+            pending = b""
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
+                data = pending + chunk
+                if data.endswith(b"\r"):
+                    # 尾字节可能是被块边界截断的 \r\n 前半，留到下一块合并判断。
+                    pending = b"\r"
+                    data = data[:-1]
+                else:
+                    pending = b""
+                digest.update(data.replace(b"\r\n", b"\n"))
+            digest.update(pending)
         return digest.hexdigest()
 
     @staticmethod

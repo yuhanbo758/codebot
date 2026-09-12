@@ -71,26 +71,40 @@
     "host": "0.0.0.0",
     "port": 15682
   },
+  "security": {
+    "lan_auth_enabled": true,
+    "pairing_code_ttl_seconds": 300,
+    "session_hours": 720
+  },
   "integration": {
     "modelscope_api_key": ""
   },
   "skills": {
     "custom_skill_dirs": []
   },
-  "hermes": {
+  "codex": {
     "enabled": true,
     "auto_start": true,
-    "repo_url": "https://github.com/NousResearch/hermes-agent",
-    "install_dir": "",
-    "cli_path": "hermes",
-    "share_models": true,
+    "runtime_source": "bundled",
+    "codex_bin": "",
+    "approval_policy": "interactive",
     "share_memory": true,
     "share_scheduler": true,
-    "skill_dirs": [],
-    "excluded_auto_skill_dirs": [],
-    "last_action": "prepare",
-    "last_status": "not_installed",
-    "last_message": "Hermes Agent is not installed yet."
+    "skill_dirs": []
+  },
+  "rakazo": {
+    "enabled": false,
+    "auto_start": false,
+    "api_url": "http://127.0.0.1:3100",
+    "compose_file": "",
+    "docker_project_name": "codebot-rakazo",
+    "release_channel": "stable",
+    "experimental_runtime_enabled": false,
+    "network_policy": "ask",
+    "default_project_read": true,
+    "default_project_write": false,
+    "default_command_execution": false,
+    "default_external_network": false
   },
   "obsidian": {
     "enabled": true,
@@ -99,6 +113,7 @@
     "knowledge_bases": []
   },
   "sandbox": {
+    "isolation_backend": "none",
     "execution_mode": "auto",
     "enabled": false,
     "workspace_dir": "",
