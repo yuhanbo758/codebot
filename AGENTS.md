@@ -417,3 +417,10 @@ build.bat
 | 2026-05-01 | 移除 Electron 内置程序小店窗口右下角无响应的“刷新/程序小店”悬浮按钮 | electron/main.js |
 | 2026-05-01 | 修复开发模式 OpenCode 端口配置错误，并兼容旧聊天模型 ID 到当前 OpenCode 模型命名 | electron/main.js, backend/core/opencode_ws.py, backend/api/routes/config.py, backend/api/routes/gateway.py, frontend/src/views/Chat.vue |
 | 2026-05-01 | 将 `npm start` 开发模式的 OpenCode 自动启动与重连端口统一收敛到 `127.0.0.1:11200`，避免误连旧端口导致聊天发送失败 | electron/main.js, backend/main.py, backend/utils/installer.py, backend/api/routes/chat.py |
+
+
+### 2026-09-13 Agent 提示词隐私与预算
+
+- `prompt_optimizer.build_memory_context` 对补充记忆跨分类去重，最多 4000 字符、每条 800；不将检索资料称为可信指令。
+- Agent/Editor 的 OpenCode 请求明确选择 `build`；复杂 Agent 契约精简，验证完成即停止，避免重复技能指导。
+- 聊天日志不再写入内部提示正文，列表和详情也屏蔽历史正文；历史数据库不自动清空。检查报告见 `security-review.md`。

@@ -152,8 +152,9 @@ class OpenCodeClient:
         }
         if system:
             payload["system"] = system
-        if mode in {"plan", "build"}:
-            payload["agent"] = mode
+        if mode in {"plan", "build", "agent", "editor"}:
+            # Agent/Editor 使用具备执行能力的 build，避免继承服务端默认 plan。
+            payload["agent"] = "plan" if mode == "plan" else "build"
         if model:
             normalized_model = self._normalize_model_id(model)
             if "/" in normalized_model:

@@ -146,13 +146,15 @@ async def cleanup_logs(days: Optional[int] = None):
 
 @router.get("/chat-logs")
 async def list_chat_logs(conversation_id: Optional[int] = None, limit: int = 50, offset: int = 0):
-    """获取聊天日志列表，包含内部提示词、推理过程和最终回复。"""
+    """获取聊天日志；历史记录中的内部提示也不通过接口返回。"""
     try:
         conn = _get_chat_conn()
         cursor = conn.cursor()
         if conversation_id:
             cursor.execute(
-                """SELECT cl.*, c.title as conversation_title
+                """SELECT cl.id, cl.conversation_id, cl.user_message, cl.tool_events,
+                      cl.final_reply, cl.model, cl.mode, cl.created_at,
+                      '' AS internal_prompt, c.title as conversation_title
                    FROM chat_logs cl
                    LEFT JOIN conversations c ON c.id = cl.conversation_id
                    WHERE cl.conversation_id = ?
@@ -165,7 +167,9 @@ async def list_chat_logs(conversation_id: Optional[int] = None, limit: int = 50,
             total = count_cursor.fetchone()[0]
         else:
             cursor.execute(
-                """SELECT cl.*, c.title as conversation_title
+                """SELECT cl.id, cl.conversation_id, cl.user_message, cl.tool_events,
+                      cl.final_reply, cl.model, cl.mode, cl.created_at,
+                      '' AS internal_prompt, c.title as conversation_title
                    FROM chat_logs cl
                    LEFT JOIN conversations c ON c.id = cl.conversation_id
                    ORDER BY cl.created_at DESC
@@ -189,7 +193,9 @@ async def get_chat_log(log_id: int):
         conn = _get_chat_conn()
         cursor = conn.cursor()
         cursor.execute(
-            """SELECT cl.*, c.title as conversation_title
+            """SELECT cl.id, cl.conversation_id, cl.user_message, cl.tool_events,
+                      cl.final_reply, cl.model, cl.mode, cl.created_at,
+                      '' AS internal_prompt, c.title as conversation_title
                FROM chat_logs cl
                LEFT JOIN conversations c ON c.id = cl.conversation_id
                WHERE cl.id = ?""",

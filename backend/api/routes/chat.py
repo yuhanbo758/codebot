@@ -1332,7 +1332,7 @@ def _save_chat_log(
     model: Optional[str] = None,
     mode: Optional[str] = None,
 ) -> None:
-    """将本次聊天的内部提示词、推理过程和最终回复写入聊天日志表。"""
+    """保存用户可见聊天日志；兼容接收 internal_prompt 参数但不持久化其正文。"""
     try:
         conversations_db.connect()
         cursor = conversations_db.conn.cursor()
@@ -1343,7 +1343,7 @@ def _save_chat_log(
             (
                 conversation_id,
                 user_message or "",
-                internal_prompt or "",
+                "",  # 内部提示含私人记忆/技能正文，不写入可查询的聊天日志。
                 json.dumps(tool_events or [], ensure_ascii=False),
                 final_reply or "",
                 model or "",
@@ -3056,8 +3056,8 @@ def _build_autonomous_execution_policy(mode: Optional[str] = None) -> List[str]:
     elif mode == "agent":
         lines.extend([
             "当前是智能体模式（Agent Mode）：先判断任务复杂度，再选择最少且必要的能力完成工作。",
-            "简单任务直接完成；复杂任务先形成短计划，执行后验证关键结果，并在最终答复中区分已完成、未验证和风险。",
-            "只有任务确实需要多视角决策时才使用专家协作；不要为了展示过程而模拟角色、重复讨论或虚构子代理结果。",
+            "简单任务直接完成；复杂任务用短计划执行并验证关键结果。验证通过即结束；只有新证据或失败才扩大检查，避免重复读取、无效重试和长篇汇报。",
+            "仅在用户明确要求或独立子任务确有收益时使用专家协作；不要模拟角色讨论或虚构子代理结果。",
             "只有用户明确要求记忆，或形成稳定且可复用的长期经验时，才通过 Codebot 记忆/成长机制沉淀；不要写入独立的私有记忆目录。",
         ])
     elif mode == "editor":
@@ -3188,7 +3188,7 @@ async def _build_opencode_prompt_parts(
     构建 OpenCode 提示词，返回 (system_prompt, user_message) 元组。
 
     system_prompt 通过 OpenCode API 的独立 system 字段传递，不混入用户消息文本，
-    从根本上解决 AI 把系统指令原文回显到回复中的问题。
+    降低系统指令被当作用户输入回显的风险；角色分离不能保证模型绝不泄露提示词。
     """
     raw_message = message or ""
     try:
@@ -3273,28 +3273,16 @@ async def _build_opencode_prompt_parts(
             )
     except Exception as exc:
         logger.debug(f"[prompt-optimizer] 生成 Agent 执行契约失败（跳过）：{exc}")
-    memory_lines: List[str] = []
-    has_any = any([facts_context, habit_context, preference_context, profile_context, memories_context])
-    if facts_context:
-        memory_lines.append("【用户事实记忆（可信，优先使用；如有冲突以最新为准）】")
-        for item in facts_context[:5]:
-            memory_lines.append(f"- {item}")
-    if profile_context:
-        memory_lines.append("【用户个人信息】")
-        for item in profile_context[:3]:
-            memory_lines.append(f"- {item}")
-    if preference_context:
-        memory_lines.append("【用户偏好】")
-        for item in preference_context[:3]:
-            memory_lines.append(f"- {item}")
-    if habit_context:
-        memory_lines.append("【用户习惯】")
-        for item in habit_context[:3]:
-            memory_lines.append(f"- {item}")
-    if memories_context:
-        memory_lines.append("【用户长期记忆（可信，尽量参考）】")
-        for item in memories_context[:5]:
-            memory_lines.append(f"- {item}")
+    # 所有来源共享预算与去重集合，防止单条长记忆或跨分类命中撑大每轮上下文。
+    from core.prompt_optimizer import build_memory_context
+
+    memory_context = build_memory_context([
+        ("相关事实参考", facts_context[:5]),
+        ("用户个人信息", profile_context[:3]),
+        ("用户偏好", preference_context[:3]),
+        ("用户习惯", habit_context[:3]),
+        ("相关长期记忆", memories_context[:5]),
+    ])
 
     # ── 构建 system prompt（仅含系统指令，不含用户消息）─────────────────────
     # 该提示由 OpenCode 与 Codex 两条执行链共用，不能把运行时名称写死为 OpenCode。
@@ -3306,9 +3294,8 @@ async def _build_opencode_prompt_parts(
             "如果需要创建技能，请仍按 OpenCode 原有 skill-creator/agent-skill 逻辑完成，"
             "但不要把 skill 保存到用户的文件存储路径；Codebot 会在任务结束后把本轮新生成的 skill 迁移为 Codebot 的自动生成技能。"
         )
-    if has_any:
-        system_lines.append("以下是与当前问题相关的用户记忆，请在回答中参考；若与用户本轮消息冲突，以用户本轮消息为准。")
-        system_lines.extend(memory_lines)
+    if memory_context:
+        system_lines.append(memory_context)
 
     if selected_skill and selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, CODEX, OPENCLAW}:
         system_lines.append(_build_skill_system_context(selected_skill))
@@ -3357,19 +3344,8 @@ async def _build_opencode_prompt_parts(
         except Exception:
             pass
 
-    # ── Agent 模式：注入自我改进、专家代理、AI 团队技能 ───────────────────────
-    if mode == "agent":
-        agent_skills = _load_agent_mode_skill_content()
-        if agent_skills:
-            system_lines.append(
-                "=== Agent 模式技能指导 ===\n"
-                "你现在处于智能体（Agent）模式。不要机械执行全部能力，按任务需要选择：\n"
-                "1. 评估复杂度并形成最短可执行路径\n"
-                "2. 实施后验证关键边界，失败时保留证据并安全降级\n"
-                "3. 仅在能提升决策质量时引入必要的专家视角或多 Agent\n"
-                "4. 仅沉淀经过验证、具有长期价值且不含敏感信息的经验\n\n"
-                f"{agent_skills}"
-            )
+    # Agent 的复杂度、验证、协作与记忆规则已在 policy 中声明一次。
+    # 明确点名的 Skill 仍由上方注册表加载，不再每轮附加重复的技能推广索引。
 
     system_prompt = "\n\n".join(system_lines)
     if selected_skill and opencode_skill_fallback:
