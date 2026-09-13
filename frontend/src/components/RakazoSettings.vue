@@ -203,6 +203,10 @@
     <el-divider content-position="left">配置</el-divider>
     <el-form :model="form" label-width="150px">
       <el-form-item label="启用 Rakazo"><el-switch v-model="form.enabled" /></el-form-item>
+      <el-form-item label="完全访问">
+        <el-switch v-model="form.full_access" />
+        <div class="field-tip">保存后从下一轮生效：允许项目读写、专属 Computer 内命令及外网，自动允许权限请求。关闭后下一轮恢复项目原权限；普通问题仍需回答。</div>
+      </el-form-item>
       <el-form-item label="随 Codebot 启动">
         <el-switch v-model="form.auto_start" :loading="autoStartSaving" @change="saveAutoStart" />
         <div class="field-tip">切换后立即保存；下次启动 Codebot 时自动恢复已有 Docker、运行时和加密授权，不会自动安装系统组件或创建新账号。</div>
@@ -408,6 +412,7 @@ try {
   dockerStorageRoot.value = window.localStorage.getItem('codebot.rakazoDockerStorageRoot') || ''
 } catch (_) {}
 const form = ref({
+  full_access: false,
   enabled: false,
   auto_start: false,
   api_url: 'http://127.0.0.1:3100',
@@ -573,6 +578,7 @@ const saveConfig = async () => {
       release_channel: form.value.release_channel,
       network_policy: form.value.default_external_network ? 'allow' : 'deny',
       default_project_read: Boolean(form.value.default_project_read),
+      full_access: Boolean(form.value.full_access),
       default_project_write: Boolean(form.value.default_project_write),
       default_command_execution: Boolean(form.value.default_command_execution),
       default_external_network: Boolean(form.value.default_external_network),

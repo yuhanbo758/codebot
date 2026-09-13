@@ -40,12 +40,14 @@ class CodexConfigUpdateRequest(BaseModel):
     runtime_source: Optional[Literal["bundled", "custom"]] = None
     codex_bin: Optional[str] = None
     approval_policy: Optional[Literal["interactive", "auto_review", "deny_all"]] = None
+    full_access: Optional[bool] = None
     share_memory: Optional[bool] = None
     share_scheduler: Optional[bool] = None
     skill_dirs: Optional[List[str]] = None
 
 
 class RakazoConfigUpdateRequest(BaseModel):
+    full_access: Optional[bool] = None
     enabled: Optional[bool] = None
     auto_start: Optional[bool] = None
     api_url: Optional[str] = None
@@ -208,6 +210,22 @@ def _validate_abs_dir_list(values: Optional[List[str]], label: str) -> List[str]
     return result
 
 
+class OpenCodeAccessUpdateRequest(BaseModel):
+    full_access: bool
+
+
+@router.get("/opencode/access")
+async def get_opencode_access():
+    return {"success": True, "data": {"full_access": app_config.opencode.full_access}}
+
+
+@router.patch("/opencode/access")
+async def update_opencode_access(request: OpenCodeAccessUpdateRequest):
+    app_config.opencode.full_access = request.full_access
+    save_config(app_config)
+    return await get_opencode_access()
+
+
 @router.get("/codex")
 async def get_codex_config():
     return {"success": True, "data": app_config.codex.model_dump()}
@@ -228,7 +246,7 @@ async def update_codex_config(request: CodexConfigUpdateRequest):
         current.update(updates)
         app_config.codex = CodexConfig(**current)
         save_config(app_config)
-        return {"success": True, "data": app_config.codex.model_dump(), "message": "Codex 配置已保存；运行时设置变更将在重启 Codex 后生效"}
+        return {"success": True, "data": app_config.codex.model_dump(), "message": "Codex 配置已保存；权限设置从下一条消息生效，Runtime 来源等启动配置需重启 Codex"}
     except HTTPException:
         raise
     except Exception as e:

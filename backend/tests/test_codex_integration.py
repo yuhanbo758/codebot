@@ -132,6 +132,97 @@ class _FakeNotificationClient:
 
 
 class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_loaded_thread_switches_provider_before_sending_new_model(self):
+        """真实 SDK 的 resume 会保留已加载 provider，必须卸载后恢复相同 thread。"""
+        self.runtime._save_session(7, "existing-thread", self.temp_dir.name)
+        calls = []
+
+        async def fake_call(method, *args, **kwargs):
+            calls.append((method, args))
+            if method == "request":
+                self.assertEqual(args, ("thread/unsubscribe", {"threadId": "existing-thread"}))
+                return SimpleNamespace(status="unsubscribed")
+            return SimpleNamespace(
+                thread=SimpleNamespace(id="existing-thread"),
+                model_provider="provider-a" if len(calls) == 1 else "provider-b",
+            )
+
+        self.runtime._call = fake_call
+        thread_id = await self.runtime._get_or_start_thread(
+            7, self.temp_dir.name, model="glm-5.3-flash", model_provider="provider-b",
+            model_config={}, mode="build", developer_instructions="", history_context="", interactive=True,
+        )
+        self.assertEqual(thread_id, "existing-thread")
+        self.assertEqual([call[0] for call in calls], ["thread_resume", "request", "thread_resume"])
+        self.assertEqual(calls[-1][1][1]["modelProvider"], "provider-b")
+        self.assertEqual(self.runtime._get_session(7)["thread_id"], "existing-thread")
+
+    async def test_full_access_config_roundtrip_and_default(self):
+        """旧配置默认关闭；PATCH 可保存开关，关闭后保留原审批策略。"""
+        from config import CodexConfig
+        from api.routes.config import CodexConfigUpdateRequest, update_codex_config
+
+        original = app_config.codex
+        self.assertFalse(CodexConfig().full_access)
+        try:
+            with patch("api.routes.config.save_config") as save:
+                result = await update_codex_config(CodexConfigUpdateRequest(full_access=True))
+                self.assertTrue(result["data"]["full_access"])
+                self.assertTrue(CodexConfig(**result["data"]).full_access)
+                await update_codex_config(CodexConfigUpdateRequest(full_access=False))
+                self.assertFalse(app_config.codex.full_access)
+                self.assertEqual(app_config.codex.approval_policy, original.approval_policy)
+                self.assertEqual(save.call_count, 2)
+        finally:
+            app_config.codex = original
+
+    async def test_full_access_sandbox_and_unattended_boundaries(self):
+        """完全访问同时修改审批与沙箱，避免 never 被误实现为拒绝所有提权。"""
+        with patch.object(app_config.codex, "full_access", True):
+            self.assertEqual(self.runtime._approval_settings(True)["approvalPolicy"], "never")
+            self.assertEqual(self.runtime._sandbox_settings("build", self.temp_dir.name),
+                             ("danger-full-access", {"type": "dangerFullAccess"}))
+            self.assertEqual(self.runtime._sandbox_settings("plan", self.temp_dir.name)[0], "read-only")
+            self.assertEqual(self.runtime._sandbox_settings("build", self.temp_dir.name, False)[0], "workspace-write")
+            self.assertFalse(self.runtime._full_access_enabled(False, "build"))
+            self.assertFalse(self.runtime._full_access_enabled(True, "plan"))
+        with patch.object(app_config.codex, "full_access", False):
+            self.assertEqual(self.runtime._sandbox_settings("build", self.temp_dir.name)[0], "workspace-write")
+
+    async def test_full_access_accepts_permissions_without_ui_events(self):
+        queue = asyncio.Queue()
+        active = ActiveCodexTurn("11", "thread", "turn", asyncio.get_running_loop(), queue, True, True)
+        self.runtime._active_by_turn["turn"] = active
+        cases = [
+            ("item/commandExecution/requestApproval", {}, {"decision": "accept"}),
+            ("item/fileChange/requestApproval", {}, {"decision": "accept"}),
+            ("item/permissions/requestApproval", {"permissions": {"network": {"enabled": True}}},
+             {"permissions": {"network": {"enabled": True}}, "scope": "turn"}),
+            ("mcpServer/elicitation/request", {"_meta": {"codex_approval_kind": "mcp_tool_call"}},
+             {"action": "accept", "content": {}}),
+        ]
+        with patch.object(app_config.codex, "approval_policy", "deny_all"):
+            for method, payload, expected in cases:
+                self.assertEqual(self.runtime._handle_server_request(method, {"turnId": "turn", **payload}), expected)
+        self.assertTrue(queue.empty())
+        active.interactive = False
+        self.assertEqual(self.runtime._handle_server_request(cases[0][0], {"turnId": "turn"}), {"decision": "decline"})
+
+    async def test_full_access_still_waits_for_real_user_answers(self):
+        """不能把表单或需求澄清当成权限批准，伪造用户回答。"""
+        queue = asyncio.Queue()
+        self.runtime._active_by_turn["turn"] = ActiveCodexTurn(
+            "11", "thread", "turn", asyncio.get_running_loop(), queue, True, True,
+        )
+        for method in ("item/tool/requestUserInput", "mcpServer/elicitation/request"):
+            task = asyncio.create_task(asyncio.to_thread(
+                self.runtime._handle_server_request, method, {"turnId": "turn"},
+            ))
+            event = await asyncio.wait_for(queue.get(), timeout=2)
+            self.assertEqual(event["event_type"], "question.asked")
+            self.runtime.reply_question(event["request_id"], reject=True)
+            await asyncio.wait_for(task, timeout=2)
+
     async def test_opencode_oauth_is_listed_and_refreshed_in_host_bridge(self):
         """安装版同样列出授权模型，调用时取新令牌而非启动时的旧快照。"""
         from dataclasses import replace

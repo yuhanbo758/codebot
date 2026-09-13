@@ -62,6 +62,8 @@ class ActiveCodexTurn:
     loop: asyncio.AbstractEventLoop
     queue: asyncio.Queue
     interactive: bool
+    # 固定本轮权限快照，设置关闭后不会误把旧轮次标记为新的受限轮次。
+    full_access: bool = False
 
 
 # 保留旧类型名，避免外部测试和插件导入路径被共享注册表抽取破坏。
@@ -159,11 +161,8 @@ class CodexRuntime:
         """从 OpenCode provider 元数据构建 Codex 可用模型路由。
 
         Codex 自定义 model provider 当前只支持 Responses。OpenCode 的 `api.npm`
-        描述的是 OpenCode 客户端选择的适配器，并不能证明上游只支持这一种协议：
-        例如 OpenCode Go 会让 DeepSeek 走 Chat Completions 适配器，但同一 base URL
-        实际也提供 `/responses`。因此只要同一上游地址已有任一明确的 Responses
-        模型，就把该地址视为双协议端点，让 Codex 直接验证目标模型。其余
-        其余模型按 ``codex_model_bridge`` 的显式协议注册表交给 Codebot 本机
+        描述 OpenCode 为该模型选择的适配器；共享 base URL 不代表其他模型也
+        支持 Responses。每个模型按 ``codex_model_bridge`` 的显式协议注册表交给 Codebot 本机
         中间层；未知协议继续明确标记为不兼容，绝不偷偷回退到 ChatGPT 账号。
         """
         return model_route_registry.parse_runnable_catalog(payload, credentials, environ)
@@ -504,6 +503,7 @@ class CodexRuntime:
             "runtimeSource": app_config.codex.runtime_source,
             "codexBin": app_config.codex.codex_bin if app_config.codex.runtime_source == "custom" else "",
             "approvalPolicy": app_config.codex.approval_policy,
+            "fullAccess": app_config.codex.full_access,
             "metadata": dict(self._metadata),
             "startedAt": self._started_at or None,
             "lastError": self._last_error,
@@ -805,7 +805,22 @@ class CodexRuntime:
         payload = params if isinstance(params, dict) else {}
         active = self._find_active_turn(payload)
         policy = str(app_config.codex.approval_policy or "interactive")
-        if active is None or not active.interactive or policy == "deny_all":
+        if active is None or not active.interactive:
+            return self._decline_result(method, payload)
+        if active.full_access:
+            # 只批准权限请求；普通 MCP 表单和 requestUserInput 仍交给用户回答。
+            if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
+                return {"decision": "accept"}
+            if method == "item/permissions/requestApproval":
+                return {"permissions": payload.get("permissions") or {}, "scope": "turn"}
+            metadata = payload.get("_meta") or {}
+            if (
+                method == "mcpServer/elicitation/request"
+                and isinstance(metadata, dict)
+                and metadata.get("codex_approval_kind") == "mcp_tool_call"
+            ):
+                return {"action": "accept", "content": {}}
+        elif policy == "deny_all":
             return self._decline_result(method, payload)
         if policy == "auto_review" and method in {
             "item/commandExecution/requestApproval",
@@ -925,7 +940,9 @@ class CodexRuntime:
         return str(workspace)
 
     @staticmethod
-    def _approval_settings(interactive: bool) -> Dict[str, Any]:
+    def _approval_settings(interactive: bool, mode: Optional[str] = None) -> Dict[str, Any]:
+        if CodexRuntime._full_access_enabled(interactive, mode):
+            return {"approvalPolicy": "never", "approvalsReviewer": "user"}
         policy = str(app_config.codex.approval_policy or "interactive") if interactive else "deny_all"
         if policy == "deny_all":
             return {"approvalPolicy": "never", "approvalsReviewer": "user"}
@@ -934,9 +951,16 @@ class CodexRuntime:
         return {"approvalPolicy": "on-request", "approvalsReviewer": "user"}
 
     @staticmethod
-    def _sandbox_settings(mode: Optional[str], workspace: str) -> tuple[str, Dict[str, Any]]:
+    def _full_access_enabled(interactive: bool, mode: Optional[str]) -> bool:
+        """完全访问仅覆盖交互执行；计划模式和无人值守任务维持原权限边界。"""
+        return bool(app_config.codex.full_access and interactive and str(mode or "").lower() != "plan")
+
+    @staticmethod
+    def _sandbox_settings(mode: Optional[str], workspace: str, interactive: bool = True) -> tuple[str, Dict[str, Any]]:
         if str(mode or "").lower() == "plan":
             return "read-only", {"type": "readOnly", "networkAccess": False}
+        if CodexRuntime._full_access_enabled(interactive, mode):
+            return "danger-full-access", {"type": "dangerFullAccess"}
         return "workspace-write", {
             "type": "workspaceWrite",
             "writableRoots": [workspace],
@@ -958,8 +982,8 @@ class CodexRuntime:
     ) -> str:
         session = self._get_session(conversation_id)
         project_key = self._project_key(workspace)
-        approval = self._approval_settings(interactive)
-        sandbox_mode, _ = self._sandbox_settings(mode, workspace)
+        approval = self._approval_settings(interactive, mode)
+        sandbox_mode, _ = self._sandbox_settings(mode, workspace, interactive)
         if session and self._project_key(session.get("project_dir")) == project_key:
             try:
                 response = await self._call(
@@ -975,6 +999,29 @@ class CodexRuntime:
                         **approval,
                     },
                 )
+                # 已加载的 App Server thread 可能忽略 resume 的 modelProvider。
+                # 必须核对返回值，否则 turn/start 只更新 model，会把新模型发给旧厂商。
+                if getattr(response, "model_provider", model_provider) != model_provider:
+                    from openai_codex.generated.v2_all import ThreadUnsubscribeResponse
+
+                    await self._call(
+                        "request", "thread/unsubscribe", {"threadId": session["thread_id"]},
+                        response_model=ThreadUnsubscribeResponse,
+                    )
+                    response = await self._call(
+                        "thread_resume", session["thread_id"],
+                        {
+                            "cwd": workspace,
+                            "model": model or None,
+                            "modelProvider": model_provider,
+                            "config": model_config or None,
+                            "developerInstructions": developer_instructions or None,
+                            "sandbox": sandbox_mode,
+                            **approval,
+                        },
+                    )
+                    if getattr(response, "model_provider", None) != model_provider:
+                        raise RuntimeError("Codex 恢复线程后仍未应用所选模型服务商")
                 return str(response.thread.id)
             except Exception as exc:
                 logger.warning(f"恢复 Codex thread 失败，将安全新建：{exc}")
@@ -1088,8 +1135,10 @@ class CodexRuntime:
             if name and path:
                 input_items.append({"type": "skill", "name": name, "path": path})
 
-        approval = self._approval_settings(interactive)
-        _, sandbox_policy = self._sandbox_settings(mode, workspace)
+        approval = self._approval_settings(interactive, mode)
+        _, sandbox_policy = self._sandbox_settings(mode, workspace, interactive)
+        # turn/start 等待期间用户可能更改设置；回调必须使用实际发送的沙箱快照。
+        full_access = sandbox_policy["type"] == "dangerFullAccess"
         params: Dict[str, Any] = {
             "cwd": workspace,
             "model": codex_model or None,
@@ -1109,6 +1158,7 @@ class CodexRuntime:
             loop=asyncio.get_running_loop(),
             queue=queue,
             interactive=interactive,
+            full_access=full_access,
         )
         with self._state_lock:
             self._active_by_turn[turn_id] = active

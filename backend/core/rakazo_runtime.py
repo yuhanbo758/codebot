@@ -249,6 +249,8 @@ class RakazoRuntime:
         # 因此不把令牌伪装成“安全文件”持久化。
         self._session_token = ""
         self._active_runs: Dict[str, str] = {}
+        # 每轮权限快照；项目数据库中的手动授权保持不变，关闭开关后可恢复。
+        self._full_access_runs: Dict[str, bool] = {}
         self._active_lock = asyncio.Lock()
         # Rakazo 的可回答输入由 ``thread.message.created`` 中的 ask block
         # 携带，真正回复时必须同时提交 bot/run/message 三个服务端标识。
@@ -743,6 +745,9 @@ class RakazoRuntime:
         if not row:
             raise RakazoRuntimeError("Rakazo 项目映射不存在", status_code=404)
         item = dict(row)
+        if self._full_access_runs.get(project_id, False):
+            item.update(project_read=True, project_write=True, command_execution=True,
+                        external_network=True, network_policy="allow")
         return {
             "projectId": project_id,
             "projectRead": bool(item["project_read"]),
@@ -768,6 +773,8 @@ class RakazoRuntime:
         }
 
     async def update_permissions(self, project_id: str, updates: Mapping[str, Any]) -> Dict[str, Any]:
+        if self._full_access_runs.get(project_id, False):
+            raise RakazoRuntimeError("完全访问轮次运行中，请结束后修改项目原权限", status_code=409)
         current = self.get_permissions(project_id)
         mapping, _ = await self._ensure_remote_project(project_id)
         requested_external = bool(updates.get("externalNetwork", current["externalNetwork"]))
@@ -1904,9 +1911,12 @@ if (action === 'copy') {
         project_id: str,
         bot_id: str,
         allow_external: bool,
+        prepare_turn: bool = False,
     ) -> None:
         """重建单个 Bot 的 Computer 网络，保留专属 home 数据。"""
-        if project_id in self._active_runs:
+        if project_id in self._active_runs and not (
+            prepare_turn and self._active_runs[project_id] == "starting"
+        ):
             raise RakazoRuntimeError("Rakazo 正在执行任务，不能切换 Computer 外网", status_code=409)
         actual = await self._project_network_allows_external(bot_id)
         if actual is allow_external:
@@ -3615,6 +3625,20 @@ if (action === 'copy') {
                     if isinstance(event, dict):
                         yield event
 
+    async def _turn_input_event(self, mapping, run_id, message_id, block, approved):
+        """只自动回答可验证的权限 ask，去重上游重复消息，保留普通问题。"""
+        key = (message_id, str(block.get("approvalEffectId") or ""))
+        if key in approved:
+            return None
+        event = await self._register_pending_input(
+            mapping=mapping, run_id=run_id, message_id=message_id, block=block,
+        )
+        if self._full_access_runs.get(str(mapping["project_id"]), False) and event.get("event_type") == "permission.requested":
+            await self.reply_permission(event["request_id"], "once", conversation_id=mapping["conversation_id"])
+            approved.add(key)
+            return None
+        return event
+
     async def run_turn_stream(
         self,
         *,
@@ -3636,12 +3660,24 @@ if (action === 'copy') {
             if project_id in self._active_runs:
                 raise RakazoRuntimeError("该项目已有一个 Rakazo 任务正在运行", status_code=409)
             self._active_runs[project_id] = "starting"
+            self._full_access_runs[project_id] = bool(app_config.rakazo.full_access)
 
         bot_id = str(mapping["bot_id"])
         run_id = ""
         final_text = ""
         seen_by_message: Dict[str, str] = {}
+        auto_approved: set = set()
         try:
+            # 在 threads.send 前实际收敛 Docker 网络。关闭完全访问后的下一轮
+            # 使用数据库原权限重新隔离外网，不只修改界面布尔值。
+            if self._full_access_runs[project_id] and not self._is_managed_compose():
+                raise RakazoRuntimeError("完全访问需要 Codebot 受管 Compose 才能实际放行项目外网", status_code=409)
+            if self._is_managed_compose():
+                await self._reconfigure_project_network(
+                    project_id=project_id, bot_id=bot_id,
+                    allow_external=self.get_permissions(project_id)["externalNetwork"],
+                    prepare_turn=True,
+                )
             # 发送前幂等迁移旧版随机占位凭据。这样已经创建的主会话无需删除、
             # 重新授权或重装 Docker，首次再次发送即可恢复正确的私网 Bearer。
             await self._ensure_local_provider_connection(route.route_id)
@@ -3715,12 +3751,9 @@ if (action === 'copy') {
                         None,
                     )
                     if pending_ask:
-                        yield await self._register_pending_input(
-                            mapping=mapping,
-                            run_id=run_id,
-                            message_id=message_id,
-                            block=pending_ask,
-                        )
+                        input_event = await self._turn_input_event(mapping, run_id, message_id, pending_ask, auto_approved)
+                        if input_event:
+                            yield input_event
                     elif event_type == "thread.message.updated":
                         await self._clear_pending_inputs(
                             project_id=project_id,
@@ -3740,6 +3773,9 @@ if (action === 'copy') {
                 elif event_type == "memory.revised":
                     yield {"type": "tool_event", "source": "rakazo", "event_type": "memory.updated", "summary": "Rakazo 记忆已更新", "data": payload}
                 elif event_type == "run.waiting_input":
+                    if auto_approved and not await self._has_pending_input(project_id=project_id, run_id=run_id):
+                        # 上游可能在已回答的 ask 后补发旧 waiting_input 状态。
+                        continue
                     if not await self._has_pending_input(project_id=project_id, run_id=run_id):
                         raise RakazoRuntimeError(
                             "Rakazo 进入等待输入状态，但事件流没有提供可验证的 ask messageId；已失败关闭",
@@ -3807,6 +3843,7 @@ if (action === 'copy') {
                 await self._clear_pending_inputs(project_id=project_id, run_id=run_id)
             async with self._active_lock:
                 self._active_runs.pop(project_id, None)
+                self._full_access_runs.pop(project_id, None)
 
     async def interrupt_project(self, project_id: str) -> Dict[str, Any]:
         mapping, _ = await self._ensure_remote_project(project_id)

@@ -89,6 +89,8 @@ class GeneralConfig(BaseModel):
 
 class OpenCodeConfig(BaseModel):
     """OpenCode 配置"""
+    # 仅覆盖交互执行会话，不修改用户全局 OpenCode 权限配置。
+    full_access: bool = False
     server_url: str = "http://127.0.0.1:11200"
     cli_path: str = ""
     auto_install: bool = True
@@ -152,6 +154,8 @@ class CodexConfig(BaseModel):
     runtime_source: Literal["bundled", "custom"] = "bundled"
     codex_bin: str = ""
     approval_policy: Literal["interactive", "auto_review", "deny_all"] = "interactive"
+    # 用户显式开启后，交互执行轮次允许完整文件系统、网络和工具权限。
+    full_access: bool = False
     share_memory: bool = True
     share_scheduler: bool = True
     skill_dirs: List[str] = []
@@ -176,6 +180,7 @@ class RakazoConfig(BaseModel):
     # 只有用户点击“安装并启动固定实验版”后才会置为 True。单纯手改 channel
     # 不能绕过显式风险确认，也不会让旧配置在升级后自动进入实验通道。
     experimental_runtime_enabled: bool = False
+    full_access: bool = False
     network_policy: Literal["ask", "deny", "allow"] = "ask"
     default_project_read: bool = True
     default_project_write: bool = False

@@ -145,8 +145,8 @@ jobs:
           pip install -r backend/requirements.txt
           pip install pyinstaller
 
-      - name: Test backend model integrations
-        run: python -m unittest discover -s backend/tests -p "test_*integration.py"
+      - name: Test backend integrations and full access
+        run: python -m unittest discover -s backend/tests -p "test_*.py"
 
       - name: Install frontend dependencies
         working-directory: frontend
@@ -154,7 +154,9 @@ jobs:
 
       - name: Build frontend
         working-directory: frontend
-        run: npm run build
+        run: |
+          npm run build
+          python ../scripts/verify_full_access_frontend.py dist
 
       - name: Build backend executable
         working-directory: backend
@@ -223,7 +225,9 @@ jobs:
 
       - name: Build frontend
         working-directory: frontend
-        run: npm run build
+        run: |
+          npm run build
+          python ../scripts/verify_full_access_frontend.py dist
 
       - name: Build backend executable
         working-directory: backend
@@ -294,7 +298,9 @@ jobs:
 
       - name: Build frontend
         working-directory: frontend
-        run: npm run build
+        run: |
+          npm run build
+          python ../scripts/verify_full_access_frontend.py dist
 
       - name: Build backend executable
         working-directory: backend

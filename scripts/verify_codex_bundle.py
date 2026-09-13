@@ -24,6 +24,8 @@ def main() -> int:
     required_modules = {
         "core.codex_runtime", "core.codex_model_bridge", "core.model_route_registry",
         "core.rakazo_runtime", "api.routes.codex", "api.routes.rakazo",
+        # 三种执行器的完全访问依赖共享配置、配置 API 和 OpenCode 事件流。
+        "config", "api.routes.config", "core.opencode_ws",
     }
     missing = required_modules.difference(bundled_modules)
     if missing:

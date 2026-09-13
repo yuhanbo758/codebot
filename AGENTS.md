@@ -304,6 +304,12 @@ build.bat
 
 ## 变更日志
 
+2026-09-13：发布门禁增加三执行器完全访问产物检查：Windows CI 执行全部后端测试（含 test_full_access.py），三平台 Vite 构建后检查实际 JS 产物包含三个配置入口，PyInstaller PYZ 检查增加共享 config、配置 API 和 OpenCode 客户端。构建仍使用自动版本提交的精确 SHA，Electron extraResources 收集验证后的后端与 frontend/dist。
+
+2026-09-13：将完全访问扩展到 OpenCode 与 Rakazo，各自默认关闭且独立保存。OpenCode 新增设置标签和 `/api/config/opencode/access` GET/PATCH，交互流按轮次自动批准权限请求，保留计划模式与普通输入；实测 OpenCode session PATCH 空权限数组不会清除旧 allow，因此不使用长期会话权限覆盖。Rakazo 按轮次覆盖项目读写/命令/联网，发送前收敛真实专属网络，自动回复官方 approval ask 并去重；关闭后下一轮恢复数据库原授权，禁止将运行中临时授权回写项目。原项目/容器隔离边界保持。README 同步供设置文档页读取，无依赖变更。
+
+2026-09-13：Codex 设置新增默认关闭的 `full_access` 开关，保存后从下一条交互执行消息生效，配套使用 `never` 审批与 `danger-full-access` 沙箱，并自动批准命令、文件及 MCP 工具权限；普通输入、计划模式和定时任务保留原边界。修复已加载 Codex thread 在 `thread/resume` 时忽略新 `modelProvider`，导致切换模型后把新模型发往旧服务商的问题：核对返回的实际 provider，必要时 `thread/unsubscribe` 后恢复相同 thread。真实 SDK 配合本机模拟上游已验证切换前后 HTTP 地址正确及线程复用；该验证不代表所有第三方模型已完成真实调用验收。涉及 config、配置 API、CodexRuntime、CodexSettings、README 与回归测试；无依赖变更。
+
 2026-09-12：Rakazo 模型选择移除前置采样探测，改为复用当前 OpenCode 连接；设置页改为全目录搜索、筛选和滚动。Codex 接入 OpenCode 内置 OpenAI OAuth 宿主刷新桥；聊天目录增加请求顺序保护，目录暂缺时保留模型选择。发布流程增加 Windows 后端集成测试，三平台产物检查增加 PYZ 模型路由模块完整性检查。该检查不等价于所有上游模型的真实调用验收。
 
 | 日期 | 变更内容 | 影响范围 |

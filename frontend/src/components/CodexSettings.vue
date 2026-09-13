@@ -16,8 +16,12 @@
       <el-form-item v-if="form.runtime_source === 'custom'" label="Codex 可执行文件">
         <el-input v-model="form.codex_bin" placeholder="codex.exe 的绝对路径" clearable />
       </el-form-item>
+      <el-form-item label="完全访问">
+        <el-switch v-model="form.full_access" />
+        <div class="field-tip">保存后从下一条消息生效：允许 Codex 访问完整文件系统、执行命令、联网，并自动允许工具权限请求。普通问题仍需回答；计划模式和定时任务保留限制。</div>
+      </el-form-item>
       <el-form-item label="审批策略">
-        <el-select v-model="form.approval_policy" style="width: 280px">
+        <el-select v-model="form.approval_policy" :disabled="form.full_access" style="width: 280px">
           <el-option label="交互审批" value="interactive" />
           <el-option label="Codex 自动审查" value="auto_review" />
           <el-option label="全部拒绝提权" value="deny_all" />
@@ -127,6 +131,7 @@ const form = ref({
   runtime_source: 'bundled',
   codex_bin: '',
   approval_policy: 'interactive',
+  full_access: false,
   share_memory: true,
   share_scheduler: true,
   skill_dirs: [],

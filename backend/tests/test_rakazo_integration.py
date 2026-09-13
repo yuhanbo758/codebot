@@ -765,6 +765,46 @@ class RakazoRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rows[0]["permissions"]["projectRead"])
         self.assertTrue(rows[0]["permissions"]["projectWrite"])
 
+    async def test_full_access_overrides_without_overwriting_project_permissions(self):
+        project_id = self.mapping["project_id"]
+        before = self.runtime.get_permissions(project_id)
+        self.runtime._full_access_runs[project_id] = True
+        effective = self.runtime.get_permissions(project_id)
+        for key in ("projectRead", "projectWrite", "commandExecution", "externalNetwork"):
+            self.assertTrue(effective[key])
+        self.runtime.call_project_tool(project_id, "codebot_project_write", {"path": "full.txt", "content": "OK"})
+        self.assertEqual((self.project / "full.txt").read_text(encoding="utf-8"), "OK")
+        self.runtime._full_access_runs.pop(project_id)
+        self.assertEqual(self.runtime.get_permissions(project_id), before)
+
+    async def test_full_access_auto_approves_once_but_preserves_questions(self):
+        self.runtime._full_access_runs[self.mapping["project_id"]] = True
+        approved = set()
+        block = {"kind": "ask", "approvalEffectId": "effect", "actions": [{"id": "allow"}, {"id": "deny"}]}
+        with patch.object(self.runtime, "rpc", new=AsyncMock(return_value={"ok": True})) as rpc:
+            self.assertIsNone(await self.runtime._turn_input_event(self.mapping, "run", "message", block, approved))
+            self.assertIsNone(await self.runtime._turn_input_event(self.mapping, "run", "message", block, approved))
+            self.assertEqual(rpc.await_count, 1)
+            self.assertEqual(rpc.call_args.args[1]["answer"], "allow")
+        question = await self.runtime._turn_input_event(
+            self.mapping, "run", "question", {"kind": "ask", "text": "Which environment?"}, approved,
+        )
+        self.assertTrue(question["requires_user_action"])
+        self.assertEqual(question["event_type"], "question.asked")
+
+    async def test_network_preparation_only_bypasses_guard_before_turn_start(self):
+        project_id = self.mapping["project_id"]
+        self.runtime._active_runs[project_id] = "starting"
+        with patch.object(self.runtime, "_project_network_allows_external", new=AsyncMock(return_value=True)):
+            await self.runtime._reconfigure_project_network(
+                project_id=project_id, bot_id=self.mapping["bot_id"], allow_external=True, prepare_turn=True,
+            )
+            self.runtime._active_runs[project_id] = "running-id"
+            with self.assertRaises(RakazoRuntimeError):
+                await self.runtime._reconfigure_project_network(
+                    project_id=project_id, bot_id=self.mapping["bot_id"], allow_external=True, prepare_turn=True,
+                )
+
     async def test_command_and_network_permissions_apply_real_runtime_controls(self):
         project_id = self.mapping["project_id"]
         ensure_remote = AsyncMock(return_value=(self.mapping, {"id": self.mapping["bot_id"]}))

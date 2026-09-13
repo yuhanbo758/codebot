@@ -4,6 +4,9 @@
       <el-tab-pane label="通用设置" name="general">
         <GeneralSettings />
       </el-tab-pane>
+      <el-tab-pane label="OpenCode" name="opencode">
+        <OpenCodeSettings />
+      </el-tab-pane>
       <el-tab-pane label="Codex" name="codex">
         <CodexSettings />
       </el-tab-pane>
@@ -49,6 +52,7 @@ import { ref } from 'vue'
 import { useRoute } from 'vue-router'
 import GeneralSettings from '@/components/GeneralSettings.vue'
 import CodexSettings from '@/components/CodexSettings.vue'
+import OpenCodeSettings from '@/components/OpenCodeSettings.vue'
 import RakazoSettings from '@/components/RakazoSettings.vue'
 import ObsidianSettings from '@/components/ObsidianSettings.vue'
 import NotificationSettings from '@/components/NotificationSettings.vue'
@@ -62,9 +66,11 @@ import SandboxSettings from '@/components/SandboxSettings.vue'
 import Docs from '@/views/Docs.vue'
 
 const route = useRoute()
+// 支持通过设置链接直接定位 OpenCode 权限开关。
 const tabNames = new Set(['general', 'codex', 'rakazo', 'obsidian', 'notification', 'lark', 'email', 'skills', 'backup', 'integration', 'security', 'sandbox', 'docs'])
 // 兼容旧收藏链接，但页面本身不再保留 Hermes 标签或接口。
 const requestedTab = route.query.tab === 'hermes' ? 'codex' : route.query.tab
+tabNames.add('opencode')
 const initialTab = typeof requestedTab === 'string' && tabNames.has(requestedTab) ? requestedTab : 'general'
 const activeTab = ref(initialTab)
 </script>

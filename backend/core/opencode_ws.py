@@ -13,6 +13,7 @@ import httpx
 from datetime import datetime
 
 from utils.installer import collect_opencode_commands
+from config import app_config
 
 # 全局任务队列：每个对话有自己的任务队列和当前 session_id
 # key: conversation_id (str), value: asyncio.Queue of coroutines
@@ -714,6 +715,8 @@ class OpenCodeClient:
         await self.ensure_connected()
         final_parts: List[dict] = []
         final_content = ""
+        # 每轮固定开关；非流式后台任务不经过此授权路径。
+        full_access = bool(app_config.opencode.full_access and str(mode or "").lower() != "plan")
         conv_id = str(conversation_id) if conversation_id is not None else None
         if conv_id:
             mark_conversation_running(conv_id)
@@ -812,6 +815,15 @@ class OpenCodeClient:
                                 event_session_id = info_id
                     if event_session_id not in tracked_session_ids:
                         continue
+
+                    if full_access and event_type in {"permission.asked", "permission.updated"}:
+                        request_id = properties.get("id") or properties.get("requestID") or properties.get("permissionID")
+                        if request_id and await self.reply_permission(
+                            str(request_id), "once", session_id=event_session_id, workspace=workspace,
+                        ):
+                            # 成功回复后不再展示需要点击的审批卡，普通 question 事件不受影响。
+                            continue
+                        raise RuntimeError("OpenCode 完全访问自动授权失败，请检查 OpenCode 连接后重试")
 
                     if event_type == "message.updated":
                         info = properties.get("info")
