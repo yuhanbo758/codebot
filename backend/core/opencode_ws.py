@@ -177,10 +177,11 @@ class OpenCodeClient:
         client: httpx.AsyncClient,
         session_id: str,
         timeout: int = 30,
+        workspace: Optional[str] = None,
     ) -> tuple[str, List[Dict[str, Any]]]:
         latest_resp = await client.get(
             f"{self.base_url}/session/{session_id}/message",
-            params={"limit": 20},
+            params={"limit": 20, **({"directory": workspace} if workspace else {})},
             timeout=timeout,
         )
         latest_resp.raise_for_status()
@@ -210,6 +211,8 @@ class OpenCodeClient:
     ) -> TaskResult:
         prompt_resp = await client.post(
             f"{self.base_url}/session/{session_id}/prompt_async",
+            # session ID 不能代替目录上下文：上游仍按 directory 选择项目实例。
+            params={"directory": workspace} if workspace else None,
             json=payload,
             timeout=min(timeout, 30),
         )
@@ -220,6 +223,7 @@ class OpenCodeClient:
                 _conversation_current_workspace[str(conversation_id)] = self._normalize_workspace_key(workspace)
             prompt_resp = await client.post(
                 f"{self.base_url}/session/{session_id}/prompt_async",
+                params={"directory": workspace} if workspace else None,
                 json=payload,
                 timeout=min(timeout, 30),
             )
@@ -234,6 +238,7 @@ class OpenCodeClient:
                 client=client,
                 session_id=session_id,
                 timeout=min(timeout, 20),
+                workspace=workspace,
             )
             if content:
                 last_content = content
@@ -500,12 +505,13 @@ class OpenCodeClient:
             f"{provider_hint}"
         )
 
-    async def abort_session(self, session_id: str) -> bool:
+    async def abort_session(self, session_id: str, workspace: Optional[str] = None) -> bool:
         """终止一个运行中的 session"""
         try:
             client = await self._get_client()
             response = await client.post(
                 f"{self.base_url}/session/{session_id}/abort",
+                params={"directory": workspace} if workspace else None,
                 timeout=5
             )
             return response.status_code == 200
@@ -744,6 +750,8 @@ class OpenCodeClient:
                 event_response.raise_for_status()
                 prompt_resp = await client.post(
                     f"{self.base_url}/session/{session_id}/prompt_async",
+                    # 与创建 session 使用相同目录，避免切回 server 默认项目后无回复。
+                    params={"directory": workspace} if workspace else None,
                     json=payload,
                     timeout=30
                 )
@@ -755,6 +763,7 @@ class OpenCodeClient:
                         _conversation_current_workspace[str(conversation_id)] = self._normalize_workspace_key(workspace)
                     prompt_resp = await client.post(
                         f"{self.base_url}/session/{session_id}/prompt_async",
+                        params={"directory": workspace} if workspace else None,
                         json=payload,
                         timeout=30
                     )
@@ -764,6 +773,7 @@ class OpenCodeClient:
                 part_buffers: Dict[str, str] = {}
                 part_types: Dict[str, str] = {}  # partID -> part type (e.g. "text", "reasoning")
                 assistant_message_ids: Dict[str, str] = {}
+                user_message_ids: set[str] = set()
                 delta_buffer = ""
                 last_emit = 0.0
 
@@ -827,6 +837,9 @@ class OpenCodeClient:
 
                     if event_type == "message.updated":
                         info = properties.get("info")
+                        # 新项目首轮的用户消息事件可能先于助手事件到达；不能将其回显为回复。
+                        if isinstance(info, dict) and info.get("role") == "user" and info.get("id"):
+                            user_message_ids.add(info["id"])
                         if isinstance(info, dict) and info.get("role") == "assistant":
                             msg_id = info.get("id")
                             msg_session_id = info.get("sessionID")
@@ -850,6 +863,8 @@ class OpenCodeClient:
 
                     if event_type == "message.part.delta":
                         message_id = properties.get("messageID")
+                        if message_id in user_message_ids:
+                            continue
                         expected_message_id = assistant_message_ids.get(event_session_id)
                         if expected_message_id and message_id != expected_message_id:
                             continue
@@ -885,6 +900,8 @@ class OpenCodeClient:
 
                     if event_type == "message.part.updated":
                         part = properties.get("part")
+                        if isinstance(part, dict) and part.get("messageID") in user_message_ids:
+                            continue
                         if not isinstance(part, dict):
                             continue
                         # 更新 part type 映射
@@ -968,7 +985,7 @@ class OpenCodeClient:
             if not final_content:
                 latest_resp = await client.get(
                     f"{self.base_url}/session/{session_id}/message",
-                    params={"limit": 20},
+                    params={"limit": 20, **({"directory": workspace} if workspace else {})},
                     timeout=20
                 )
                 latest_resp.raise_for_status()

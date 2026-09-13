@@ -6353,7 +6353,10 @@ async def abort_task(request: AbortRequest):
             unmark_conversation_running(target_id)
             continue
         try:
-            ok = await client.abort_session(session_id)
+            # 停止请求也必须回到会话原项目，否则上游会在默认目录中查找 session。
+            ok = await client.abort_session(
+                session_id, workspace=_conversation_current_workspace.get(target_id) or None
+            )
             if ok:
                 aborted_sessions += 1
             logger.info(f"终止对话 {target_id} session {session_id}: {'成功' if ok else '失败'}")
