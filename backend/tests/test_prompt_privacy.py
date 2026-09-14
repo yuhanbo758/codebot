@@ -18,6 +18,83 @@ from core.prompt_optimizer import build_memory_context
 
 
 class PromptPrivacyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_codex_native_skill_omits_duplicate_body_and_keeps_fallback(self):
+        # 同一技能用原生 input 传递时不得再注入正文；没有原生 input 时必须保留。
+        skill_path = Path(_DATA.name) / "SKILL.md"
+        body = "SKILL_BODY_CANARY\n" + "执行要求。" * 1000
+        skill_path.write_text(body, encoding="utf-8")
+        skill = {"id": "test", "slug": "test", "source": chat.BUILTIN,
+                 "skill_md_path": str(skill_path), "skill_md_content": body}
+        manager = SimpleNamespace(search_facts=AsyncMock(return_value=[]),
+                                  search_memories=AsyncMock(return_value=[]))
+        with patch.object(chat, "_get_chat_memory_manager", return_value=manager), patch.object(
+            chat, "_extract_requested_skill", return_value=(skill, "执行任务", False)
+        ):
+            fallback, user = await chat._build_opencode_prompt_parts("@test 执行任务", mode="agent")
+            native, native_user = await chat._build_opencode_prompt_parts(
+                "@test 执行任务", mode="agent", target="codex", native_skill_paths=[str(skill_path)]
+            )
+        self.assertIn(body, fallback)
+        self.assertNotIn("SKILL_BODY_CANARY", native)
+        self.assertGreater(len(fallback) - len(native), len(body))
+        self.assertEqual(user, native_user)
+
+    async def test_codex_stream_delivers_native_skill_without_internal_prompt_event(self):
+        captured = {}
+
+        async def fake_stream(**kwargs):
+            captured.update(kwargs)
+            yield {"type": "done", "content": "完成"}
+
+        skill_path = Path(_DATA.name) / "native-SKILL.md"
+        skill_path.write_text("NATIVE_PRIVATE_CANARY", encoding="utf-8")
+        skill = {"id": "native", "slug": "native", "source": chat.BUILTIN,
+                 "skill_md_path": str(skill_path)}
+        manager = SimpleNamespace(search_facts=AsyncMock(return_value=[]),
+                                  search_memories=AsyncMock(return_value=[]))
+        with patch.object(chat, "_get_chat_memory_manager", return_value=manager), patch.object(
+            chat, "_extract_requested_skill", return_value=(skill, "执行任务", False)
+        ), patch.object(chat, "_codex_history_context", new=AsyncMock(return_value="")), patch(
+            "core.codex_runtime.codex_runtime.run_turn_stream", new=fake_stream
+        ):
+            events = [event async for event in chat._stream_codex_proxy_events(
+                "@native 执行任务", conversation_id="987", mode="agent"
+            )]
+        self.assertEqual(captured["skills"], [{"name": "native", "path": str(skill_path)}])
+        self.assertNotIn("NATIVE_PRIVATE_CANARY", captured["developer_instructions"])
+        self.assertEqual(captured["message"], "执行任务")
+        self.assertEqual(events, [{"type": "done", "content": "完成"}])
+
+    async def test_obsidian_native_skill_and_opencode_marker_fallback(self):
+        skill_path = Path(_DATA.name) / "obsidian-SKILL.md"
+        skill_path.write_text("OBSIDIAN_BODY_CANARY", encoding="utf-8")
+        skill = {"id": "obsidian", "slug": "obsidian", "source": chat.BUILTIN,
+                 "skill_md_path": str(skill_path)}
+        manager = SimpleNamespace(search_facts=AsyncMock(return_value=[]),
+                                  search_memories=AsyncMock(return_value=[]))
+        with patch.object(chat, "_get_chat_memory_manager", return_value=manager), patch.object(
+            chat, "_extract_requested_skill", return_value=(None, "整理笔记", False)
+        ), patch.object(chat, "_find_skill_prefer_non_opencode", return_value=skill), patch.object(
+            chat, "_build_obsidian_context", return_value="知识库资料"
+        ):
+            native, _ = await chat._build_opencode_prompt_parts(
+                "整理笔记", target="codex_obsidian", native_skill_paths=[str(skill_path)]
+            )
+            fallback, _ = await chat._build_opencode_prompt_parts("整理笔记", target="codex_obsidian")
+        self.assertNotIn("OBSIDIAN_BODY_CANARY", native)
+        self.assertIn("知识库资料", native)
+        self.assertIn("OBSIDIAN_BODY_CANARY", fallback)
+        # OpenCode 来源的 slash 指令也只在没有原生输入时保留。
+        with patch.object(chat, "_get_chat_memory_manager", return_value=manager), patch.object(
+            chat, "_extract_requested_skill", return_value=(skill, "整理笔记", True)
+        ):
+            _, native_user = await chat._build_opencode_prompt_parts(
+                "@obsidian 整理笔记", native_skill_paths=[str(skill_path)]
+            )
+            _, fallback_user = await chat._build_opencode_prompt_parts("@obsidian 整理笔记")
+        self.assertEqual(native_user, "整理笔记")
+        self.assertTrue(fallback_user.startswith("/skill obsidian\n"))
+
     def test_memory_budget_and_cross_category_dedup(self):
         duplicate = "用户偏好精简答案"
         context = build_memory_context([

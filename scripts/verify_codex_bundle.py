@@ -26,6 +26,8 @@ def main() -> int:
         "core.rakazo_runtime", "api.routes.codex", "api.routes.rakazo",
         # 三种执行器的完全访问依赖共享配置、配置 API 和 OpenCode 事件流。
         "config", "api.routes.config", "core.opencode_ws",
+        # 聊天提示词去重和日志隐私必须进入三平台正式后端，不能只在源码测试通过。
+        "api.routes.chat", "api.routes.logs", "core.prompt_optimizer",
     }
     missing = required_modules.difference(bundled_modules)
     if missing:

@@ -2019,6 +2019,8 @@ async def _stream_codex_proxy_events(
         raise HTTPException(status_code=400, detail="Codex 执行需要有效 conversation_id")
     numeric_conversation_id = int(str(conversation_id))
     target = "codex_obsidian" if obsidian_enabled else "codex"
+    # 先确定实际发送的原生技能，再构建上下文，避免同一正文进入两个输入通道。
+    skills = _codex_selected_skills(message, obsidian_enabled=obsidian_enabled)
     system_prompt, user_message = await _build_opencode_prompt_parts(
         message,
         mode=mode,
@@ -2026,8 +2028,8 @@ async def _stream_codex_proxy_events(
         target=target,
         knowledge_paths=knowledge_paths,
         model=model,
+        native_skill_paths=[item["path"] for item in skills],
     )
-    skills = _codex_selected_skills(message, obsidian_enabled=obsidian_enabled)
     history_context = await _codex_history_context(numeric_conversation_id, user_message_id)
     conv_id = str(numeric_conversation_id)
     # Codex + Obsidian 只把知识库内容作为上下文输入；绝不把 Vault 或前端选择的
@@ -2035,7 +2037,6 @@ async def _stream_codex_proxy_events(
     runtime_project_dir = None if obsidian_enabled else project_dir
     mark_conversation_running(conv_id)
     try:
-        yield {"type": "internal_prompt", "prompt": f"[developer]\n{system_prompt}\n\n[user]\n{user_message}"}
         async for event in codex_runtime.run_turn_stream(
             message=user_message,
             conversation_id=numeric_conversation_id,
@@ -2248,7 +2249,6 @@ async def _stream_execute_opencode_with_meta(
     if _is_rakazo_target(target):
         if not str(conversation_id or "").isdigit():
             raise RakazoRuntimeError("Rakazo 执行需要已绑定的 Codebot 主会话", status_code=409)
-        yield {"type": "internal_prompt", "prompt": "[rakazo] 用户原文通过固定 Rakazo Thread 发送；未注入 OpenCode Agent 提示词。"}
         async for event in rakazo_runtime.run_turn_stream(
             conversation_id=int(str(conversation_id)),
             message=message,
@@ -2328,9 +2328,6 @@ async def _stream_execute_opencode_with_meta(
                 "parts": [],
             }
             return
-    # 首先 yield 内部提示词事件，供聊天日志记录
-    yield {"type": "internal_prompt", "prompt": f"[system]\n{system_prompt}\n\n[user]\n{user_message}"}
-
     client = opencode_ws
     created_client = False
     try:
@@ -3183,6 +3180,7 @@ async def _build_opencode_prompt_parts(
     target: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
     model: Optional[str] = None,
+    native_skill_paths: Optional[List[str]] = None,
 ) -> Tuple[str, str]:
     """
     构建 OpenCode 提示词，返回 (system_prompt, user_message) 元组。
@@ -3191,6 +3189,14 @@ async def _build_opencode_prompt_parts(
     降低系统指令被当作用户输入回显的风险；角色分离不能保证模型绝不泄露提示词。
     """
     raw_message = message or ""
+    # 仅跳过本轮确实交给 Codex 的技能；其他执行器和缺失路径仍保留正文回退。
+    native_paths = {os.path.normcase(os.path.abspath(path)) for path in native_skill_paths or []}
+
+    def skill_context(skill: dict) -> str:
+        path = str(skill.get("skill_md_path") or "").strip()
+        if path and os.path.normcase(os.path.abspath(path)) in native_paths:
+            return ""
+        return _build_skill_system_context(skill)
     try:
         selected_skill, cleaned_message, opencode_skill_fallback = _extract_requested_skill(raw_message)
     except Exception as exc:
@@ -3298,7 +3304,7 @@ async def _build_opencode_prompt_parts(
         system_lines.append(memory_context)
 
     if selected_skill and selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, CODEX, OPENCLAW}:
-        system_lines.append(_build_skill_system_context(selected_skill))
+        system_lines.append(skill_context(selected_skill))
 
     if _is_obsidian_target(normalized_target):
         # Obsidian target should actively bias the agent toward the Obsidian
@@ -3312,9 +3318,9 @@ async def _build_opencode_prompt_parts(
         if obsidian_skill and not selected_skill:
             selected_skill = obsidian_skill
             if selected_skill.get("source") in {AUTO_GENERATED, BUILTIN, EXTERNAL, CODEX, OPENCLAW}:
-                system_lines.append(_build_skill_system_context(selected_skill))
+                system_lines.append(skill_context(selected_skill))
         elif obsidian_skill and selected_skill and obsidian_skill.get("id") != selected_skill.get("id"):
-            system_lines.append(_build_skill_system_context(obsidian_skill))
+            system_lines.append(skill_context(obsidian_skill))
         obsidian_context = _build_obsidian_context(cleaned_message or raw_message, knowledge_paths)
         if obsidian_context:
             system_lines.append(obsidian_context)
@@ -3347,8 +3353,11 @@ async def _build_opencode_prompt_parts(
     # Agent 的复杂度、验证、协作与记忆规则已在 policy 中声明一次。
     # 明确点名的 Skill 仍由上方注册表加载，不再每轮附加重复的技能推广索引。
 
-    system_prompt = "\n\n".join(system_lines)
-    if selected_skill and opencode_skill_fallback:
+    system_prompt = "\n\n".join(line for line in system_lines if line)
+    if selected_skill and opencode_skill_fallback and not (
+        selected_skill.get("skill_md_path")
+        and os.path.normcase(os.path.abspath(selected_skill["skill_md_path"])) in native_paths
+    ):
         cleaned_message = f"/skill {selected_skill.get('slug')}\n\n{cleaned_message or raw_message}"
     # user_message 只含纯净的用户输入，不混入任何系统指令
     return system_prompt, cleaned_message or raw_message
@@ -5763,7 +5772,7 @@ async def send_to_opencode_stream(request: SendMessageRequest):
             ):
                 event_type = stream_event.get("type")
                 if event_type == "internal_prompt":
-                    internal_prompt = stream_event.get("prompt") or ""
+                    # 兼容旧适配器，但不接收、保存或转发内部提示词正文。
                     continue
                 if event_type == "content_delta":
                     delta_text = stream_event.get("delta") or ""

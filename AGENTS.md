@@ -304,6 +304,10 @@ build.bat
 
 ## 变更日志
 
+2026-09-14：正式发布 PYZ 门禁增加 api.routes.chat、api.routes.logs、core.prompt_optimizer，确保提示词去重与日志隐私模块随三平台后端打包；Windows 全量后端测试覆盖提示词专项回归，Electron 沿用 dist_build 后端及 README 收集链。
+
+2026-09-14：复核提示词隐私和 Agent 消耗，修复 Codex 显式/Obsidian Skill 同时进入 developer 正文与原生 skill input 的重复注入；仅按本轮实际原生路径跳过正文，其他执行器与缺失路径保留回退。移除三执行器内部提示词事件生产，保留消费端丢弃兼容。README 同步设置文档页；新增无计费模拟链路回归，不宣称真实模型账单节省或彻底防止提示注入。无配置、依赖和数据库结构变更。
+
 2026-09-13：发布门禁增加三执行器完全访问产物检查：Windows CI 执行全部后端测试（含 test_full_access.py），三平台 Vite 构建后检查实际 JS 产物包含三个配置入口，PyInstaller PYZ 检查增加共享 config、配置 API 和 OpenCode 客户端。构建仍使用自动版本提交的精确 SHA，Electron extraResources 收集验证后的后端与 frontend/dist。
 
 2026-09-13：将完全访问扩展到 OpenCode 与 Rakazo，各自默认关闭且独立保存。OpenCode 新增设置标签和 `/api/config/opencode/access` GET/PATCH，交互流按轮次自动批准权限请求，保留计划模式与普通输入；实测 OpenCode session PATCH 空权限数组不会清除旧 allow，因此不使用长期会话权限覆盖。Rakazo 按轮次覆盖项目读写/命令/联网，发送前收敛真实专属网络，自动回复官方 approval ask 并去重；关闭后下一轮恢复数据库原授权，禁止将运行中临时授权回写项目。原项目/容器隔离边界保持。README 同步供设置文档页读取，无依赖变更。
