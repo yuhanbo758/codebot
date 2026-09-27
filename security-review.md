@@ -129,3 +129,8 @@
 - `node --check electron/main.js`、`node --check electron/preload.js`：通过。
 - `electron-builder --dir --win`：通过，成功生成 Windows x64 目录包。
 - Python `pip-audit --requirement backend/requirements.txt`：2026-09-11 在项目虚拟环境复验为 `No known vulnerabilities found, 4 ignored`，四条命中对应上述两个公告的重复别名记录；最终发布结果同时以对应 GitHub Actions 为准。
+## 2026-09-27 开源前隐私复核
+
+- 使用 security Skill 的纯 Python 扫描器检查全部拟提交源码（133 个适用文件），并检查现有 Git 历史中的 884 个 Blob。高危/中危命中均位于测试代码，逐项核对为固定模拟 Key、Token 和认证头，未发现可确认的真实凭据。低危命中主要是环境变量读取；这些只是变量名。
+- `.env` 已被忽略，但旧仓库仍追踪 `.dbg/` 调试记录和 `data/` 运行配置。现从 Git 索引移除这 14 个文件并忽略两个目录，不删除本机文件；后续配置由程序运行时生成。调试记录含本机绝对路径，旧公开提交仍可访问，撤出当前版本不会清除 GitHub 历史。
+- 本轮没有执行 Git 历史重写或密钥轮换。若今后核实历史中曾出现真实凭据，应先在服务端撤销，再单独评估历史清理及克隆仓库同步影响。

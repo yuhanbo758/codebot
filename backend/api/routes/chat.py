@@ -3,7 +3,7 @@
 """
 from fastapi import APIRouter, HTTPException, Body, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 from typing import List, Optional, Tuple, Dict, Any, Literal
 from datetime import datetime, timedelta
 from uuid import uuid4
@@ -24,6 +24,11 @@ from database.init_db import conversations_db
 from core.memory_manager import MemoryManager
 from core.project_versioning import ProjectVersionManager
 from core.rakazo_runtime import RakazoRuntimeError, rakazo_runtime
+from core.jevai import (
+    JevAIError, TaskRoute, choose_model, finish_run, record_stage,
+    register_run, route_snapshot, set_current_stage, take_checkpoint, validate_media_artifacts,
+)
+from core.media_runtime import MediaError, configured_service, generate as generate_media
 from utils.background_tasks import create_background_task
 from core.opencode_ws import OpenCodeClient, _conversation_current_session, _conversation_current_workspace, is_conversation_running, mark_conversation_running, unmark_conversation_running
 from core.memory_extractor import extract_and_save_background, extract_candidates
@@ -259,12 +264,14 @@ def _attachment_summary(file: AttachedFile) -> str:
 
 
 class SendMessageRequest(BaseModel):
+    _jev_route: Optional[TaskRoute] = PrivateAttr(default=None)
     conversation_id: int
     message: str
     model: Optional[str] = None
     reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]] = None
-    mode: Optional[Literal["plan", "build", "agent", "editor"]] = None
+    mode: Optional[Literal["plan", "build", "agent", "editor", "jevai"]] = None
     attached_files: Optional[List[AttachedFile]] = Field(default=None, max_length=10)
+    media_action: Optional[Literal["image", "speech", "transcription"]] = None
     user_already_saved: bool = False
     project_dir: Optional[str] = None  # 用户选择的项目文件夹路径
     target: Optional[str] = None  # codebot | codex | rakazo | obsidian | codex_obsidian
@@ -276,6 +283,30 @@ class SendMessageRequest(BaseModel):
         if total_chars > 50_000_000:
             raise ValueError("附件总内容过大，请分批发送")
         return self
+
+
+def _image_inputs(attached_files: Optional[List[AttachedFile]]) -> List[dict]:
+    """仅将真实图片字节交给执行器；聊天正文只保留附件名称。"""
+    images: List[dict] = []
+    total = 0
+    allowed = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+    for file in attached_files or []:
+        if file.is_text:
+            continue
+        if file.type.startswith("image/") and file.type not in allowed:
+            raise HTTPException(status_code=415, detail=f"暂不支持把 {file.name} 作为图片输入；请使用 PNG、JPEG、WebP 或 GIF")
+        if file.type not in allowed:
+            continue
+        try:
+            data = base64.b64decode(file.content, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise HTTPException(status_code=400, detail=f"图片附件编码无效：{file.name}") from exc
+        total += len(data)
+        if not data or total > 20 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="图片附件总大小不能超过 20 MB")
+        images.append({"type": "file", "mime": file.type,
+                       "url": f"data:{file.type};base64,{file.content}", "filename": Path(file.name).name})
+    return images
 
 
 class PermissionReplyRequest(BaseModel):
@@ -910,6 +941,33 @@ async def _resolve_conversation_execution(request: SendMessageRequest) -> Dict[s
         request.project_dir = str(conversation.get("project_dir") or request.project_dir or "") or None
 
     return conversation
+
+
+async def _prepare_jevai_request(request: SendMessageRequest) -> None:
+    if request.mode != "jevai" or request.media_action:
+        return
+    executor = "codex" if _is_codex_target(request.target) else "opencode"
+    if _is_rakazo_target(request.target):
+        raise HTTPException(status_code=409, detail="Rakazo 对话不支持 JevAI 模式")
+    try:
+        if executor == "codex":
+            from core.codex_runtime import codex_runtime
+            models = await codex_runtime.models()
+        else:
+            client = opencode_ws or OpenCodeClient(app_config.opencode.server_url)
+            try:
+                models = await client.get_models(prefer_cli=False, quiet=True)
+            finally:
+                if opencode_ws is None and getattr(client, "connected", False):
+                    await client.disconnect()
+        available = [str(item.get("id")) for item in models if isinstance(item, dict) and item.get("id") and item.get("runnable", True) is not False]
+        request._jev_route = route_snapshot(executor, available)
+        request.model = None  # 模式设置中的模型由后端选择，忽略工具栏旧选择。
+    except JevAIError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning(f"JevAI 模型目录不可用：{exc}")
+        raise HTTPException(status_code=503, detail="当前执行器模型目录不可用，JevAI 任务未发送") from exc
 
 
 def _looks_like_codebot_schedule_creation_request(message: str) -> bool:
@@ -1627,7 +1685,7 @@ def _resolve_opencode_workspace(project_dir: Optional[str] = None, target: Optio
     return None
 
 
-async def _execute_opencode_client(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None, system: Optional[str] = None, user_message: str = "", workspace: Optional[str] = None) -> Tuple[Optional[str], bool]:
+async def _execute_opencode_client(message: str, model: Optional[str] = None, mode: Optional[str] = None, conversation_id: Optional[str] = None, system: Optional[str] = None, user_message: str = "", workspace: Optional[str] = None, files: Optional[List[dict]] = None) -> Tuple[Optional[str], bool]:
     client = opencode_ws
     created_client = False
     try:
@@ -1637,7 +1695,7 @@ async def _execute_opencode_client(message: str, model: Optional[str] = None, mo
         ok = await _ensure_opencode_client_connected(client)
         if not ok:
             return None, False
-        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id, system=system, workspace=workspace)
+        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id, system=system, workspace=workspace, files=files)
         if result.success:
             return _sanitize_assistant_output(result.content or "", user_message=user_message) or None, True
         return result.error or None, True
@@ -1659,7 +1717,8 @@ async def _execute_opencode_client_with_parts(
     conversation_id: Optional[str] = None,
     system: Optional[str] = None,
     user_message: str = "",
-    workspace: Optional[str] = None
+    workspace: Optional[str] = None,
+    files: Optional[List[dict]] = None,
 ) -> Tuple[Optional[str], bool, List[dict]]:
     client = opencode_ws
     created_client = False
@@ -1670,7 +1729,7 @@ async def _execute_opencode_client_with_parts(
         ok = await _ensure_opencode_client_connected(client)
         if not ok:
             return None, False, []
-        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id, system=system, workspace=workspace)
+        result = await client.execute_task(message, model=model, mode=mode, conversation_id=conversation_id, system=system, workspace=workspace, files=files)
         if result.success:
             return _sanitize_assistant_output(result.content or "", user_message=user_message) or None, True, result.parts or []
         return result.error or None, True, []
@@ -2012,6 +2071,7 @@ async def _stream_codex_proxy_events(
     knowledge_paths: Optional[List[str]] = None,
     obsidian_enabled: bool = False,
     interactive: bool = True,
+    image_files: Optional[List[dict]] = None,
 ):
     from core.codex_runtime import codex_runtime
 
@@ -2048,6 +2108,7 @@ async def _stream_codex_proxy_events(
             developer_instructions=system_prompt,
             history_context=history_context,
             skills=skills,
+            images=[item["url"] for item in image_files or []],
             interactive=interactive,
         ):
             yield event
@@ -2069,6 +2130,24 @@ async def _execute_codex_proxy(
     return _sanitize_assistant_output(content, user_message=message)
 
 
+async def _run_media_action(action: str, prompt: str, attached_files: Optional[List[AttachedFile]] = None,
+                            conversation_id: Optional[str] = None) -> str:
+    audio = None
+    filename = "audio.mp3"
+    if action == "transcription":
+        file = next((item for item in attached_files or [] if not item.is_text and
+                     (item.type.startswith("audio/") or Path(item.name).suffix.lower() in {".mp3", ".wav", ".m4a", ".ogg", ".webm"})), None)
+        if file is None:
+            raise MediaError("语音识别需要先添加音频附件")
+        try:
+            audio = base64.b64decode(file.content, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise MediaError("音频附件编码无效") from exc
+        filename = file.name
+    result = await _generate_media_for_conversation(conversation_id, action, prompt, audio=audio, filename=filename)
+    return result.get("content") or result.get("text") or ""
+
+
 async def _execute_opencode(
     message: str,
     model: Optional[str] = None,
@@ -2079,7 +2158,31 @@ async def _execute_opencode(
     target: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
     user_message_id: Optional[int] = None,
+    jev_route: Optional[TaskRoute] = None,
+    decision_message: Optional[str] = None,
+    media_action: Optional[str] = None,
+    attached_files: Optional[List[AttachedFile]] = None,
 ) -> str:
+    if media_action:
+        mark_conversation_running(str(conversation_id or ""))
+        try:
+            return await _run_media_action(media_action, decision_message if decision_message is not None else message, attached_files, conversation_id)
+        finally:
+            unmark_conversation_running(str(conversation_id or ""))
+    if mode == "jevai":
+        content = ""
+        async for event in _stream_jevai_task(
+            message, jev_route=jev_route, conversation_id=conversation_id,
+            user_message_id=user_message_id, project_dir=project_dir,
+            target=target, knowledge_paths=knowledge_paths,
+            decision_message=decision_message,
+            attached_files=attached_files,
+        ):
+            if event.get("type") == "done":
+                content = str(event.get("content") or "")
+            elif event.get("type") == "error":
+                raise JevAIError(str(event.get("message") or "JevAI 执行失败"))
+        return content
     # Rakazo 自己拥有持久 Thread 与长期记忆；这里只转发用户原文，不注入
     # OpenCode system prompt，也绝不创建 OpenCode Session/Agent 双循环。
     if _is_rakazo_target(target):
@@ -2116,6 +2219,7 @@ async def _execute_opencode(
             project_dir=project_dir,
             knowledge_paths=knowledge_paths,
             obsidian_enabled=_is_obsidian_target(target),
+            image_files=_image_inputs(attached_files),
         )
         return _sanitize_assistant_output(content or "", user_message=message)
 
@@ -2136,7 +2240,7 @@ async def _execute_opencode(
     )
     workspace = _resolve_opencode_workspace(project_dir=project_dir, target=target)
     try:
-        content, _ = await _execute_opencode_client(user_message, model=model, mode=mode, conversation_id=conversation_id, system=system_prompt, user_message=message, workspace=workspace)
+        content, _ = await _execute_opencode_client(user_message, model=model, mode=mode, conversation_id=conversation_id, system=system_prompt, user_message=message, workspace=workspace, files=_image_inputs(attached_files))
         content = _sanitize_assistant_output(content or "", user_message=message)
 
         if not content:
@@ -2157,6 +2261,7 @@ async def _execute_opencode_with_meta(
     target: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
     user_message_id: Optional[int] = None,
+    attached_files: Optional[List[AttachedFile]] = None,
 ) -> Tuple[str, List[dict]]:
     if _is_rakazo_target(target):
         if not str(conversation_id or "").isdigit():
@@ -2222,7 +2327,8 @@ async def _execute_opencode_with_meta(
             conversation_id=conversation_id,
             system=system_prompt,
             user_message=message,
-            workspace=workspace
+            workspace=workspace,
+            files=_image_inputs(attached_files),
         )
         content = _sanitize_assistant_output(content or "", user_message=message)
 
@@ -2235,6 +2341,264 @@ async def _execute_opencode_with_meta(
         _finish_codebot_skill_creation_watch(skill_watch)
 
 
+_jevai_aborted: set[str] = set()
+_active_media_requests: Dict[str, asyncio.Task] = {}
+
+
+async def _generate_media_for_conversation(conversation_id: Optional[str], kind: str, prompt: str, **kwargs) -> dict:
+    """保存当前媒体请求，供聊天“终止”按钮取消正在等待的供应商调用。"""
+    key = str(conversation_id or "")
+    task = asyncio.create_task(generate_media(kind, prompt, **kwargs))
+    if key:
+        _active_media_requests[key] = task
+    try:
+        return await task
+    except asyncio.CancelledError as exc:
+        raise MediaError("媒体任务已由用户终止") from exc
+    finally:
+        if key and _active_media_requests.get(key) is task:
+            _active_media_requests.pop(key, None)
+
+
+async def _stream_jevai_task(
+    message: str,
+    *,
+    jev_route: Optional[TaskRoute],
+    conversation_id: Optional[str],
+    user_message_id: Optional[int],
+    project_dir: Optional[str],
+    target: Optional[str],
+    knowledge_paths: Optional[List[str]],
+    decision_message: Optional[str],
+    attached_files: Optional[List[AttachedFile]] = None,
+):
+    """由 Codebot 控制阶段边界；每个阶段仍是原执行器的一次完整 Agent turn。"""
+    if jev_route is None or not str(conversation_id or "").isdigit():
+        raise JevAIError("JevAI 任务缺少已验证的模型配置或对话")
+    conv_id = str(conversation_id)
+    _jevai_aborted.discard(conv_id)
+    run_id = uuid4().hex
+    register_run(run_id, jev_route)
+
+    async def run_stage(prompt: str, model: str, mode: str):
+        content = ""
+        async for event in _stream_execute_opencode_with_meta(
+            prompt, model=model, mode=mode, conversation_id=conv_id,
+            user_message_id=user_message_id, project_dir=project_dir, target=target,
+            knowledge_paths=knowledge_paths, internal_stage=True,
+            attached_files=attached_files,
+        ):
+            if conv_id in _jevai_aborted:
+                raise JevAIError("JevAI 任务已被用户终止")
+            if event.get("type") == "error":
+                raise JevAIError(str(event.get("message") or event.get("error") or "阶段执行失败"))
+            if event.get("type") == "done":
+                content = str(event.get("content") or content)
+            yield event, content
+
+    async def media_stage(kind: str, goal: str, model: str, prior: str = "") -> dict:
+        if kind == "image":
+            prompt = f"用户原始需求：{route_text[:5000]}\n当前图片阶段：{goal[:1000]}"
+        else:
+            script_request = (
+                "仅输出应由语音合成服务朗读的最终文本，不要解释或加标题。"
+                f"\n用户原始需求：{route_text[:4000]}\n当前阶段：{goal[:1000]}"
+                f"\n已完成的文字：{prior[-3000:]}"
+            )
+            script = ""
+            async for _event, content in run_stage(script_request, model, "plan"):
+                if content:
+                    script = content
+            if not script.strip():
+                raise JevAIError("LLM 未给出可合成的语音文本，任务已暂停")
+            prompt = script[:10000]
+        return await _generate_media_for_conversation(conv_id, kind, prompt)
+
+    try:
+        route_text = str(decision_message if decision_message is not None else message)[:6000]
+        if not route_text.strip():
+            route_text = "用户请求仅包含附件；需要结合附件完成任务"
+        has_image = bool(_image_inputs(attached_files))
+        first = await choose_model(jev_route, {"user_request": route_text, "image_input": has_image}, first_stage=True)
+        if conv_id in _jevai_aborted:
+            raise JevAIError("JevAI 任务已被用户终止")
+        first_media = "image" if first.get("output_kind") == "image" else "speech" if first.get("output_kind") == "audio" else ""
+        first_model = f"{configured_service(first_media).protocol}/{configured_service(first_media).model}" if first_media else first["model"]
+        yield {"type": "meta_event", "source": "jevai", "event_type": "jevai.route",
+               "summary": f"JevAI 初始路由：{first['role']} → {first_model}",
+               "metadata": {"model": first_model, "role": first["role"], "output_kind": first.get("output_kind", "text"), "jev_model": first["jev_model"]}}
+
+        if not first["multi_stage"]:
+            if first["output_kind"] in {"image", "audio"}:
+                media_kind = "image" if first["output_kind"] == "image" else "speech"
+                record_stage(run_id, int(conv_id), 1, "running", first_model, "单阶段媒体生成", first)
+                try:
+                    result = await media_stage(media_kind, route_text, first["model"])
+                except Exception:
+                    record_stage(run_id, int(conv_id), 1, "interrupted", first_model, "媒体调用结果不明；不会自动重放", first)
+                    raise
+                if conv_id in _jevai_aborted:
+                    raise JevAIError("JevAI 任务已被用户终止")
+                record_stage(run_id, int(conv_id), 1, "completed", first_model, "媒体文件已生成", first, [result["path"]])
+                yield {"type": "meta_event", "source": "jevai", "event_type": "jevai.media",
+                       "summary": "媒体文件已生成", "metadata": {"artifacts": [result["path"]]}}
+                yield {"type": "done", "content": result["content"], "parts": [], "source": "jevai"}
+                return
+            media_instruction = (
+                f"本轮必须实际生成 {first['output_kind']} 文件，并调用 codebot_jev_checkpoint(run_id={run_id}, stage=1, status=completed, summary, artifacts) 提交真实文件路径；仅返回描述不算完成。"
+                if first["output_kind"] != "text" else ""
+            )
+            prompt = (
+                f"JevAI 任务编号 {run_id}。请按 Agent 模式完成用户任务。"
+                + media_instruction
+                + f"需要对结果分类时，先生成稳定的类别名称及定义，再调用 codebot_jev_classify(run_id={run_id}, categories, records)；"
+                "分类工具只做判断，文件操作由你完成。\n\n用户任务：" + message
+            )
+            record_stage(run_id, int(conv_id), 1, "running", first["model"], "单阶段任务", first)
+            if first["output_kind"] != "text":
+                set_current_stage(run_id, 1)
+            final_content = ""
+            pending_done = None
+            try:
+                async for event, content in run_stage(prompt, first["model"], "agent"):
+                    if event.get("type") == "done":
+                        final_content = content
+                        pending_done = event
+                        if first["output_kind"] != "text":
+                            continue
+                    yield event
+            except Exception:
+                record_stage(run_id, int(conv_id), 1, "interrupted", first["model"], "执行结果不明；不会自动重放本阶段", first)
+                raise
+            artifacts = []
+            if first["output_kind"] != "text":
+                checkpoint = take_checkpoint(run_id, 1)
+                if checkpoint is None or checkpoint["status"] != "completed":
+                    record_stage(run_id, int(conv_id), 1, "paused", first["model"], "媒体产物检查点缺失或未完成", first)
+                    raise JevAIError("媒体阶段未提交完成检查点，任务已暂停；不会自动重放")
+                artifacts = checkpoint["artifacts"]
+                try:
+                    validate_media_artifacts(artifacts, first["output_kind"], project_dir)
+                except JevAIError:
+                    record_stage(run_id, int(conv_id), 1, "paused", first["model"], "媒体产物未确认", first, artifacts)
+                    raise
+            record_stage(run_id, int(conv_id), 1, "completed", first["model"], final_content, first, artifacts)
+            if artifacts:
+                yield {"type": "meta_event", "source": "jevai", "event_type": "jevai.media",
+                       "summary": "已确认媒体产物：" + "、".join(artifacts[:3]), "metadata": {"artifacts": artifacts}}
+                if pending_done:
+                    yield pending_done
+            return
+
+        plan_prompt = (
+            "只规划执行阶段，不执行文件修改。请仅输出 JSON 对象，格式为 "
+            "{\"stages\":[\"阶段一目标\",\"阶段二目标\"]}；阶段数 2 到 12，"
+            "每个阶段有明确完成边界。大量文档可按批次生成，分类与归档应安排在生成后。\n\n"
+            f"用户任务：{message[:12000]}"
+        )
+        plan_content = ""
+        async for _event, content in run_stage(plan_prompt, first.get("planning_model", first["model"]), "plan"):
+            if content:
+                plan_content = content
+        plan_data = _extract_json_object(plan_content)
+        stages = plan_data.get("stages") if isinstance(plan_data, dict) else None
+        if not isinstance(stages, list) or not 2 <= len(stages) <= 12 or any(not isinstance(item, str) or not item.strip() for item in stages):
+            raise JevAIError("LLM 未生成可执行的阶段计划，任务已暂停")
+        stages = [item.strip()[:1000] for item in stages]
+        progress = ""
+        last_answer = ""
+        for index, stage_goal in enumerate(stages, 1):
+            attempts = 0
+            blocked_model = ""
+            while True:
+                if conv_id in _jevai_aborted:
+                    raise JevAIError("JevAI 任务已被用户终止")
+                decision = await choose_model(
+                    jev_route,
+                    {"user_request": route_text[:3500], "current_stage": stage_goal,
+                     "completed_progress": progress[-3500:], "previous_output": last_answer[-3000:], "image_input": has_image},
+                )
+                if blocked_model and decision["model"] == blocked_model and decision["role"] not in {"strong", "multimodal"}:
+                    # 同一模型已明确报告能力不足；再次选中它时升级到强模型。
+                    decision = {**decision, "role": "strong", "model": jev_route.models["strong"]}
+                if blocked_model and decision["model"] == blocked_model:
+                    raise JevAIError(f"阶段 {index} 未找到新的可用模型，已保存进度并暂停")
+                media_kind = "image" if decision.get("output_kind") == "image" else "speech" if decision.get("output_kind") == "audio" else ""
+                active_model = f"{configured_service(media_kind).protocol}/{configured_service(media_kind).model}" if media_kind else decision["model"]
+                yield {"type": "meta_event", "source": "jevai", "event_type": "jevai.stage",
+                       "summary": f"阶段 {index}/{len(stages)} · {decision['role']} · {active_model}",
+                       "metadata": {"stage": index, "total": len(stages), "model": active_model,
+                                    "output_kind": decision.get("output_kind", "text"), "jev_model": decision["jev_model"]}}
+                record_stage(run_id, int(conv_id), index, "running", active_model, stage_goal, decision)
+                set_current_stage(run_id, index)
+                if decision.get("output_kind", "text") in {"image", "audio"}:
+                    media_kind = "image" if decision["output_kind"] == "image" else "speech"
+                    try:
+                        result = await media_stage(media_kind, stage_goal, decision["model"], last_answer)
+                    except Exception:
+                        record_stage(run_id, int(conv_id), index, "interrupted", active_model, "媒体调用结果不明；不会自动重放", decision)
+                        raise
+                    if conv_id in _jevai_aborted:
+                        raise JevAIError("JevAI 任务已被用户终止")
+                    record_stage(run_id, int(conv_id), index, "completed", active_model, "媒体文件已生成", decision, [result["path"]])
+                    last_answer = result["content"]
+                    progress = (progress + f"\n阶段 {index}：{result['path']}")[-7000:]
+                    yield {"type": "meta_event", "source": "jevai", "event_type": "jevai.media",
+                           "summary": f"阶段 {index} 媒体文件已生成", "metadata": {"artifacts": [result["path"]]}}
+                    break
+                media_instruction = (
+                    f"本阶段必须实际生成 {decision['output_kind']} 文件并把路径填入 artifacts；仅返回描述不算完成。\n"
+                    if decision.get("output_kind", "text") != "text" else ""
+                )
+                stage_prompt = (
+                    f"JevAI 任务编号：{run_id}。当前阶段 {index}/{len(stages)}：{stage_goal}\n"
+                    f"原始用户任务：{message[:6000]}\n已完成进度：{progress[-3500:] or '无'}\n"
+                    + media_instruction
+                    + f"当前阶段已有部分结果：{last_answer[-2000:] if attempts else '无'}\n"
+                    "只执行当前阶段；不要重复创建已完成产物。分类任务先提出固定类别，"
+                    "再调用 codebot_jev_classify(run_id, categories, records)，按返回分类使用原有工具归档。"
+                    f"阶段结束必须调用 codebot_jev_checkpoint，参数 run_id={run_id}、stage={index}、"
+                    "status=completed 或 blocked，填写简短 summary 和已创建的 artifacts；"
+                    "调用后结束本轮。若是最后阶段，请同时给用户最终结果。"
+                )
+                stage_content = ""
+                try:
+                    async for event, content in run_stage(stage_prompt, decision["model"], "agent"):
+                        if event.get("type") == "done":
+                            stage_content = content
+                        elif event.get("type") in {"tool_event", "meta_event"}:
+                            yield event
+                        elif index == len(stages) and event.get("type") == "content_delta":
+                            yield event
+                except Exception:
+                    record_stage(run_id, int(conv_id), index, "interrupted", decision["model"], "执行结果不明；不会自动重放本阶段", decision)
+                    raise
+                checkpoint = take_checkpoint(run_id, index)
+                if checkpoint is None:
+                    record_stage(run_id, int(conv_id), index, "paused", decision["model"], "执行器未提交阶段检查点", decision)
+                    raise JevAIError(f"阶段 {index} 缺少检查点，任务已暂停以避免重复操作")
+                last_answer = stage_content
+                record_stage(run_id, int(conv_id), index, checkpoint["status"], decision["model"], checkpoint["summary"], decision, checkpoint["artifacts"])
+                if checkpoint["status"] == "completed":
+                    try:
+                        validate_media_artifacts(checkpoint["artifacts"], decision.get("output_kind", "text"), project_dir)
+                    except JevAIError:
+                        record_stage(run_id, int(conv_id), index, "paused", decision["model"], "媒体产物未确认", decision, checkpoint["artifacts"])
+                        raise
+                    progress = (progress + f"\n阶段 {index}：{checkpoint['summary']} 产物：{checkpoint['artifacts']}")[-7000:]
+                    break
+                attempts += 1
+                blocked_model = decision["model"]
+                progress = (progress + f"\n阶段 {index} 受阻：{checkpoint['summary']} 已有产物：{checkpoint['artifacts']}")[-7000:]
+                if attempts >= 2 or decision["role"] in {"strong", "multimodal"}:
+                    raise JevAIError(f"阶段 {index} 仍受阻，已保存进度并暂停；不会自动重复文件操作")
+            if index == len(stages):
+                yield {"type": "done", "content": last_answer, "parts": [], "source": "jevai"}
+    finally:
+        finish_run(run_id)
+        _jevai_aborted.discard(conv_id)
+
+
 async def _stream_execute_opencode_with_meta(
     message: str,
     model: Optional[str] = None,
@@ -2245,7 +2609,26 @@ async def _stream_execute_opencode_with_meta(
     target: Optional[str] = None,
     knowledge_paths: Optional[List[str]] = None,
     user_message_id: Optional[int] = None,
+    jev_route: Optional[TaskRoute] = None,
+    internal_stage: bool = False,
+    decision_message: Optional[str] = None,
+    media_action: Optional[str] = None,
+    attached_files: Optional[List[AttachedFile]] = None,
 ):
+    if media_action:
+        content = await _run_media_action(media_action, decision_message if decision_message is not None else message, attached_files, conversation_id)
+        yield {"type": "done", "content": content, "parts": [], "source": "media"}
+        return
+    if mode == "jevai":
+        async for event in _stream_jevai_task(
+            message, jev_route=jev_route, conversation_id=conversation_id,
+            user_message_id=user_message_id, project_dir=project_dir,
+            target=target, knowledge_paths=knowledge_paths,
+            decision_message=decision_message,
+            attached_files=attached_files,
+        ):
+            yield event
+        return
     if _is_rakazo_target(target):
         if not str(conversation_id or "").isdigit():
             raise RakazoRuntimeError("Rakazo 执行需要已绑定的 Codebot 主会话", status_code=409)
@@ -2256,7 +2639,7 @@ async def _stream_execute_opencode_with_meta(
             yield event
         return
 
-    schedule_intent = await _classify_codebot_schedule_creation_request(message, model=model)
+    schedule_intent = False if internal_stage else await _classify_codebot_schedule_creation_request(message, model=model)
     if schedule_intent:
         executor = _task_executor_from_target(target)
         preparing = f"Codebot 正在创建定时任务（执行器：{_task_executor_label(executor)}）...\n\n"
@@ -2294,6 +2677,7 @@ async def _stream_execute_opencode_with_meta(
             project_dir=project_dir,
             knowledge_paths=knowledge_paths,
             obsidian_enabled=_is_obsidian_target(target),
+            image_files=_image_inputs(attached_files),
         ):
             yield event
         return
@@ -2344,7 +2728,8 @@ async def _stream_execute_opencode_with_meta(
             mode=mode,
             conversation_id=conversation_id,
             system=system_prompt,
-            workspace=workspace
+            workspace=workspace,
+            files=_image_inputs(attached_files),
         ):
             yield event
     finally:
@@ -4888,6 +5273,7 @@ async def read_file_content(path: str = Body(..., embed=True), abs_path: str = B
 async def send_to_opencode(request: SendMessageRequest):
     """发送消息到 OpenCode。支持多任务排队：如果该对话已有任务在运行，新任务会加入队列。"""
     await _resolve_conversation_execution(request)
+    await _prepare_jevai_request(request)
     conv_id = str(request.conversation_id)
 
     # 构建包含附件内容的完整消息
@@ -4915,6 +5301,10 @@ async def send_to_opencode(request: SendMessageRequest):
                 "target": request.target,
                 "knowledge_paths": request.knowledge_paths,
                 "user_already_saved": request.user_already_saved,
+                "jev_route": request._jev_route,
+                "decision_message": request.message,
+                "media_action": request.media_action,
+                "attached_files": request.attached_files,
             })
         except asyncio.QueueFull:
             raise HTTPException(status_code=429, detail=f"当前对话排队任务已达到 {MAX_CONVERSATION_QUEUE_SIZE} 个，请等待或停止当前任务")
@@ -4935,6 +5325,10 @@ async def send_to_opencode(request: SendMessageRequest):
             project_dir=request.project_dir,
             target=request.target,
             knowledge_paths=request.knowledge_paths,
+            jev_route=request._jev_route,
+            decision_message=request.message,
+            media_action=request.media_action,
+            attached_files=request.attached_files,
         )
 
         if content:
@@ -5688,6 +6082,7 @@ def _format_cli_opencode_event(stream_event: dict, seen: set[str]) -> str:
 async def send_to_opencode_stream(request: SendMessageRequest):
     _prune_finished_chat_runtime()
     await _resolve_conversation_execution(request)
+    await _prepare_jevai_request(request)
     conv_id = str(request.conversation_id)
     full_message = request.message
     if request.attached_files:
@@ -5712,6 +6107,10 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                 "target": request.target,
                 "knowledge_paths": request.knowledge_paths,
                 "user_already_saved": request.user_already_saved,
+                "jev_route": request._jev_route,
+                "decision_message": request.message,
+                "media_action": request.media_action,
+                "attached_files": request.attached_files,
             })
         except asyncio.QueueFull:
             raise HTTPException(status_code=429, detail=f"当前对话排队任务已达到 {MAX_CONVERSATION_QUEUE_SIZE} 个，请等待或停止当前任务")
@@ -5769,6 +6168,10 @@ async def send_to_opencode_stream(request: SendMessageRequest):
                 project_dir=request.project_dir,
                 target=request.target,
                 knowledge_paths=request.knowledge_paths,
+                jev_route=request._jev_route,
+                decision_message=request.message,
+                media_action=request.media_action,
+                attached_files=request.attached_files,
             ):
                 event_type = stream_event.get("type")
                 if event_type == "internal_prompt":
@@ -6249,6 +6652,10 @@ async def _drain_queue(conv_id: str, conversation_id: int):
                 project_dir=task.get("project_dir"),
                 target=task.get("target"),
                 knowledge_paths=task.get("knowledge_paths"),
+                jev_route=task.get("jev_route"),
+                decision_message=task.get("decision_message"),
+                media_action=task.get("media_action"),
+                attached_files=task.get("attached_files"),
             )
             if content:
                 await memory_manager.save_message(
@@ -6285,6 +6692,10 @@ class AbortRequest(BaseModel):
 async def abort_task(request: AbortRequest):
     """终止指定对话的当前运行任务"""
     conv_id = str(request.conversation_id)
+    _jevai_aborted.add(conv_id)
+    active_media = _active_media_requests.get(conv_id)
+    if active_media and not active_media.done():
+        active_media.cancel()
     client = opencode_ws
     target_conv_ids = [conv_id]
     dispatch_state = _multi_agent_dispatch_state.get(conv_id)
@@ -6471,6 +6882,10 @@ def _mark_model_sources(cli_models: List[dict], server_models: List[dict]) -> tu
         for item in server_models
         if isinstance(item, dict) and item.get("id")
     }
+    server_by_id = {
+        str(item.get("id") or "").strip(): item
+        for item in server_models if isinstance(item, dict) and item.get("id")
+    }
     seen: set[str] = set()
     merged: List[dict] = []
     missing_runnable: List[str] = []
@@ -6483,6 +6898,8 @@ def _mark_model_sources(cli_models: List[dict], server_models: List[dict]) -> tu
             continue
         item = dict(raw)
         runnable = model_id in server_ids
+        if runnable:
+            item["modalities"] = server_by_id[model_id].get("modalities", {})
         item["source"] = "cli"
         item["runnable"] = runnable
         if not runnable:

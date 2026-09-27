@@ -1267,6 +1267,35 @@ async def _call_external_proxy_tool(tool_name: str, arguments: dict) -> dict:
 def _build_codebot_tool_definitions() -> List[dict]:
     return [
         {
+            "name": "codebot_jev_checkpoint",
+            "description": "JevAI 多阶段任务在当前阶段结束时记录完成或受阻状态；调用后结束本轮，由 Codebot 选择下一阶段模型。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"}, "stage": {"type": "integer"},
+                    "status": {"type": "string", "enum": ["completed", "blocked"]},
+                    "summary": {"type": "string"},
+                    "artifacts": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["run_id", "stage", "status", "summary"],
+            },
+        },
+        {
+            "name": "codebot_jev_classify",
+            "description": "由 Jev 对 LLM 提出的固定类别进行批量分类。每条 text 须为不超过 800 字的摘要；只返回结果，不移动或修改文件。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "categories": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "records": {"type": "array", "items": {"type": "object", "properties": {
+                        "id": {"type": "string"}, "text": {"type": "string"},
+                    }, "required": ["id", "text"]}},
+                },
+                "required": ["run_id", "categories", "records"],
+            },
+        },
+        {
             "name": "codebot_get_runtime_overview",
             "description": "获取 Codebot 当前第三方运行总览，包括 OpenCode 连接、MCP/技能同步、任务数与记忆统计。",
             "inputSchema": {"type": "object", "properties": {}},
@@ -1491,6 +1520,21 @@ async def _call_codebot_tool(name: str, arguments: dict, *, codex_client: bool =
     args = arguments or {}
     if codex_client and not _codex_tool_allowed(name):
         raise PermissionError(f"Codex 配置未允许共享工具：{name}")
+    if name == "codebot_jev_checkpoint":
+        from core.jevai import save_checkpoint
+        value = save_checkpoint(
+            str(args.get("run_id") or ""), int(args.get("stage") or 0),
+            str(args.get("status") or ""), str(args.get("summary") or ""),
+            args.get("artifacts") if isinstance(args.get("artifacts"), list) else [],
+        )
+        return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}]}
+    if name == "codebot_jev_classify":
+        from core.jevai import active_route, classify_records
+        route = active_route(str(args.get("run_id") or ""))
+        records = args.get("records") if isinstance(args.get("records"), list) else []
+        categories = args.get("categories") if isinstance(args.get("categories"), dict) else {}
+        value = await classify_records(route, records, categories)
+        return {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}]}
     if name == "codebot_get_runtime_overview":
         payload = await _codebot_overview_payload(codex_client=codex_client)
         return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]}

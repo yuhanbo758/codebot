@@ -1092,6 +1092,7 @@ class CodexRuntime:
         developer_instructions: str = "",
         history_context: str = "",
         skills: Optional[List[Dict[str, str]]] = None,
+        images: Optional[List[str]] = None,
         interactive: bool = True,
     ) -> AsyncIterator[Dict[str, Any]]:
         await self.start()
@@ -1129,6 +1130,8 @@ class CodexRuntime:
         )
 
         input_items: List[Dict[str, Any]] = [{"type": "text", "text": message}]
+        for image_url in images or []:
+            input_items.append({"type": "image", "url": image_url})
         for skill in skills or []:
             name = str(skill.get("name") or "").strip()
             path = str(skill.get("path") or "").strip()

@@ -3,9 +3,11 @@
 """
 from pathlib import Path
 import json
+import os
 import re
+import secrets
 from urllib.parse import urlparse
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from typing import Literal, Optional, List
 
@@ -14,6 +16,7 @@ from config import (
     save_config,
     SkillsConfig,
     CodexConfig,
+    JevAIConfig,
     RakazoConfig,
     ObsidianConfig,
     ObsidianKnowledgeBase,
@@ -212,6 +215,56 @@ def _validate_abs_dir_list(values: Optional[List[str]], label: str) -> List[str]
 
 class OpenCodeAccessUpdateRequest(BaseModel):
     full_access: bool
+
+
+class JevAIConfigUpdateRequest(BaseModel):
+    provider: Literal["openrouter", "typesafe"]
+    opencode: dict
+    codex: dict
+
+
+class JevAIDesktopKeyRequest(BaseModel):
+    provider: Literal["openrouter", "typesafe"]
+    api_key: str = ""
+
+
+@router.get("/jevai")
+async def get_jevai_config():
+    from core.jevai import credential_configured
+    return {"success": True, "data": {
+        **app_config.jevai.model_dump(),
+        "credentials": {provider: credential_configured(provider) for provider in ("openrouter", "typesafe")},
+    }}
+
+
+@router.patch("/jevai")
+async def update_jevai_config(request: JevAIConfigUpdateRequest):
+    updated = request.model_dump()
+    for executor in ("opencode", "codex"):
+        tiers = getattr(request, executor)
+        keys = set(tiers)
+        if not {"fast", "balanced", "strong"} <= keys or not keys <= {"fast", "balanced", "strong", "multimodal"} or any(not isinstance(value, str) for value in tiers.values()):
+            raise HTTPException(status_code=400, detail=f"{executor} 必须提供轻、中、强三个模型字段，可增加图片理解模型")
+        if "multimodal" not in tiers:
+            updated[executor]["multimodal"] = getattr(app_config.jevai, executor).multimodal
+        selected = [updated[executor][role].strip() for role in ("fast", "balanced", "strong") if updated[executor][role].strip()]
+        if len(set(selected)) != len(selected):
+            raise HTTPException(status_code=400, detail=f"{executor} 的轻、中、强模型不能重复")
+    app_config.jevai = JevAIConfig(**updated)
+    save_config(app_config)
+    return await get_jevai_config()
+
+
+@router.post("/jevai/desktop-key", include_in_schema=False)
+async def set_jevai_desktop_key(request: Request, body: JevAIDesktopKeyRequest):
+    """密钥只经 Electron 桥注入内存，永不写入 config.json 或接口响应。"""
+    expected = os.environ.get("CODEBOT_DESKTOP_BRIDGE_TOKEN", "")
+    supplied = request.headers.get("x-codebot-desktop-token", "")
+    if request.client is None or request.client.host not in {"127.0.0.1", "::1"} or not expected or not secrets.compare_digest(expected, supplied):
+        raise HTTPException(status_code=404, detail="Not found")
+    from core.jevai import set_desktop_key
+    set_desktop_key(body.provider, body.api_key)
+    return {"success": True, "data": {"configured": bool(body.api_key)}}
 
 
 @router.get("/opencode/access")

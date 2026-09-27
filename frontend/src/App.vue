@@ -246,7 +246,7 @@
       <el-alert
         type="warning"
         title="此局域网设备尚未配对"
-        description="请在运行 Codebot 的电脑上打开“设置 → 访问安全”，生成 6 位配对码后输入。"
+        description="请在运行 Codebot 的电脑上打开“设置 → 安全”，生成 6 位配对码后输入。"
         :closable="false"
         show-icon
       />

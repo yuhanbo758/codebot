@@ -78,7 +78,7 @@
           <el-icon class="ms-warn-icon"><Warning /></el-icon>
           <span>
             尚未配置 API Key，请前往
-            <router-link to="/settings" class="link">设置 → 集成配置</router-link>
+            <router-link to="/settings" class="link">设置 → 集成</router-link>
             填写 ModelScope API Key 后使用。
           </span>
         </div>

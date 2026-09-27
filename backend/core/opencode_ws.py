@@ -129,7 +129,8 @@ class OpenCodeClient:
         prompt: str,
         model: Optional[str] = None,
         mode: Optional[str] = None,
-        system: Optional[str] = None
+        system: Optional[str] = None,
+        files: Optional[List[dict]] = None,
     ) -> dict:
         actual_prompt = prompt
         if mode == "plan":
@@ -150,6 +151,8 @@ class OpenCodeClient:
                 }
             ]
         }
+        if files:
+            payload["parts"].extend(files)
         if system:
             payload["system"] = system
         if mode in {"plan", "build", "agent", "editor"}:
@@ -463,6 +466,20 @@ class OpenCodeClient:
                             display_name = model_info.get("name") or model_key
                         else:
                             display_name = model_key
+                        declared = {}
+                        if isinstance(model_info, dict):
+                            for source_key in ("modalities", "capabilities"):
+                                source = model_info.get(source_key)
+                                if not isinstance(source, dict):
+                                    continue
+                                for direction in ("input", "output"):
+                                    values = source.get(direction)
+                                    if isinstance(values, list):
+                                        declared[direction] = [value for value in values if isinstance(value, str) and value in {"text", "image", "audio", "video"}]
+                                    elif isinstance(values, dict):
+                                        declared[direction] = [value for value in ("text", "image", "audio", "video") if values.get(value) is True]
+                            if model_info.get("attachment") is True or (isinstance(model_info.get("capabilities"), dict) and model_info["capabilities"].get("attachment") is True):
+                                declared["input"] = list(dict.fromkeys([*declared.get("input", []), "image"]))
                         # 格式：providerID/modelID，与 OpenCode 内部格式一致
                         full_id = f"{provider_id}/{model_key}"
                         models.append({
@@ -470,6 +487,8 @@ class OpenCodeClient:
                             "name": f"{display_name} ({provider_name})",
                             "provider": provider_id,
                             "model": model_key,
+                            # 仅透传目录明确声明的输入/输出能力，不能根据模型名称猜测。
+                            "modalities": declared,
                         })
             return self._dedupe_models(models)
         except Exception as e:
@@ -657,7 +676,8 @@ class OpenCodeClient:
         workspace: Optional[str] = None,
         timeout: int = 300,
         conversation_id: Optional[str] = None,
-        system: Optional[str] = None
+        system: Optional[str] = None,
+        files: Optional[List[dict]] = None,
     ) -> TaskResult:
         """
         执行任务
@@ -689,7 +709,7 @@ class OpenCodeClient:
                 conversation_id=conversation_id,
                 workspace=workspace
             )
-            payload = self._build_prompt_payload(prompt=prompt, model=model, mode=mode, system=system)
+            payload = self._build_prompt_payload(prompt=prompt, model=model, mode=mode, system=system, files=files)
             return await self._execute_task_via_prompt_async(
                 client=client,
                 session_id=session_id,
@@ -717,7 +737,8 @@ class OpenCodeClient:
         workspace: Optional[str] = None,
         timeout: int = 300,
         conversation_id: Optional[str] = None,
-        system: Optional[str] = None
+        system: Optional[str] = None,
+        files: Optional[List[dict]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         await self.ensure_connected()
         final_parts: List[dict] = []
@@ -739,7 +760,7 @@ class OpenCodeClient:
                 workspace=workspace
             )
 
-            payload = self._build_prompt_payload(prompt=prompt, model=model, mode=mode, system=system)
+            payload = self._build_prompt_payload(prompt=prompt, model=model, mode=mode, system=system, files=files)
             tracked_session_ids = {session_id}
 
             async with client.stream(
