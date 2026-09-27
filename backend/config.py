@@ -161,6 +161,35 @@ class CodexConfig(BaseModel):
     skill_dirs: List[str] = []
 
 
+class JevModelTiers(BaseModel):
+    """同一执行器内的三档 LLM 与可选媒体模型。"""
+    fast: str = ""
+    balanced: str = ""
+    strong: str = ""
+    multimodal: str = ""
+
+
+class JevAIConfig(BaseModel):
+    provider: Literal["openrouter", "typesafe"] = "openrouter"
+    opencode: JevModelTiers = Field(default_factory=JevModelTiers)
+    codex: JevModelTiers = Field(default_factory=JevModelTiers)
+    confidence_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+
+
+class MediaServiceConfig(BaseModel):
+    """媒体生成服务的非敏感配置；密钥由桌面安全存储或环境变量提供。"""
+    protocol: Literal["openai", "ark", "volc_tts", "ark_chat_audio", "minimax_image", "xiaomi_tts", "minimax_tts", "xiaomi_asr", "minimax_asr", "qwen_image", "qwen_tts", "qwen_asr", "hunyuan_image", "hunyuan_asr", "tencent_minimax_tts", "openrouter_image", "openrouter_tts", "openrouter_asr", "gemini_image", "gemini_tts", "gemini_asr"] = "openai"
+    model: str = ""
+    base_url: str = ""
+    voice: str = ""
+
+
+class MediaConfig(BaseModel):
+    image: MediaServiceConfig = Field(default_factory=MediaServiceConfig)
+    speech: MediaServiceConfig = Field(default_factory=MediaServiceConfig)
+    transcription: MediaServiceConfig = Field(default_factory=MediaServiceConfig)
+
+
 class RakazoConfig(BaseModel):
     """Rakazo 本机受控运行时配置。
 
@@ -255,6 +284,8 @@ class AppConfig(BaseModel):
     integration: IntegrationConfig = IntegrationConfig()
     skills: SkillsConfig = SkillsConfig()
     codex: CodexConfig = CodexConfig()
+    jevai: JevAIConfig = Field(default_factory=JevAIConfig)
+    media: MediaConfig = Field(default_factory=MediaConfig)
     rakazo: RakazoConfig = RakazoConfig()
     obsidian: ObsidianConfig = ObsidianConfig()
     sandbox: SandboxConfig = SandboxConfig()

@@ -41,6 +41,8 @@ electron/dist/
 electron/out/
 
 # 数据文件
+/data/
+/.dbg/
 data/*.db
 data/*.json
 data/.lan_api_token

@@ -74,11 +74,24 @@
         </div>
         
         <div class="conversation-list">
-          <div
+          <el-popover
             v-for="conv in filteredConversations"
             :key="conv.id"
+            :visible="previewConversationId === conv.id"
+            placement="right-start"
+            :width="340"
+          >
+            <template #reference>
+          <div
             class="conversation-item"
-            :class="{ active: currentConversationId === conv.id, 'batch-selected': selectedConvIds.includes(conv.id), 'multi-agent-hub-item': isMultiAgentHub(conv) }"
+            :class="{ active: currentConversationId === conv.id, pinned: conv.is_pinned, 'batch-selected': selectedConvIds.includes(conv.id), 'multi-agent-hub-item': isMultiAgentHub(conv) }"
+            tabindex="0"
+            :aria-label="conv.title"
+            @mouseenter="previewConversationId = conv.id"
+            @mouseleave="previewConversationId = null"
+            @focusin="previewConversationId = conv.id"
+            @focusout="previewConversationId = null"
+            @keydown.enter="batchMode ? toggleConvSelection(conv.id) : selectConversation(conv.id)"
             @click="batchMode ? (conv.executor !== 'rakazo' && toggleConvSelection(conv.id)) : selectConversation(conv.id)"
           >
             <div v-if="batchMode" class="batch-checkbox" @click.stop>
@@ -91,14 +104,12 @@
             <div class="conversation-info">
               <div class="conversation-title">
                 <span class="conversation-title-text">{{ conv.title }}</span>
-                <el-tag v-if="conv.is_pinned" size="small" type="info">置顶</el-tag>
                 <el-tag v-if="isMultiAgentHub(conv)" size="small" type="danger">多Agent</el-tag>
                 <el-tag v-else-if="conv.is_group" size="small" type="success">{{ conv.group_role || 'Agent' }}</el-tag>
-                <el-tag v-if="conv.executor === 'rakazo'" size="small" type="primary">Rakazo</el-tag>
+                <el-tag v-if="conv.executor === 'rakazo'" size="small" type="primary" title="Rakazo">R</el-tag>
                 <el-tag v-else-if="conv.executor === 'codex'" size="small" type="success">Codex</el-tag>
                 <el-tag v-if="conv.project_dir" size="small" type="warning" :title="conv.project_dir">📁</el-tag>
               </div>
-              <div class="conversation-time">{{ formatDate(conv.updated_at) }}</div>
             </div>
             <div v-if="!batchMode" class="conversation-actions">
               <el-dropdown @command="(command) => handleConversationCommand(conv, command)" trigger="click">
@@ -123,6 +134,12 @@
               </el-dropdown>
             </div>
           </div>
+            </template>
+            <div class="conversation-preview-title">{{ conv.title }}</div>
+            <div class="conversation-preview-meta">{{ conv.executor === 'rakazo' ? 'Rakazo' : conv.executor === 'codex' ? 'Codex' : 'OpenCode' }}{{ conv.is_pinned ? ' · 已置顶' : '' }}</div>
+            <div v-if="conv.project_dir" class="conversation-preview-meta">项目：{{ conv.project_dir }}</div>
+            <div class="conversation-preview-meta">更新：{{ formatDateTime(conv.updated_at) }}</div>
+          </el-popover>
           
           <el-empty v-if="filteredConversations.length === 0 && !conversationSearchQuery" description="暂无对话" />
           <el-empty v-else-if="filteredConversations.length === 0 && conversationSearchQuery" description="无匹配对话" />
@@ -379,6 +396,7 @@
                   <div v-if="isCliDisplayMessage(msg)" class="cli-output">{{ msg.content }}</div>
                   <div v-else-if="msg.streaming" class="message-text streaming-text">{{ msg.content }}</div>
                   <div v-else class="message-text markdown-body" v-html="renderMarkdown(msg.content)"></div>
+                  <audio v-if="msg.role === 'assistant' && !msg.streaming && generatedAudioUrl(msg.content)" controls preload="none" :src="generatedAudioUrl(msg.content)" class="generated-audio" />
                   <div v-if="msg.role === 'assistant' && toolEventActions(msg.pendingActionEvent).length > 0" class="cli-action-bar">
                     <el-button
                       v-for="action in toolEventActions(msg.pendingActionEvent)"
@@ -604,10 +622,16 @@
                     <span class="agent-option-name">Agent</span>
                     <span class="agent-option-desc">智能体模式，自我反思与专家协作</span>
                   </el-option>
+                  <el-option value="jevai" label="JevAI">
+                    <span class="agent-option-name">JevAI</span>
+                    <span class="agent-option-desc">Jev 路由轻、中、强模型，按阶段切换</span>
+                  </el-option>
                 </el-select>
                 <el-divider direction="vertical" />
                 <span class="toolbar-label">模型</span>
+                <span v-if="agentMode === 'jevai'" class="jevai-auto-model">JevAI 自动路由</span>
                 <el-select
+                  v-else
                   v-model="selectedModel"
                   placeholder="默认模型"
                   size="small"
@@ -792,7 +816,7 @@
                   ref="fileInputRef"
                   type="file"
                   multiple
-                  accept="image/*,.md,.txt,.pdf,.docx,.xlsx,.xls,.pptx,.csv,.py,.js,.ts,.json,.yaml,.yml,.html,.css,.sh,.sql,.vue,.jsx,.tsx"
+                  accept="image/png,image/jpeg,image/webp,image/gif,audio/*,.md,.txt,.pdf,.docx,.xlsx,.xls,.pptx,.csv,.py,.js,.ts,.json,.yaml,.yml,.html,.css,.sh,.sql,.vue,.jsx,.tsx"
                   style="display:none"
                   @change="onFileInputChange"
                 />
@@ -827,6 +851,11 @@
                 </span>
               </div>
               <div class="input-actions-right">
+                <el-select v-if="currentConversation?.conversation_type !== 'multi_agent_hub'" v-model="mediaAction" placeholder="普通聊天" clearable style="width: 128px" title="选择媒体操作；Build、Plan、Agent 与 JevAI 模式可用">
+                  <el-option label="生成图片" value="image" />
+                  <el-option label="生成语音" value="speech" />
+                  <el-option label="语音转文字" value="transcription" />
+                </el-select>
                 <el-button
                   v-if="currentLoading"
                   type="danger"
@@ -1084,6 +1113,11 @@ const renderMarkdown = (content) => {
   // 渲染前移除 options 注释块，避免在 HTML 中残留
   const cleaned = (content || '').replace(/<!--\s*options\s*\n[\s\S]*?-->/g, '')
   return md.render(cleaned)
+}
+
+const generatedAudioUrl = (content) => {
+  const match = String(content || '').match(/\/api\/media\/assets\/[a-f0-9]{32}\.(?:mp3|wav)/)
+  return match ? match[0] : ''
 }
 
 /**
@@ -1446,6 +1480,7 @@ const scheduleConversationTitleRefresh = (conversationId, attempts = 20, delay =
 
 // 对话搜索
 const conversationSearchQuery = ref('')
+const previewConversationId = ref(null)
 const filteredConversations = computed(() => {
   const q = conversationSearchQuery.value.trim()
   const normalConversations = conversations.value.filter(conv => !isMultiAgentHub(conv))
@@ -1572,6 +1607,7 @@ const loadMultiAgentMembers = async () => {
 
 // ── 附件管理 ─────────────────────────────────────────────────────────────────
 const attachedFiles = ref([])  // [{name, type, content, is_text}]
+const mediaAction = ref('')
 const uploadingFile = ref(false)
 const isDragOver = ref(false)
 let _dragCounter = 0
@@ -1853,7 +1889,9 @@ const applyConversationTargetState = (conversationId) => {
       ? false
       : Boolean(state.obsidian_enabled ?? (target === 'obsidian' || String(target || '').includes('obsidian') || (state.knowledge_bases || []).length > 0))
     selectedKnowledgeBases.value = Array.isArray(state.knowledge_bases) ? state.knowledge_bases : []
-    agentMode.value = state.mode || localStorage.getItem(AGENT_MODE_KEY) || 'build'
+    agentMode.value = persistedExecutor === 'rakazo'
+      ? 'build'
+      : (state.mode || localStorage.getItem(AGENT_MODE_KEY) || 'build')
     const model = persistedExecutor === 'rakazo'
       ? ''
       : normalizeModelId(state.model || localStorage.getItem(LAST_MODEL_KEY) || selectedModel.value || '')
@@ -2476,6 +2514,7 @@ const attachCliActionEvent = (assistantMsg, event) => {
 
 const shouldShowStructuredEvent = (event) => {
   if (!event) return false
+  if (eventSourceName(event) === 'jevai') return ['jevai.route', 'jevai.stage'].includes(event?.event_type)
   if (eventSourceName(event) === 'rakazo') {
     return [
       'model.route', 'reasoning.delta', 'tool.started', 'tool.updated', 'tool.completed',
@@ -3406,6 +3445,8 @@ const toolEventLabel = (event) => {
     'session.retry': '自动重试',
     'session.error': '会话错误',
     'model.route': '模型路由',
+    'jevai.route': 'JevAI 路由',
+    'jevai.stage': 'JevAI 阶段',
     'reasoning.delta': '推理',
     'tool.started': '工具开始',
     'tool.updated': '工具进度',
@@ -3931,6 +3972,7 @@ const sendMessage = async () => {
   const conversationId = currentConversationId.value
   const content = inputMessage.value
   const filesToSend = [...attachedFiles.value]
+  const mediaActionToSend = mediaAction.value || null
   const targetToSend = chatTarget.value || 'codebot'
   const isCodexTargetToSend = isCodexChatTarget(targetToSend)
   const isRakazoTargetToSend = targetToSend === 'rakazo'
@@ -3939,6 +3981,11 @@ const sendMessage = async () => {
     : []
   const isLoading = isConversationLoading(conversationId)
   const pendingQuestionEvent = filesToSend.length === 0 ? findPendingQuestionEvent() : null
+
+  if (currentConversation.value?.conversation_type === 'multi_agent_hub' && agentMode.value === 'jevai') {
+    ElMessage.warning('多Agent 群聊暂不支持 JevAI；请在普通 OpenCode 或 Codex 对话中使用')
+    return
+  }
 
   if (pendingQuestionEvent && content.trim()) {
     if (shouldShowQuestionPanel(pendingQuestionEvent)) {
@@ -3962,6 +4009,7 @@ const sendMessage = async () => {
 
   inputMessage.value = ''
   attachedFiles.value = []
+  mediaAction.value = ''
   memoryHints.value = []
   showCommandPanel.value = false
   showAtPanel.value = false
@@ -4041,6 +4089,7 @@ const sendMessage = async () => {
         model: selectedModel.value || null,
         reasoning_effort: isCodexTargetToSend ? selectedReasoningEffort.value || null : null,
         mode: agentMode.value || null,
+        media_action: mediaActionToSend,
         attached_files: filesToSend.length > 0 ? filesToSend : null,
         project_dir: currentProjectDir.value || null,
         target: targetToSend,
@@ -4051,8 +4100,8 @@ const sendMessage = async () => {
         queuedCount.value += 1
         ElMessage.info('消息已加入队列，将在当前任务完成后处理')
       }
-    } catch {
-      ElMessage.error('发送失败')
+    } catch (error) {
+      ElMessage.error(error?.response?.data?.detail || '发送失败')
     }
     return
   }
@@ -4127,6 +4176,7 @@ const sendMessage = async () => {
         model: selectedModel.value || null,
         reasoning_effort: isCodexTargetToSend ? selectedReasoningEffort.value || null : null,
         mode: agentMode.value || null,
+        media_action: mediaActionToSend,
         attached_files: filesToSend.length > 0 ? filesToSend : null,
         project_dir: currentProjectDir.value || null,
         target: targetToSend,
@@ -4482,6 +4532,14 @@ const formatDate = (dateStr) => {
   return date.toLocaleDateString('zh-CN')
 }
 
+const formatDateTime = (dateStr) => {
+  if (!dateStr) return '未知'
+  const raw = String(dateStr).trim()
+  const utc = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(raw)
+  const date = new Date(utc ? `${raw.replace(' ', 'T')}Z` : raw)
+  return Number.isNaN(date.getTime()) ? raw : date.toLocaleString('zh-CN', { hour12: false })
+}
+
 onMounted(() => {
   loadConversations(true)
   // 非首屏关键数据并行加载，避免从其他页面返回聊天时串行等待。
@@ -4724,10 +4782,11 @@ onUnmounted(() => {
 }
 
 .conversation-item {
-  padding: 12px;
-  border-radius: 8px;
+  padding: 7px 9px;
+  min-height: 34px;
+  border-radius: 7px;
   cursor: pointer;
-  margin-bottom: 8px;
+  margin-bottom: 3px;
   transition: all 0.3s;
   display: flex;
   align-items: center;
@@ -4741,6 +4800,20 @@ onUnmounted(() => {
 .conversation-item.active {
   background: #ecf5ff;
   color: #409EFF;
+}
+
+.conversation-item.pinned:not(.multi-agent-hub-item) {
+  background: #fff7e8;
+  box-shadow: inset 3px 0 #e6a23c;
+}
+
+.conversation-item.pinned.active:not(.multi-agent-hub-item) {
+  background: #e5f2ff;
+  box-shadow: inset 3px 0 #e6a23c;
+}
+
+.conversation-item.pinned:hover:not(.active):not(.multi-agent-hub-item) {
+  background: #fff0ce;
 }
 
 .conversation-item.multi-agent-hub-item {
@@ -4777,17 +4850,26 @@ onUnmounted(() => {
 
 .conversation-title {
   font-weight: 500;
-  margin-bottom: 4px;
+  font-size: 13px;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
+  min-width: 0;
+  width: 100%;
 }
 
 .conversation-title-text {
+  min-width: 0;
+  flex: 1;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+.conversation-title :deep(.el-tag) { flex-shrink: 0; height: 19px; padding: 0 4px; font-size: 11px; }
+.conversation-preview-title { font-size: 14px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
+.conversation-preview-meta { color: #606266; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; margin-top: 4px; }
+.jevai-auto-model { color: #409eff; font-size: 12px; white-space: nowrap; }
 
 .conversation-time {
   font-size: 12px;
@@ -5268,6 +5350,8 @@ onUnmounted(() => {
   max-width: 100%;
   border-radius: 4px;
 }
+
+.generated-audio { width: min(100%, 420px); margin-top: 8px; }
 
 .message-footer {
   display: flex;

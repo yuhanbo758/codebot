@@ -50,6 +50,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   rakazoAuthorizationStatus: () => ipcRenderer.invoke('rakazo:authorization-status'),
   bootstrapRakazoAuthorization: () => ipcRenderer.invoke('rakazo:bootstrap-authorization'),
   clearRakazoAuthorization: () => ipcRenderer.invoke('rakazo:clear-authorization'),
+  saveJevAIKey: (provider, key) => ipcRenderer.invoke('jevai:save-key', provider, key),
+  saveMediaKey: (kind, protocol, key) => ipcRenderer.invoke('media:save-key', kind, protocol, key),
   // 四项一键启动只允许传入可选存储根目录；Docker 可执行文件、Compose 命令与
   // safeStorage 凭据全部由主进程解析，渲染页面只能看到脱敏进度与最终状态。
   startAllRakazo: (options) => ipcRenderer.invoke('rakazo:start-all', toPlainValue(options)),

@@ -105,6 +105,8 @@ codebot/
 | 技能系统 | `backend/core/skill_registry.py`, `backend/core/skill_generator.py`, `backend/core/tool_dispatcher.py`, `backend/api/routes/skills.py` | 发现内置、自动生成、外部兼容、OpenClaw 兼容和 OpenCode/AgentSkills 技能，读写 Codebot 可写 `SKILL.md`，从对话素材提炼真正的技能正文，并在聊天中注入相关技能上下文；内置多Agent协作调度技能。 |
 | MCP 聚合 | `backend/api/routes/mcp.py` | 管理第三方 MCP；保留 OpenCode SSE，并以带 Bearer Token 的标准 Streamable HTTP MCP 向 Codex 暴露记忆、调度、Skills 和第三方工具代理。 |
 | 模型网关 | `backend/api/routes/gateway.py` | 提供 OpenAI 兼容 `/v1/models` 和 `/v1/chat/completions` 接口。 |
+| JevAI 决策层 | `backend/core/jevai.py`, `backend/api/routes/chat.py`, `backend/api/routes/mcp.py` | 为 OpenCode/Codex 快照化三档 LLM、可选视觉输入模型与供应商，使用 Jev 结构化判断在阶段边界路由并批量分类；图片和语音输出调用独立媒体服务，Agent 执行用户指定目录的文件操作，阶段状态落库，结果不明时暂停。 |
+| 媒体服务 | `backend/core/media_runtime.py`, `backend/api/routes/media.py` | 提供 OpenAI/方舟图片生成、OpenAI/豆包语音合成及 OpenAI/方舟音频理解协议，独立于聊天 LLM 目录；桌面安全存储或 Web 环境变量提供密钥，产物保存在数据目录并以受限路径读取。 |
 | 沙箱 | `backend/core/sandbox/manager.py`, `backend/api/routes/sandbox.py` | 支持显式可选的 Windows Sandbox 强隔离后端、可信本地模式、超时控制和失败关闭；默认不选择、不探测或启动 Windows Sandbox。 |
 | 通知 | `backend/services/notification.py`, `backend/api/routes/notifications.py` | 应用内、桌面、飞书、邮件通知统一管理。 |
 | 日志 | `backend/api/routes/logs.py`, `frontend/src/views/Logs.vue` | 任务日志、聊天日志、已归档对话查看/恢复和日志清理 API/UI。 |
@@ -127,6 +129,7 @@ codebot/
 | `/api/skills` | `backend/api/routes/skills.py` | 技能列表、创建、编辑、删除、同步 |
 | `/api/mcp` | `backend/api/routes/mcp.py` | MCP 服务管理、ModelScope 导入、OpenCode 同步 |
 | `/api/config` | `backend/api/routes/config.py` | 应用配置读写、文件路径配置 |
+| `/api/media` | `backend/api/routes/media.py` | 媒体服务配置、密钥状态、协议调用及产物读取 |
 | `/api/notifications` | `backend/api/routes/notifications.py` | 通知列表、未读数和通知配置 |
 | `/api/logs` | `backend/api/routes/logs.py` | 任务日志、聊天日志、清理策略 |
 | `/api/lark` | `backend/api/routes/lark.py` | 飞书机器人配置与状态 |
@@ -303,6 +306,18 @@ build.bat
 ---
 
 ## 变更日志
+
+2026-09-26：媒体页新增 OpenRouter 生图/TTS/ASR 与 Gemini 生图/TTS/音频理解转写，沿用 Build/Plan/Agent/JevAI 的统一媒体链。Gemini PCM 语音转换为 WAV，媒体输出继续做大小和文件签名校验；Gemini 转写限定小于 14 MB 的真实 MP3/WAV。桌面媒体密钥按服务＋协议分别安全存储，旧单服务密钥在启动时绑定当前协议；Web 新协议需独立环境变量，避免切换供应商时复用旧密钥。README、`.env.example` 与模拟协议测试同步；无新增依赖或数据库结构变更。
+
+2026-09-26：媒体服务新增阿里云百炼千问生图 3.0、Qwen3 TTS/ASR 与腾讯 TokenHub 混元生图 3.0、Hy ASR；腾讯 TokenHub 语音合成按官方 MiniMax Speech 协议单独标注，不冒充混元 TTS。临时媒体 URL 仅允许供应商对象存储域名、限制下载大小且不跟随跳转，保存前校验文件签名。Build/Plan/Agent/JevAI 沿用统一媒体链；README 与模拟协议测试同步。无新增依赖或数据库结构变更。
+
+2026-09-26：澄清 JevAI 的第四模型槽位仅用于图片附件理解，设置标签从“视觉理解模型”改为“图片理解模型”，目录标签只报告图片输入能力；目前没有视频附件输入链路。Build/Plan/Agent 的媒体生成需要用户在发送栏明确选择媒体操作，JevAI 在阶段边界可根据路由判断调用已配置媒体服务。README 同步说明，无配置结构变更。
+
+2026-09-26：媒体设置新增小米 MiMo 与 MiniMax 官方协议：小米 MiMo TTS/ASR 使用 Chat Completions 中各自的音频请求与响应格式，MiniMax 图片、TTS、ASR 使用独立的 `image_generation`、`t2a_v2`、`speech_to_text` 接口。支持 MiniMax 国际/中国站 Base URL 和小米 WAV 播放；对 MiniMax 响应体状态、图片/音频文件签名及小米 ASR 输入格式做失败关闭校验。小米视觉理解沿用聊天模型图片输入；未声称小米有可调用的图片生成接口。README 与协议模拟测试同步更新，无新增依赖或数据库结构变更。
+
+2026-09-26：纠正聊天模型目录的媒体能力判断：OpenCode 兼容 `capabilities.input.image`、`attachment` 等标记；JevAI 第四槽位用于视觉输入，可复用任一 LLM 路由模型，目录未标注时可选择但不宣称已验证。图片附件以原生文件/图片输入交给 OpenCode、Codex；图片生成和语音合成改由独立协议服务执行，支持 OpenAI Images/Speech、方舟 Seedream、豆包语音 HTTP TTS，并支持 OpenAI Transcriptions 或方舟音频理解转文字。Build/Plan/Agent/JevAI 共用发送栏媒体操作，JevAI 在阶段边界调用相同服务，媒体文件落到数据目录。桌面密钥仍由 Electron `safeStorage` 保存并经受令牌保护的桥注入，Web 使用环境变量；新增 `media` 配置段和 `/api/media` 路由，README 同步。暂不接入实时 WebSocket ASR 和视频生成；无新增依赖或数据库结构变更。设置菜单标签缩为“通用”“模式”“通知”“飞书”“邮箱”“技能”“备份”“集成”“安全”“沙箱”，新增“媒体”页，路由 ID 不变。
+
+2026-09-25：聊天列表改为紧凑单行标题，悬停/聚焦展示完整标题及执行器、项目、更新时间；Rakazo 列表标记缩为 R，置顶项用颜色区分。新增“模式设置”和 JevAI 模式：OpenRouter/TypeSafe 固定版本 Jev、桌面安全存储或 Web 环境变量密钥、OpenCode/Codex 各自三档模型、阶段检查点路由、批量分类与失败暂停；Jev 不直接执行文件操作，Rakazo 保持独立。新增 `core.jevai` PYZ 打包门禁及模拟协议/阶段测试，README 同步设置文档。无新增依赖；新增 `jevai_stages` SQLite 表，记录阶段状态、短摘要、产物路径和实际 Jev 模型版本，不保存密钥。
 
 2026-09-14：正式发布 PYZ 门禁增加 api.routes.chat、api.routes.logs、core.prompt_optimizer，确保提示词去重与日志隐私模块随三平台后端打包；Windows 全量后端测试覆盖提示词专项回归，Electron 沿用 dist_build 后端及 README 收集链。
 

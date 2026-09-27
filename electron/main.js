@@ -34,6 +34,14 @@ const CODEBOT_GITHUB_REPO = 'codebot';
 const CODEBOT_GITHUB_RELEASES_API = `https://api.github.com/repos/${CODEBOT_GITHUB_OWNER}/${CODEBOT_GITHUB_REPO}/releases`;
 const ACCOUNT_TOKEN_FILE = 'account-token.bin';
 const RAKAZO_AUTH_FILE = 'rakazo-auth.bin';
+const JEVAI_KEYS_FILE = 'jevai-keys.bin';
+const MEDIA_KEYS_FILE = 'media-keys.bin';
+const MEDIA_PROTOCOLS = new Set([
+  'openai', 'ark', 'volc_tts', 'ark_chat_audio', 'minimax_image', 'xiaomi_tts',
+  'minimax_tts', 'xiaomi_asr', 'minimax_asr', 'qwen_image', 'qwen_tts', 'qwen_asr',
+  'hunyuan_image', 'hunyuan_asr', 'tencent_minimax_tts', 'openrouter_image',
+  'openrouter_tts', 'openrouter_asr', 'gemini_image', 'gemini_tts', 'gemini_asr',
+]);
 const BUILTIN_BROWSER_PARTITION = 'persist:builtin-browser';
 const SHOP_HOSTNAME = new URL(SHOP_BASE_URL).hostname;
 let cachedAccount = null;
@@ -608,6 +616,36 @@ ipcMain.handle('rakazo:authorization-status', async () => ({
   encryptionAvailable: Boolean(safeStorage && safeStorage.isEncryptionAvailable()),
 }));
 
+ipcMain.handle('jevai:save-key', async (_event, rawProvider, rawKey) => {
+  const provider = String(rawProvider || '');
+  const key = String(rawKey || '').trim();
+  if (!['openrouter', 'typesafe'].includes(provider) || key.length > 4096) throw new Error('Jev 凭据参数无效');
+  if (!safeStorage || !safeStorage.isEncryptionAvailable()) throw new Error('系统安全存储不可用');
+  const keys = readJevAIKeys();
+  if (key) keys[provider] = key;
+  else delete keys[provider];
+  await desktopBackendRequest('/api/config/jevai/desktop-key', { body: { provider, api_key: key } });
+  saveJevAIKeys(keys);
+  return { configured: Boolean(key) };
+});
+
+ipcMain.handle('media:save-key', async (_event, rawKind, rawProtocol, rawKey) => {
+  const kind = String(rawKind || '');
+  const protocol = String(rawProtocol || '');
+  const key = String(rawKey || '').trim();
+  if (!['image', 'speech', 'transcription'].includes(kind) || !MEDIA_PROTOCOLS.has(protocol) || key.length > 4096) throw new Error('媒体凭据参数无效');
+  if (!safeStorage || !safeStorage.isEncryptionAvailable()) throw new Error('系统安全存储不可用');
+  const keys = readMediaKeys();
+  const kindKeys = keys[kind] && typeof keys[kind] === 'object' ? { ...keys[kind] } : {};
+  if (key) kindKeys[protocol] = key;
+  else delete kindKeys[protocol];
+  if (Object.keys(kindKeys).length) keys[kind] = kindKeys;
+  else delete keys[kind];
+  await desktopBackendRequest('/api/media/desktop-key', { body: { kind, protocol, api_key: key } });
+  saveMediaKeys(keys);
+  return { configured: Boolean(key) };
+});
+
 ipcMain.handle('rakazo:bootstrap-authorization', async () => bootstrapRakazoAuthorization());
 
 ipcMain.handle('rakazo:start-all', async (_event, rawOptions) => {
@@ -908,6 +946,75 @@ function readRakazoAuthBundle() {
 
 function clearRakazoAuthBundle() {
   try { fs.unlinkSync(rakazoAuthPath()); } catch (_) {}
+}
+
+function jevaiKeysPath() {
+  return path.join(app.getPath('userData'), JEVAI_KEYS_FILE);
+}
+
+function readJevAIKeys() {
+  if (!safeStorage || !safeStorage.isEncryptionAvailable() || !fs.existsSync(jevaiKeysPath())) return {};
+  try {
+    const value = JSON.parse(safeStorage.decryptString(fs.readFileSync(jevaiKeysPath())));
+    return value && typeof value === 'object' ? value : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveJevAIKeys(keys) {
+  if (!safeStorage || !safeStorage.isEncryptionAvailable()) throw new Error('系统安全存储不可用');
+  const file = jevaiKeysPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, safeStorage.encryptString(JSON.stringify(keys)), { flag: 'w' });
+}
+
+async function restoreJevAIKeys() {
+  for (const [provider, api_key] of Object.entries(readJevAIKeys())) {
+    if (!['openrouter', 'typesafe'].includes(provider) || !api_key) continue;
+    await desktopBackendRequest('/api/config/jevai/desktop-key', { body: { provider, api_key } });
+  }
+}
+
+function mediaKeysPath() {
+  return path.join(app.getPath('userData'), MEDIA_KEYS_FILE);
+}
+
+function readMediaKeys() {
+  if (!safeStorage || !safeStorage.isEncryptionAvailable() || !fs.existsSync(mediaKeysPath())) return {};
+  try {
+    const value = JSON.parse(safeStorage.decryptString(fs.readFileSync(mediaKeysPath())));
+    return value && typeof value === 'object' ? value : {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function saveMediaKeys(keys) {
+  if (!safeStorage || !safeStorage.isEncryptionAvailable()) throw new Error('系统安全存储不可用');
+  const file = mediaKeysPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, safeStorage.encryptString(JSON.stringify(keys)), { flag: 'w' });
+}
+
+async function restoreMediaKeys() {
+  const keys = readMediaKeys();
+  let migrated = false;
+  for (const [kind, entry] of Object.entries(keys)) {
+    if (!['image', 'speech', 'transcription'].includes(kind)) continue;
+    if (typeof entry === 'string' && entry) {
+      const config = await desktopBackendRequest('/api/media/config', { method: 'GET' });
+      const protocol = config[kind]?.protocol;
+      if (!MEDIA_PROTOCOLS.has(protocol)) continue;
+      keys[kind] = { [protocol]: entry };
+      migrated = true;
+    }
+    for (const [protocol, api_key] of Object.entries(keys[kind] || {})) {
+      if (!MEDIA_PROTOCOLS.has(protocol) || !api_key) continue;
+      await desktopBackendRequest('/api/media/desktop-key', { body: { kind, protocol, api_key } });
+    }
+  }
+  if (migrated) saveMediaKeys(keys);
 }
 
 async function desktopBackendRequest(apiPath, options = {}) {
@@ -1420,6 +1527,8 @@ function createWindow() {
   startBackend()
     .then(() => waitForBackendReady())
     .then(async () => {
+      await restoreJevAIKeys().catch((error) => console.warn(`[jevai] 恢复凭据失败: ${error.message || error}`));
+      await restoreMediaKeys().catch((error) => console.warn(`[media] 恢复凭据失败: ${error.message || error}`));
       const localIP = getLocalIP();
       const url = await resolveRendererUrl();
       await mainWindow.loadURL(url);

@@ -31,7 +31,7 @@ from utils.background_tasks import create_background_task, cancel_background_tas
 from core.lan_auth import path_is_auth_exempt, request_is_authenticated
 
 # 导入 API 路由
-from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router, growth as growth_router, codex as codex_router, rakazo as rakazo_router, security as security_router
+from api.routes import chat, memory, scheduler as scheduler_router, skills, notifications, logs, lark, mcp as mcp_router, config as config_router, sandbox as sandbox_router, gateway as gateway_router, growth as growth_router, codex as codex_router, rakazo as rakazo_router, security as security_router, media as media_router
 
 
 # 全局组件实例
@@ -527,6 +527,7 @@ app.include_router(scheduler_router.router, prefix="/api/scheduler", tags=["定�
 app.include_router(skills.router, prefix="/api/skills", tags=["技能"])
 app.include_router(mcp_router.router, prefix="/api/mcp", tags=["MCP"])
 app.include_router(config_router.router, prefix="/api/config", tags=["配置"])
+app.include_router(media_router.router, prefix="/api/media", tags=["媒体"])
 app.include_router(notifications.router, prefix="/api/notifications", tags=["通知"])
 app.include_router(lark.router, prefix="/api/lark", tags=["飞书"])
 app.include_router(sandbox_router.router, prefix="/api/sandbox", tags=["沙箱"])

@@ -1,8 +1,14 @@
 <template>
   <div class="settings-view">
     <el-tabs v-model="activeTab">
-      <el-tab-pane label="通用设置" name="general">
+      <el-tab-pane label="通用" name="general">
         <GeneralSettings />
+      </el-tab-pane>
+      <el-tab-pane label="模式" name="mode">
+        <ModeSettings />
+      </el-tab-pane>
+      <el-tab-pane label="媒体" name="media">
+        <MediaSettings />
       </el-tab-pane>
       <el-tab-pane label="OpenCode" name="opencode">
         <OpenCodeSettings />
@@ -16,28 +22,28 @@
       <el-tab-pane label="Obsidian" name="obsidian">
         <ObsidianSettings />
       </el-tab-pane>
-      <el-tab-pane label="通知配置" name="notification">
+      <el-tab-pane label="通知" name="notification">
         <NotificationSettings />
       </el-tab-pane>
-      <el-tab-pane label="飞书配置" name="lark">
+      <el-tab-pane label="飞书" name="lark">
         <LarkSettings />
       </el-tab-pane>
-      <el-tab-pane label="邮箱配置" name="email">
+      <el-tab-pane label="邮箱" name="email">
         <EmailSettings />
       </el-tab-pane>
-      <el-tab-pane label="技能目录" name="skills">
+      <el-tab-pane label="技能" name="skills">
         <SkillsSettings />
       </el-tab-pane>
-      <el-tab-pane label="备份恢复" name="backup">
+      <el-tab-pane label="备份" name="backup">
         <BackupSettings />
       </el-tab-pane>
-      <el-tab-pane label="集成配置" name="integration">
+      <el-tab-pane label="集成" name="integration">
         <IntegrationSettings />
       </el-tab-pane>
-      <el-tab-pane label="访问安全" name="security">
+      <el-tab-pane label="安全" name="security">
         <SecuritySettings />
       </el-tab-pane>
-      <el-tab-pane label="沙箱配置" name="sandbox">
+      <el-tab-pane label="沙箱" name="sandbox">
         <SandboxSettings />
       </el-tab-pane>
       <el-tab-pane label="文档" name="docs">
@@ -51,6 +57,8 @@
 import { ref } from 'vue'
 import { useRoute } from 'vue-router'
 import GeneralSettings from '@/components/GeneralSettings.vue'
+import ModeSettings from '@/components/ModeSettings.vue'
+import MediaSettings from '@/components/MediaSettings.vue'
 import CodexSettings from '@/components/CodexSettings.vue'
 import OpenCodeSettings from '@/components/OpenCodeSettings.vue'
 import RakazoSettings from '@/components/RakazoSettings.vue'
@@ -67,7 +75,7 @@ import Docs from '@/views/Docs.vue'
 
 const route = useRoute()
 // 支持通过设置链接直接定位 OpenCode 权限开关。
-const tabNames = new Set(['general', 'codex', 'rakazo', 'obsidian', 'notification', 'lark', 'email', 'skills', 'backup', 'integration', 'security', 'sandbox', 'docs'])
+const tabNames = new Set(['general', 'mode', 'media', 'codex', 'rakazo', 'obsidian', 'notification', 'lark', 'email', 'skills', 'backup', 'integration', 'security', 'sandbox', 'docs'])
 // 兼容旧收藏链接，但页面本身不再保留 Hermes 标签或接口。
 const requestedTab = route.query.tab === 'hermes' ? 'codex' : route.query.tab
 tabNames.add('opencode')
@@ -78,5 +86,12 @@ const activeTab = ref(initialTab)
 <style scoped>
 .settings-view {
   padding: 20px;
+}
+.settings-view :deep(.el-tabs__item) {
+  padding: 0 12px;
+}
+@media (max-width: 720px) {
+  .settings-view { padding: 12px; }
+  .settings-view :deep(.el-tabs__item) { padding: 0 9px; }
 }
 </style>

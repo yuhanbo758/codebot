@@ -83,7 +83,7 @@ opencode serve
 opencode serve --port 11200 --hostname 127.0.0.1
 ```
 
-应用程序配置文件（设置 → 通用设置 → 配置文件 → `config.json`）里的 `server_url` 需要与 `opencode serve` 保持一致（端口/地址一致）。如果连不上，请优先检查该配置项。桌面端启动后端时会自动尝试拉起 OpenCode 服务，并统一优先使用 `127.0.0.1:11200`；`npm start` 开发模式也会跟正式版一样优先连到 `11200`，避免误起另一套 dev server。如需覆盖默认值，可设置环境变量 `CODEBOT_OPENCODE_PREFERRED_PORT` 与 `CODEBOT_OPENCODE_FALLBACK_PORT`。
+应用程序配置文件（设置 → 通用 → 配置文件 → `config.json`）里的 `server_url` 需要与 `opencode serve` 保持一致（端口/地址一致）。如果连不上，请优先检查该配置项。桌面端启动后端时会自动尝试拉起 OpenCode 服务，并统一优先使用 `127.0.0.1:11200`；`npm start` 开发模式也会跟正式版一样优先连到 `11200`，避免误起另一套 dev server。如需覆盖默认值，可设置环境变量 `CODEBOT_OPENCODE_PREFERRED_PORT` 与 `CODEBOT_OPENCODE_FALLBACK_PORT`。
 聊天页模型刷新会优先调用 `opencode models`，与 OpenCode CLI 的最新模型列表保持一致；如果当前进程找不到 CLI，会回退到当前 `server_url` 指向的 OpenCode Server。若 Codebot 进程 PATH 与终端不同，可在 `config.json` 的 `opencode.cli_path` 填写 `opencode` 可执行文件或所在目录，也可以设置环境变量 `CODEBOT_OPENCODE_PATH`。Windows 桌面端还会额外自动探测 `%APPDATA%\npm`、Scoop shim、WinGet Links、Chocolatey bin 等常见 CLI 安装位置，避免“PowerShell 里能用、Codebot 刷新不到”的情况。Codebot 自己拉起 OpenCode Server 时，会将用户全局 `~/.config/opencode/opencode.json` 里的 `provider` 合并到 `data/opencode-config/opencode.json`，并通过 `OPENCODE_CONFIG_HOME=data/opencode-config` 启动 OpenCode；不要再同时覆写 `XDG_CONFIG_HOME`，否则会导致隔离配置中的新 provider（如 `volcengine`）不被当前 server 识别。刷新模型不会自动切换 OpenCode Server 地址，避免模型列表和实际聊天运行时不一致。若 CLI 已看到新 provider 但当前 `server_url` 尚未加载，模型会标记为“未加载”，这通常意味着当前 OpenCode Server 还是旧实例，需要重启该实例后再刷新。
 启动后，Codebot 会自动把以下内容同步到 OpenCode：
 
@@ -333,11 +333,12 @@ codebot/
 - 支持在聊天中创建定时任务（如"每天8点写一个故事并保存到D盘""每天8:10提醒我喝水"，可在定时任务中查看）
 - 支持在聊天中保存记忆（如"帮我记住 广东揭阳普宁船埔 这个地址""10月2日是姐姐的生日"，可在记忆中查看）
 - **意图分类**: 消息自动分类为"定时任务/保存记忆/普通对话"，避免误判
-- **运行模式**: 支持 `build`（直接执行）、`plan`（结构化规划）和 `agent`（自主拆解、执行与验证）。Agent 模式使用精简执行规则，不默认注入专家协作等技能索引；仅复杂任务追加目标/验收/证据/停止条件契约，不为提示词优化额外调用模型。检索记忆跨分类去重，总预算为 4,000 字符（并非 token 数）；明确选定的 Skill 保留。Codex 原生传入的 Skill 不再同时复制进 developer 提示词，无法原生传入时保留正文回退。任务总 token 仍受模型推理、项目规则、工具结果与会话历史影响
+- **运行模式**: 支持 `build`（直接执行）、`plan`（结构化规划）、`agent`（自主拆解、执行与验证）和 `JevAI`（阶段路由与分类）。Agent 模式使用精简执行规则，不默认注入专家协作等技能索引；仅复杂任务追加目标/验收/证据/停止条件契约，不为提示词优化额外调用模型。检索记忆跨分类去重，总预算为 4,000 字符（并非 token 数）；明确选定的 Skill 保留。Codex 原生传入的 Skill 不再同时复制进 developer 提示词，无法原生传入时保留正文回退。任务总 token 仍受模型推理、项目规则、工具结果与会话历史影响
 - **提示词隐私**: 聊天日志不保存或返回内部提示词正文，执行流不再生成内部提示词事件。历史数据库及备份中的旧正文不会自动删除；这些保护也不保证模型绝不复述收到的上下文
 - **对话级状态**: 每个普通对话会独立保存当前模式、模型、Codex/Obsidian 目标、Codex 推理强度和已选知识库；在 B 对话切换模型或处理目标，不会覆盖 A 对话原来的选择
+- **对话列表**: 标题以紧凑的单行展示；悬停或键盘聚焦可查看完整标题、执行器、项目目录和更新时间。Rakazo 在列表中显示为 `R`，置顶对话以颜色区分；列表菜单仍可取消置顶。
 - 消息一键复制（Electron 使用系统剪贴板）
-- 支持文件附件上传；多模态模型支持图片分析
+- 支持文件附件上传；图片附件以原生图片输入交给 OpenCode 或 Codex 模型。是否能够理解图片取决于所选模型和供应商，目录没有标记时可选择后实测。
 - 支持截图后直接在聊天输入框粘贴图片，图片会自动作为附件加入当前消息
 - 流式响应显示
 - 流式展示 OpenCode 步骤事件（如 `step-start` / `step-finish`）与回复增量
@@ -404,7 +405,12 @@ codebot/
 
 ### 1.2 Codex / Obsidian / VS Code / 文档入口
 
+- **OpenRouter / Gemini 媒体协议**：在“设置 → 媒体”为图片生成、语音合成、语音识别分别选择 OpenRouter 或 Gemini。OpenRouter 分别调用 `/api/v1/images`、`/api/v1/audio/speech`、`/api/v1/audio/transcriptions`；示例模型依次为 `bytedance-seed/seedream-4.5`、`openai/gpt-4o-mini-tts-2025-12-15`、`openai/whisper-1`。Gemini 使用 `generateContent`；示例模型依次为 `gemini-3.1-flash-image`、`gemini-3.8-flash-tts`、`gemini-3.8-flash`。实际选择的模型须具备相应输出能力。Gemini TTS 的 24 kHz、16 位单声道 PCM 转换为 WAV 后展示；Gemini 音频理解转写只接收真实 MP3/WAV，内嵌音频最大 14 MB，未接入专用 Files API 的长录音上传。桌面密钥按服务和协议分别加密保存，切换供应商不会沿用旧密钥；旧桌面密钥首次恢复时绑定当前协议。Web 为新协议使用 `CODEBOT_MEDIA_服务_协议_API_KEY`，六个具体变量见 `.env.example`，旧协议仍兼容按服务命名的变量。切换协议后需重新填写模型 ID、接口地址和音色；当前只保存 PNG/JPEG/WebP 图片及 MP3/WAV 语音。真实调用需要有效密钥单独验收。
+
 - **完全访问设置**：OpenCode、Codex、Rakazo 在各自设置标签页分别提供默认关闭的“完全访问”开关，保存后从下一轮交互执行生效。OpenCode 自动回复当前会话及子任务的权限请求，不写入全局或长期会话授权，普通问题仍需回答；显式拒绝的上游规则仍由 OpenCode 执行，计划模式与非流式后台任务不自动授权。Rakazo 临时覆盖本轮项目读写、容器命令及联网权限，自动回复可验证的权限审批，并保留数据库中的项目原授权；关闭后下一轮发送前按原授权重新收敛 Docker 网络。Rakazo 完全访问限于项目 MCP 与专属 Computer，不开放宿主根目录或 Docker Socket；需要受管 Compose 来真实控制外网，不支持时返回明确错误。所有执行器的普通问题、表单和凭据输入继续由用户回答。
+- **JevAI 模式设置**：在“设置 → 模式”中选择 OpenRouter 或 TypeSafe 官方 Jev 供应商，并分别为 OpenCode、Codex 指定三款互不重复、当前可运行的轻量/均衡/强 LLM。第四个可选槽位仅用于图片附件理解，不处理视频附件，可复用前三档中的同一模型；目录未标注图片能力时也可选择，但是否真正支持图片输入仍需实测。桌面版 Jev API Key 使用 Electron `safeStorage` 加密保存；独立 Web 部署使用 `CODEBOT_JEV_OPENROUTER_API_KEY` 或 `CODEBOT_JEV_TYPESAFE_API_KEY`。配置读取只显示密钥是否存在。缺少密钥或任一必需 LLM 时无法发送 JevAI 请求；Rakazo 对话不提供该模式。
+- **媒体设置与使用**：在“设置 → 媒体”分别配置图片生成、语音合成、语音识别服务的协议、模型 ID、接口地址和密钥。图片生成支持 OpenAI Images 兼容协议、火山方舟 Seedream、MiniMax `image-01`、阿里云百炼 `qwen-image-3.0`/`qwen-image-3.0-pro` 以及腾讯 TokenHub 混元 `hy-image-v3`；语音合成支持 OpenAI Speech、豆包语音 HTTP TTS、小米 `mimo-v2.5-tts`、MiniMax Speech、百炼 `qwen3-tts-flash` 以及腾讯 TokenHub 的 **MiniMax Speech**（此项并非混元原生 TTS）；语音识别支持 OpenAI Transcriptions、方舟音频理解、小米 `mimo-v2.5-asr`、MiniMax `asr-1.0`、百炼 `qwen3-asr-flash` 和 TokenHub 混元 `hy-asr-3.0-preview`。百炼生图、语音合成返回的临时文件地址会经过供应商域名、文件大小和格式校验后保存到本地；百炼生图/ASR 默认使用现有北京站地址，也可填写与 API Key 同地域的业务空间专属 `/compatible-mode/v1` 地址。百炼 TTS 单次限 600 字，ASR 音频限 10 MB。MiniMax 默认使用国际站 `https://api.minimax.io/v1`，中国站可在接口地址填写 `https://api.minimaxi.com/v1`；小米默认使用 `https://api.xiaomimimo.com/v1`。小米图片理解使用已有 OpenCode/Codex 聊天模型目录及图片附件输入，当前未接入小米图片生成专用接口；小米 ASR 仅接受真实的 MP3/WAV 音频。豆包语音截图里的实时 WebSocket ASR 协议未接入，不能把其 `wss://` 地址填入 HTTP 配置。密钥在桌面端用 `safeStorage` 保存，Web 部署分别使用 `CODEBOT_MEDIA_IMAGE_API_KEY`、`CODEBOT_MEDIA_SPEECH_API_KEY`、`CODEBOT_MEDIA_TRANSCRIPTION_API_KEY`；配置接口不回显密钥。聊天发送栏可在任一模式选择“生成图片”“生成语音”“语音转文字”；语音转文字须先添加音频附件。媒体产物保存在 Codebot 数据目录并显示在对话中。图片理解与图片生成是两条独立请求链，普通聊天模型的视觉输入能力不等于它能通过聊天接口直接生成图片文件。
+- **JevAI 执行边界**：Jev 使用固定版本模型回答结构化路由、输出类型和分类问题。判断需要图片或音频文件时，在阶段边界调用“媒体”中配置的服务，确认实际文件后记录产物；音频阶段先由当前 LLM 给出要朗读的文本。视频生成协议暂未接入，若 Jev 判断需要视频则暂停并说明。简单文字任务由所选 LLM 完成；多阶段任务先由文字 LLM 在原执行器中规划，再逐阶段执行，只有阶段结束或明确受阻时才重新路由，不会在单次输出中换模。任务继续复用原执行器、会话历史与项目目录；阶段状态和模型选择显示在聊天事件中。分类时 Agent 先给出固定类别与每篇文档不超过 800 字的摘要，Jev 每批最多判断 12 条并返回类别及概率，文件创建、移动与归档仍由 Agent 执行。初始置信度门槛为 0.7，文字路由低于门槛时使用已配置强模型；媒体类型判断低于门槛时暂停。Jev 不可用、结果非法或检查点缺失时暂停，不自动改用其他供应商或重放结果不明的文件操作。真实供应商调用需在用户配置有效密钥后单独验收。
 - **Codex 模式**: 聊天页点击 `Codex` 后使用官方 `openai-codex==0.147.0` Python SDK 和随包 Codex runtime。设置页可切换 SDK 内置或本机自定义 binary、选择审批策略、管理额外 Skill 根目录，并查看 App Server、账号、订阅、用量、速率限制，以及 Codex 原生模型和兼容的 OpenCode 模型。ChatGPT 浏览器登录为默认方式，设备码为回退；API Key 只在用户主动选择时单次传给 App Server，不写入 Codebot 配置、不回传前端
 - **OpenCode 模型中间层**: Codex 官方自定义 provider 只接受 Responses 协议。Codebot 因此读取当前 OpenCode `/provider` 元数据并逐模型服从其 SDK/协议声明：`@ai-sdk/openai` 使用 Responses；`@ai-sdk/openai-compatible`（包括 `opencode-go` 下的 DeepSeek、GLM 等）由本机 Responses → Chat Completions 适配器转换；`@ai-sdk/anthropic` 由本机 Responses → Anthropic Messages 适配器转换。即使多个模型共用同一个上游地址，也不会因为其中一个支持 Responses 就猜测其他模型采用相同协议。凡用户当前已接入 OpenCode 且属于这些协议的模型都会自动加入 Codex 模型列表，不区分 OpenCode 自带、官方 provider 或用户自定义 provider。中间层只做一次模型采样并翻译输入、工具调用和输出 item，不嵌套 OpenCode Agent 循环，所以线程、命令、文件工具、沙箱和审批仍全部由 Codex Harness 控制
 - **协议覆盖边界**: “模型兼容”不是修改模型名称，而是转换真实上游 wire protocol。设置页会展示各适配协议的模型数量和不兼容数量；OpenCode 全目录中的 Google/Vertex/Bedrock 等原生协议只有在 Codebot 注册并测试对应的请求、鉴权、工具调用和响应适配器后才会启用。未知协议不会猜成 Chat Completions，更不会静默改用 ChatGPT 账号；这可避免界面选中 A 模型、实际却由 B 模型回答
@@ -494,7 +500,7 @@ codebot/
 ### 4. 模型管理
 
 - **主模型**: 处理常规文本任务
-- **多模态模型**: 处理图片识别任务
+- **视觉聊天模型**: 处理图片理解；图片和语音文件生成在“设置 → 媒体”选择专用协议和模型
 - **自由切换**: UI 界面随时切换模型
 - **刷新模型**: 聊天页刷新按钮会优先读取 OpenCode CLI 的 `opencode models` 输出；CLI 不可用时回退到当前 `server_url` 的 `/provider` 列表。若桌面端找不到 CLI，可配置 `opencode.cli_path` 或 `CODEBOT_OPENCODE_PATH`；Windows 下还会自动扫描 `%APPDATA%\npm`、Scoop、WinGet、Chocolatey 等常见安装目录。Codebot 自己启动 OpenCode Server 时会同步全局 `provider` 配置到隔离的 `data/opencode-config/opencode.json`，并仅通过 `OPENCODE_CONFIG_HOME` 指向该目录。刷新不会自动切换 OpenCode Server 地址；如果 CLI 列表已有新 provider 但当前 server 尚未加载，UI 会标记为“未加载”，发送前也会提示需要重启当前 OpenCode Server。
 
@@ -618,7 +624,7 @@ codebot/
 - **SSE 模式**: 通过 HTTP Server-Sent Events 与远程服务通信
 - 添加后，AI 会在处理相关请求时自动调用匹配的 MCP 工具
 
-在设置页面"技能目录"标签页可以管理自定义技能文件夹：
+在设置页面“技能”标签页可以管理自定义技能文件夹：
 
 - **添加目录**: 输入包含技能子文件夹的目录路径，每个子文件夹须包含 `SKILL.md` 文件
 - **多目录支持**: 可添加多个不同路径，所有目录中的技能会统一显示在技能列表中
@@ -631,7 +637,7 @@ codebot/
 - **系统桌面通知**: 推送至操作系统通知中心（Windows/macOS/Linux），需在设置中启用
 - **飞书通知**: 配置 Webhook URL
 - **邮箱通知**: 配置 SMTP 服务器，任务通知会按“全局开关+任务渠道”共同判定
-- **邮箱测试**: 设置页“邮箱配置”支持一键发送测试邮件，快速验证 SMTP 配置是否生效
+- **邮箱测试**: 设置页“邮箱”支持一键发送测试邮件，快速验证 SMTP 配置是否生效
 - **地址兼容**: 自动将国际化域名转为 Punycode；若邮箱本地部分含中文且 SMTP 不支持 SMTPUTF8，会返回明确错误提示
 
 ### 飞书对话机器人
