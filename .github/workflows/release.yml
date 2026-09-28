@@ -184,7 +184,7 @@ jobs:
         run: npm run build -- --win nsis portable --publish never
 
       - name: Verify packaged OpenCode runtime
-        run: python scripts/stage_opencode_binary.py --verify-path electron/dist/electron_new/win-unpacked/resources/opencode/opencode.exe
+        run: python scripts/stage_opencode_binary.py --verify-packaged-root electron/dist/electron_new
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
@@ -258,7 +258,7 @@ jobs:
         run: npm run build -- --mac zip --publish never
 
       - name: Verify packaged OpenCode runtime
-        run: python scripts/stage_opencode_binary.py --verify-path electron/dist/electron_new/mac/Codebot.app/Contents/Resources/opencode/opencode
+        run: python scripts/stage_opencode_binary.py --verify-packaged-root electron/dist/electron_new
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
@@ -337,7 +337,7 @@ jobs:
         run: npm run build -- --linux AppImage --publish never
 
       - name: Verify packaged OpenCode runtime
-        run: python scripts/stage_opencode_binary.py --verify-path electron/dist/electron_new/linux-unpacked/resources/opencode/opencode
+        run: python scripts/stage_opencode_binary.py --verify-packaged-root electron/dist/electron_new
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4

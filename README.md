@@ -717,6 +717,7 @@ npm run build
 - 桌面端打包默认读取 `backend/dist_build/codebot-backend` 作为后端资源目录。
 - Windows 下建议使用根目录 `build.bat` 执行完整打包流程（后端 PyInstaller + 前端构建 + Electron 安装包）。
 - Windows 打包产物默认输出到 `electron/dist/electron_new/`。
+- 发布流水线从 `opencode-ai` 安装结果中的原生程序制作内置 OpenCode，并校验 Windows、macOS、Linux 展开包中的文件头及版本。
 - Windows 产物会同时生成安装版（`Codebot-Setup-1.0.0.exe`）和免安装版（`Codebot-1.0.0.exe`，portable）。
 - GitHub Releases 公共更新会在桌面端先解析 Release API 中的真实安装包资产名，再执行下载；即使资产名里的空格、点号或连字符存在差异，也不会再因为 404 导致下载失败。
 - 项目已在 `.trae/rules/release-update-compat.md` 固化 GitHub Release 更新兼容规则，后续智能体处理发版、补传资产或自动更新问题时应优先遵循该规则。
