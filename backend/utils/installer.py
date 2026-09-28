@@ -121,6 +121,7 @@ def _collect_opencode_commands() -> List[List[str]]:
 
     repo_root = Path(__file__).resolve().parents[2]
     for directory in [
+        repo_root / "electron" / "vendor" / "opencode" / "native",
         repo_root / "electron" / "vendor" / "opencode",
         repo_root / "vendor" / "opencode",
     ]:

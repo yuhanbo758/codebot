@@ -39,6 +39,7 @@ frontend/.vite/
 # Electron
 electron/dist/
 electron/out/
+electron/vendor/opencode/
 
 # 数据文件
 /data/

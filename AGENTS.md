@@ -307,6 +307,8 @@ build.bat
 
 ## 变更日志
 
+2026-09-28：修复正式版 OpenAI 模型目录停留在 GPT-5.6 的发布与刷新链路：手动刷新调用 `opencode models --refresh`，Codex 选择器先刷新 OpenCode 目录再读取动态桥接模型；桌面构建固定安装 `opencode-ai@1.18.32` 的当前平台原生二进制，并在打包前后检查原生文件头和版本，移除误收录的 shell 脚本 `opencode.exe`。普通页面加载仍使用缓存；外部 OpenCode Server 需自行重启以加载新目录。README 同步；无数据库或配置结构变更。
+
 2026-09-26：媒体页新增 OpenRouter 生图/TTS/ASR 与 Gemini 生图/TTS/音频理解转写，沿用 Build/Plan/Agent/JevAI 的统一媒体链。Gemini PCM 语音转换为 WAV，媒体输出继续做大小和文件签名校验；Gemini 转写限定小于 14 MB 的真实 MP3/WAV。桌面媒体密钥按服务＋协议分别安全存储，旧单服务密钥在启动时绑定当前协议；Web 新协议需独立环境变量，避免切换供应商时复用旧密钥。README、`.env.example` 与模拟协议测试同步；无新增依赖或数据库结构变更。
 
 2026-09-26：媒体服务新增阿里云百炼千问生图 3.0、Qwen3 TTS/ASR 与腾讯 TokenHub 混元生图 3.0、Hy ASR；腾讯 TokenHub 语音合成按官方 MiniMax Speech 协议单独标注，不冒充混元 TTS。临时媒体 URL 仅允许供应商对象存储域名、限制下载大小且不跟随跳转，保存前校验文件签名。Build/Plan/Agent/JevAI 沿用统一媒体链；README 与模拟协议测试同步。无新增依赖或数据库结构变更。

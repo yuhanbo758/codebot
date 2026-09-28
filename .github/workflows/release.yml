@@ -174,11 +174,17 @@ jobs:
         working-directory: electron
         run: npm ci
 
+      - name: Stage native OpenCode runtime
+        run: python scripts/stage_opencode_binary.py
+
       - name: Build Windows artifacts
         working-directory: electron
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run build -- --win nsis portable --publish never
+
+      - name: Verify packaged OpenCode runtime
+        run: python scripts/stage_opencode_binary.py --verify-path electron/dist/electron_new/win-unpacked/resources/opencode/opencode.exe
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
@@ -242,11 +248,17 @@ jobs:
         working-directory: electron
         run: npm ci
 
+      - name: Stage native OpenCode runtime
+        run: python scripts/stage_opencode_binary.py
+
       - name: Build macOS artifacts
         working-directory: electron
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run build -- --mac zip --publish never
+
+      - name: Verify packaged OpenCode runtime
+        run: python scripts/stage_opencode_binary.py --verify-path electron/dist/electron_new/mac/Codebot.app/Contents/Resources/opencode/opencode
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
@@ -315,11 +327,17 @@ jobs:
         working-directory: electron
         run: npm ci
 
+      - name: Stage native OpenCode runtime
+        run: python scripts/stage_opencode_binary.py
+
       - name: Build Linux artifacts
         working-directory: electron
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run build -- --linux AppImage --publish never
+
+      - name: Verify packaged OpenCode runtime
+        run: python scripts/stage_opencode_binary.py --verify-path electron/dist/electron_new/linux-unpacked/resources/opencode/opencode
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4

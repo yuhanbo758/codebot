@@ -73,7 +73,7 @@ chmod +x scripts/install.sh
 
 #### 先启动 OpenCode Serve（必需）
 
-应用程序运行依赖 OpenCode CLI，需要开启 `opencode serve` 才能连接 OpenCode Server。
+桌面发布包内置经版本与文件格式校验的 OpenCode 原生运行时；源码开发或自管部署仍需可用的 OpenCode CLI，并使 `opencode serve` 可连接。
 
 ```bash
 # Windows（打开 cmd 运行）
@@ -84,7 +84,7 @@ opencode serve --port 11200 --hostname 127.0.0.1
 ```
 
 应用程序配置文件（设置 → 通用 → 配置文件 → `config.json`）里的 `server_url` 需要与 `opencode serve` 保持一致（端口/地址一致）。如果连不上，请优先检查该配置项。桌面端启动后端时会自动尝试拉起 OpenCode 服务，并统一优先使用 `127.0.0.1:11200`；`npm start` 开发模式也会跟正式版一样优先连到 `11200`，避免误起另一套 dev server。如需覆盖默认值，可设置环境变量 `CODEBOT_OPENCODE_PREFERRED_PORT` 与 `CODEBOT_OPENCODE_FALLBACK_PORT`。
-聊天页模型刷新会优先调用 `opencode models`，与 OpenCode CLI 的最新模型列表保持一致；如果当前进程找不到 CLI，会回退到当前 `server_url` 指向的 OpenCode Server。若 Codebot 进程 PATH 与终端不同，可在 `config.json` 的 `opencode.cli_path` 填写 `opencode` 可执行文件或所在目录，也可以设置环境变量 `CODEBOT_OPENCODE_PATH`。Windows 桌面端还会额外自动探测 `%APPDATA%\npm`、Scoop shim、WinGet Links、Chocolatey bin 等常见 CLI 安装位置，避免“PowerShell 里能用、Codebot 刷新不到”的情况。Codebot 自己拉起 OpenCode Server 时，会将用户全局 `~/.config/opencode/opencode.json` 里的 `provider` 合并到 `data/opencode-config/opencode.json`，并通过 `OPENCODE_CONFIG_HOME=data/opencode-config` 启动 OpenCode；不要再同时覆写 `XDG_CONFIG_HOME`，否则会导致隔离配置中的新 provider（如 `volcengine`）不被当前 server 识别。刷新模型不会自动切换 OpenCode Server 地址，避免模型列表和实际聊天运行时不一致。若 CLI 已看到新 provider 但当前 `server_url` 尚未加载，模型会标记为“未加载”，这通常意味着当前 OpenCode Server 还是旧实例，需要重启该实例后再刷新。
+聊天页手动刷新会调用 `opencode models --refresh` 更新模型缓存，再核对当前 `server_url` 的 OpenCode Server；普通页面加载只读取现有目录。Codex 模式手动刷新也先更新这份 OpenCode 目录，再读取 Codex 原生及桥接模型。桌面发布包优先使用内置 OpenCode 运行时，源码开发或自管部署若找不到 CLI，会回退到当前 Server。可在 `config.json` 的 `opencode.cli_path` 填写可执行文件或目录，也可以设置 `CODEBOT_OPENCODE_PATH`；Windows 还会扫描 `%APPDATA%\npm`、Scoop、WinGet 和 Chocolatey。Codebot 自己拉起 Server 时，会将用户全局 `~/.config/opencode/opencode.json` 的 `provider` 合并到 `data/opencode-config/opencode.json`，并通过 `OPENCODE_CONFIG_HOME` 启动。刷新不会切换 Server 地址；Codebot 管理的 Server 发现新模型时会重启加载，外部 Server 若仍使用旧目录，需要重启该实例后再刷新。
 启动后，Codebot 会自动把以下内容同步到 OpenCode：
 
 - Codebot 自身的第三方 MCP 入口：`/api/mcp/codebot/sse`
@@ -502,7 +502,7 @@ codebot/
 - **主模型**: 处理常规文本任务
 - **视觉聊天模型**: 处理图片理解；图片和语音文件生成在“设置 → 媒体”选择专用协议和模型
 - **自由切换**: UI 界面随时切换模型
-- **刷新模型**: 聊天页刷新按钮会优先读取 OpenCode CLI 的 `opencode models` 输出；CLI 不可用时回退到当前 `server_url` 的 `/provider` 列表。若桌面端找不到 CLI，可配置 `opencode.cli_path` 或 `CODEBOT_OPENCODE_PATH`；Windows 下还会自动扫描 `%APPDATA%\npm`、Scoop、WinGet、Chocolatey 等常见安装目录。Codebot 自己启动 OpenCode Server 时会同步全局 `provider` 配置到隔离的 `data/opencode-config/opencode.json`，并仅通过 `OPENCODE_CONFIG_HOME` 指向该目录。刷新不会自动切换 OpenCode Server 地址；如果 CLI 列表已有新 provider 但当前 server 尚未加载，UI 会标记为“未加载”，发送前也会提示需要重启当前 OpenCode Server。
+- **刷新模型**: 手动刷新执行 `opencode models --refresh`；Codex 模式会随后更新其 OpenCode 桥接目录。正式桌面包使用经过校验的内置 OpenCode；当前 Server 尚未加载的新模型会显示“未加载”，外部 Server 需自行重启。普通页面加载不强制联网刷新。
 
 ### 5. 技能系统
 

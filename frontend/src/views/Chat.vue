@@ -2925,11 +2925,15 @@ const loadModels = async (options = {}) => {
   const useCodex = codexEnabled.value
   modelsLoading.value = true
   try {
+    // Codex 的 OpenCode 桥也读取当前 Server 目录，先刷新它再请求 Codex 列表。
+    if (manual && useCodex && !useRakazo) {
+      const refreshed = await axios.get('/api/chat/models', { params: { refresh: true } })
+      if (sequence !== modelLoadSequence) return
+      if (refreshed.data?.message) ElMessage.warning(refreshed.data.message)
+    }
     const res = await axios.get(useRakazo ? '/api/rakazo/models' : useCodex ? '/api/codex/models' : '/api/chat/models', {
       // 复用 OpenCode 当前连接，不发送首次使用探测请求。
-      params: useRakazo
-        ? { refresh: manual ? true : undefined }
-        : undefined,
+      params: (useRakazo || !useCodex) && manual ? { refresh: true } : undefined,
     })
     // 切换执行器期间旧请求可能后返回，不能覆盖新执行器的目录。
     if (sequence !== modelLoadSequence) return
