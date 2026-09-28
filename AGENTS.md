@@ -307,6 +307,8 @@ build.bat
 
 ## 变更日志
 
+2026-09-28：继续修复 Codex 对话的 GPT-6 选择与实际发送：进入 Codex 对话时先核对 OpenCode 当前 Server 目录，CLI 已有但桥未加载的模型保留为不可选并明确显示，OpenAI 可运行路由按版本降序靠前，搜索 `codex` 也包含 OpenCode 接入 Codex 的模型；OpenCode OpenAI OAuth 的 Codex Responses 端点要求 `stream=true`，模型桥改为收集 SSE 完成事件与 output item 后交给 App Server，保留 incomplete 终态。真实 `openai/gpt-6-luna` 经 Codebot Codex Harness 返回指定文本，专项测试和前端构建通过；无数据库、配置或依赖变更。
+
 2026-09-28：修复正式版 OpenAI 模型目录停留在 GPT-5.6 的发布与刷新链路：手动刷新调用 `opencode models --refresh`，Codex 选择器先刷新 OpenCode 目录再读取动态桥接模型；桌面构建固定安装 `opencode-ai@1.18.32` 的当前平台原生二进制，并在打包前后检查原生文件头和版本，移除误收录的 shell 脚本 `opencode.exe`。首次发布运行暴露跨平台打包错误：`opencode-ai` 的 `postinstall` 在三平台均写入 `bin/opencode.exe`，先前脚本在 macOS/Linux 错找 `bin/opencode`；Windows 验证成功后因 CI 的 cp1252 控制台无法打印中文而报错。现按实际来源复制、使用可安全输出的 ASCII 诊断，并兼容 macOS 架构目录查找展开包。普通页面加载仍使用缓存；外部 OpenCode Server 需自行重启以加载新目录。README 同步；无数据库或配置结构变更。
 
 2026-09-26：媒体页新增 OpenRouter 生图/TTS/ASR 与 Gemini 生图/TTS/音频理解转写，沿用 Build/Plan/Agent/JevAI 的统一媒体链。Gemini PCM 语音转换为 WAV，媒体输出继续做大小和文件签名校验；Gemini 转写限定小于 14 MB 的真实 MP3/WAV。桌面媒体密钥按服务＋协议分别安全存储，旧单服务密钥在启动时绑定当前协议；Web 新协议需独立环境变量，避免切换供应商时复用旧密钥。README、`.env.example` 与模拟协议测试同步；无新增依赖或数据库结构变更。

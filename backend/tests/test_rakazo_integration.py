@@ -251,7 +251,7 @@ class RawSamplingBridgeTests(unittest.IsolatedAsyncioTestCase):
             }],
             "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
         }
-        with patch("core.codex_model_bridge._post_upstream", new=AsyncMock(return_value=upstream)) as post:
+        with patch("core.codex_model_bridge._collect_responses_stream", new=AsyncMock(return_value=upstream)) as post:
             result = await bridge_chat_completions_request(
                 route,
                 {
@@ -266,6 +266,7 @@ class RawSamplingBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["Authorization"], "Bearer test-secret-key")
         self.assertTrue(headers.get("session-id"))
         self.assertFalse(body["store"])
+        self.assertTrue(body["stream"])
         self.assertNotIn("max_output_tokens", body)
         self.assertTrue(body.get("instructions"))
         self.assertNotIn(route.api_key, json.dumps(result.response, ensure_ascii=False))

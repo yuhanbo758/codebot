@@ -84,7 +84,7 @@ opencode serve --port 11200 --hostname 127.0.0.1
 ```
 
 应用程序配置文件（设置 → 通用 → 配置文件 → `config.json`）里的 `server_url` 需要与 `opencode serve` 保持一致（端口/地址一致）。如果连不上，请优先检查该配置项。桌面端启动后端时会自动尝试拉起 OpenCode 服务，并统一优先使用 `127.0.0.1:11200`；`npm start` 开发模式也会跟正式版一样优先连到 `11200`，避免误起另一套 dev server。如需覆盖默认值，可设置环境变量 `CODEBOT_OPENCODE_PREFERRED_PORT` 与 `CODEBOT_OPENCODE_FALLBACK_PORT`。
-聊天页手动刷新会调用 `opencode models --refresh` 更新模型缓存，再核对当前 `server_url` 的 OpenCode Server；普通页面加载只读取现有目录。Codex 模式手动刷新也先更新这份 OpenCode 目录，再读取 Codex 原生及桥接模型。桌面发布包优先使用内置 OpenCode 运行时，源码开发或自管部署若找不到 CLI，会回退到当前 Server。可在 `config.json` 的 `opencode.cli_path` 填写可执行文件或目录，也可以设置 `CODEBOT_OPENCODE_PATH`；Windows 还会扫描 `%APPDATA%\npm`、Scoop、WinGet 和 Chocolatey。Codebot 自己拉起 Server 时，会将用户全局 `~/.config/opencode/opencode.json` 的 `provider` 合并到 `data/opencode-config/opencode.json`，并通过 `OPENCODE_CONFIG_HOME` 启动。刷新不会切换 Server 地址；Codebot 管理的 Server 发现新模型时会重启加载，外部 Server 若仍使用旧目录，需要重启该实例后再刷新。
+聊天页手动刷新会调用 `opencode models --refresh` 更新模型缓存，再核对当前 `server_url` 的 OpenCode Server；普通页面加载只读取现有目录。进入 Codex 对话时也会先核对当前 OpenCode Server，再读取 Codex 原生及桥接模型；搜索 `gpt-6` 可查看当前连接中的 GPT-6，搜索 `codex` 也会包含通过 OpenCode 接入 Codex 的模型。CLI 已有而桥尚未加载的模型会显示为不可选。OpenCode 内置 OpenAI OAuth 模型通过 Codex Harness 使用上游要求的 Responses 流式传输。桌面发布包优先使用内置 OpenCode 运行时，源码开发或自管部署若找不到 CLI，会回退到当前 Server。可在 `config.json` 的 `opencode.cli_path` 填写可执行文件或目录，也可以设置 `CODEBOT_OPENCODE_PATH`；Windows 还会扫描 `%APPDATA%\npm`、Scoop、WinGet 和 Chocolatey。Codebot 自己拉起 Server 时，会将用户全局 `~/.config/opencode/opencode.json` 的 `provider` 合并到 `data/opencode-config/opencode.json`，并通过 `OPENCODE_CONFIG_HOME` 启动。刷新不会切换 Server 地址；Codebot 管理的 Server 发现新模型时会重启加载，外部 Server 若仍使用旧目录，需要重启该实例后再刷新。
 启动后，Codebot 会自动把以下内容同步到 OpenCode：
 
 - Codebot 自身的第三方 MCP 入口：`/api/mcp/codebot/sse`

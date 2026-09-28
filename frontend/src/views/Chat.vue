@@ -2287,7 +2287,7 @@ const modelProviderLabel = (model) => {
       : protocol === 'anthropic-bridge'
         ? 'Anthropic 兼容桥'
         : 'Responses'
-    return `${model?.provider || 'OpenCode'} · ${transport}`
+    return `${model?.provider || 'OpenCode'} · OpenCode 接入 Codex · ${transport}`
   }
   return model?.provider || ''
 }
@@ -2311,7 +2311,8 @@ const filteredModels = computed(() => {
     m.id.toLowerCase().includes(q) ||
     m.name.toLowerCase().includes(q) ||
     (m.provider || '').toLowerCase().includes(q) ||
-    (m.model || '').toLowerCase().includes(q)
+    (m.model || '').toLowerCase().includes(q) ||
+    modelProviderLabel(m).toLowerCase().includes(q)
   )
 })
 
@@ -2925,11 +2926,20 @@ const loadModels = async (options = {}) => {
   const useCodex = codexEnabled.value
   modelsLoading.value = true
   try {
-    // Codex 的 OpenCode 桥也读取当前 Server 目录，先刷新它再请求 Codex 列表。
-    if (manual && useCodex && !useRakazo) {
-      const refreshed = await axios.get('/api/chat/models', { params: { refresh: true } })
+    let opencodeModels = []
+    // Codex 桥读取当前 OpenCode Server；进入 Codex 对话也要先让受管 Server
+    // 与 CLI 目录同步，手动刷新时才联网更新模型缓存。
+    if (useCodex && !useRakazo) {
+      try {
+        const refreshed = await axios.get('/api/chat/models', {
+          params: manual ? { refresh: true } : undefined,
+        })
+        opencodeModels = refreshed.data?.data?.models || []
+        if (manual && refreshed.data?.message) ElMessage.warning(refreshed.data.message)
+      } catch {
+        if (manual) ElMessage.warning('OpenCode 模型同步失败，继续读取 Codex 已加载的模型。')
+      }
       if (sequence !== modelLoadSequence) return
-      if (refreshed.data?.message) ElMessage.warning(refreshed.data.message)
     }
     const res = await axios.get(useRakazo ? '/api/rakazo/models' : useCodex ? '/api/codex/models' : '/api/chat/models', {
       // 复用 OpenCode 当前连接，不发送首次使用探测请求。
@@ -2970,6 +2980,21 @@ const loadModels = async (options = {}) => {
         supportedReasoningEfforts: m.supportedReasoningEfforts || m.supported_reasoning_efforts || [],
       }
     }).filter(m => m.id)
+
+    if (useCodex && !useRakazo) {
+      const listed = new Set(newList.map(m => m.id))
+      for (const model of opencodeModels) {
+        const id = model?.id
+        if (!id || listed.has(id)) continue
+        // CLI 已有、但 Codex 桥尚未加载的模型仍显示为不可选，避免误以为
+        // GPT-6 不存在，也避免把未验证路由静默发送到 Codex 原生账号。
+        newList.push(makeModelOption(id, { runnable: false, source: 'cli' }))
+        listed.add(id)
+      }
+      const versionOrder = new Intl.Collator('en', { numeric: true })
+      const priority = m => m.source === 'opencode' && m.provider === 'openai' && m.runnable !== false ? 0 : m.source === 'codex' ? 1 : 2
+      newList.sort((a, b) => priority(a) - priority(b) || (priority(a) === 0 ? versionOrder.compare(b.model, a.model) : 0))
+    }
 
     // 如果用户有已保存的模型，且新列表中没有对应条目，则保留一个占位条目以避免 el-select 显示空值
     const saved = useRakazo

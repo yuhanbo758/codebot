@@ -47,7 +47,8 @@ class BridgedResponsesResult:
         for item in self.response.get("output") or []:
             if isinstance(item, dict):
                 events.append({"type": "response.output_item.done", "item": item})
-        events.append({"type": "response.completed", "response": self.response})
+        terminal = "response.incomplete" if self.response.get("status") == "incomplete" else "response.completed"
+        events.append({"type": terminal, "response": self.response})
         return "".join(
             f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
             for event in events
@@ -745,17 +746,62 @@ async def bridge_responses_request(route: Any, payload: Mapping[str, Any]) -> Br
     if adapter.auth_kind == "anthropic":
         headers.setdefault("anthropic-version", "2023-06-01")
     headers.setdefault("Content-Type", "application/json")
-    data = await _post_upstream(
-        f"{base_url}{adapter.endpoint_suffix}",
-        headers,
-        query,
-        request,
-    )
+    endpoint = f"{base_url}{adapter.endpoint_suffix}"
+    if getattr(route, "credential_mode", "") == "opencode_oauth":
+        # OpenCode 的 Codex OAuth 端点只接受 stream=true；收集完成事件后
+        # 仍按原有桥接结果交给 App Server，不把 OAuth 流直接暴露给它。
+        request["stream"] = True
+        headers.setdefault("Accept", "text/event-stream")
+        data = await _collect_responses_stream(endpoint, headers, query, request)
+    else:
+        data = await _post_upstream(endpoint, headers, query, request)
     return adapter.response_converter(
         data,
         requested_model=requested_model,
         tool_kinds=tool_kinds,
     )
+
+
+async def _collect_responses_stream(
+    url: str,
+    headers: Dict[str, str],
+    query: Dict[str, str],
+    body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """将 OpenCode OAuth 的 Responses SSE 还原为一次完整响应。"""
+    output_items: Dict[int, Dict[str, Any]] = {}
+    terminal: Optional[Dict[str, Any]] = None
+    upstream = _stream_upstream_sse(url, headers, query, body)
+    try:
+        async for event_name, event in upstream:
+            if event == "[DONE]":
+                break
+            if not isinstance(event, Mapping):
+                continue
+            event_type = str(event.get("type") or event_name or "")
+            if event_type == "response.output_item.done":
+                item = event.get("item")
+                if isinstance(item, Mapping):
+                    index = event.get("output_index")
+                    if not isinstance(index, int) or index < 0:
+                        index = len(output_items)
+                    output_items[index] = dict(item)
+            elif event_type in {"response.completed", "response.incomplete"}:
+                response = event.get("response")
+                if isinstance(response, Mapping):
+                    terminal = dict(response)
+                    terminal.setdefault("status", "incomplete" if event_type == "response.incomplete" else "completed")
+            elif event_type in {"response.failed", "response.error", "error"}:
+                raise CodexModelBridgeError(502, "上游 Responses 流失败")
+    finally:
+        await upstream.aclose()
+    if terminal is None:
+        raise CodexModelBridgeError(502, "上游 Responses 流未返回 completed/incomplete 终态")
+    if not terminal.get("output") and output_items:
+        terminal["output"] = [output_items[index] for index in sorted(output_items)]
+    if not isinstance(terminal.get("output"), list):
+        raise CodexModelBridgeError(502, "上游 Responses 流没有返回 output")
+    return terminal
 
 
 def _chat_payload_to_responses(payload: Mapping[str, Any], upstream_model: str) -> Dict[str, Any]:

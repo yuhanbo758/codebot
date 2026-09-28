@@ -37,6 +37,7 @@ from core.codex_model_bridge import (  # noqa: E402
     bridge_adapter,
     bridge_protocol_for_npm,
     bridge_protocol_metadata,
+    bridge_responses_request,
     anthropic_to_responses,
     build_anthropic_request,
     build_chat_completions_request,
@@ -245,6 +246,36 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.runtime.bridge_responses(route.codex_provider, {"model": "test"})
         refresh.assert_called_once_with(route.route_id)
         bridge.assert_awaited_once_with(fresh, {"model": "test"})
+
+    async def test_opencode_oauth_codex_endpoint_uses_stream_and_collects_output(self):
+        route = ModelRoute(
+            display_id="openai/gpt-6-luna", display_name="GPT-6 Luna", opencode_provider="openai",
+            opencode_model="gpt-6-luna", codex_provider="bridge_openai", codex_model="gpt-6-luna",
+            base_url="https://example.invalid/backend-api/codex", env_key="", api_key="test-token",
+            upstream_protocol="responses_proxy", credential_mode="opencode_oauth", connected=True,
+        )
+
+        async def upstream(_url, _headers, _query, body):
+            self.assertTrue(body["stream"])
+            self.assertFalse(body["store"])
+            self.assertNotIn("max_output_tokens", body)
+            yield "response.output_item.done", {
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "123"}]},
+            }
+            yield "response.completed", {
+                "type": "response.completed", "response": {"id": "resp_test", "status": "completed", "output": []},
+            }
+
+        with patch("core.codex_model_bridge._stream_upstream_sse", new=upstream):
+            result = await bridge_responses_request(route, {"model": "gpt-6-luna", "input": [], "max_output_tokens": 100})
+        self.assertEqual(result.response["output"][0]["content"][0]["text"], "123")
+        self.assertIn("event: response.completed", result.as_sse())
+
+    def test_incomplete_responses_keeps_incomplete_terminal_event(self):
+        result = BridgedResponsesResult({"id": "resp_incomplete", "status": "incomplete", "output": []})
+        self.assertIn("event: response.incomplete", result.as_sse())
+        self.assertNotIn("event: response.completed", result.as_sse())
 
     async def asyncSetUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
