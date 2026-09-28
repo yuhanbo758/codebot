@@ -396,13 +396,13 @@ class OpenCodeClient:
             ]
         return [*command, *args]
 
-    async def _run_opencode_models_cli(self) -> List[dict]:
+    async def _run_opencode_models_cli(self, refresh: bool = False) -> List[dict]:
         commands = collect_opencode_commands()
         if not commands:
             return []
         for command in commands:
             try:
-                argv = self._build_cli_command(command, ["models"])
+                argv = self._build_cli_command(command, ["models", *(["--refresh"] if refresh else [])])
                 proc = await asyncio.create_subprocess_exec(
                     *argv,
                     stdout=asyncio.subprocess.PIPE,
@@ -410,7 +410,7 @@ class OpenCodeClient:
                     stdin=asyncio.subprocess.DEVNULL,
                 )
                 try:
-                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60 if refresh else 20)
                 except asyncio.TimeoutError:
                     try:
                         proc.kill()
@@ -432,8 +432,12 @@ class OpenCodeClient:
                 logger.warning(f"OpenCode CLI models command error: {command[0]} ({e})")
         return []
 
-    async def get_models_from_cli(self) -> List[dict]:
-        return await self._run_opencode_models_cli()
+    async def get_models_from_cli(self, refresh: bool = False) -> List[dict]:
+        models = await self._run_opencode_models_cli(refresh=refresh)
+        if refresh and not models:
+            # 在线目录刷新失败时仍允许读取现有缓存，运行能力由当前 Server 再核验。
+            return await self._run_opencode_models_cli()
+        return models
     
     async def get_models(self, prefer_cli: bool = False, quiet: bool = False, http_timeout: float = 10) -> list:
         """获取 OpenCode 可用模型列表（从 /provider 端点解析已连接的 provider）"""

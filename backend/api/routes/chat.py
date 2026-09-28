@@ -6930,7 +6930,7 @@ async def _load_current_server_models_for_refresh(client: OpenCodeClient) -> Lis
 
 
 @router.get("/models")
-async def get_models():
+async def get_models(refresh: bool = False):
     """获取 OpenCode 可用模型列表"""
     global opencode_ws
     client = opencode_ws
@@ -6940,7 +6940,7 @@ async def get_models():
             client = OpenCodeClient(app_config.opencode.server_url)
             created_client = True
 
-        cli_models = await client.get_models_from_cli()
+        cli_models = await client.get_models_from_cli(refresh=refresh)
         server_models = await _load_current_server_models_for_refresh(client)
 
         if cli_models:

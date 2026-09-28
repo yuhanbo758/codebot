@@ -137,6 +137,12 @@ if errorlevel 1 (
     echo ERROR: npm install electron failed.
     exit /b 1
 )
+"%PYTHON%" "%ROOT%scripts\stage_opencode_binary.py"
+if errorlevel 1 (
+    popd
+    echo ERROR: OpenCode native binary staging failed.
+    exit /b 1
+)
 call npm run build
 if errorlevel 1 (
     popd

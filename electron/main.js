@@ -1660,6 +1660,8 @@ async function startBackend() {
   const opencodeCandidates = [
     path.join(process.resourcesPath || '', 'opencode', 'opencode.exe'),
     path.join(process.resourcesPath || '', 'opencode', 'opencode'),
+    path.join(repoRoot, 'electron', 'vendor', 'opencode', 'native', 'opencode.exe'),
+    path.join(repoRoot, 'electron', 'vendor', 'opencode', 'native', 'opencode'),
     path.join(repoRoot, 'electron', 'vendor', 'opencode', 'opencode.exe'),
     path.join(repoRoot, 'electron', 'vendor', 'opencode', 'opencode'),
     path.join(repoRoot, 'vendor', 'opencode', 'opencode.exe'),

@@ -68,10 +68,11 @@
         ]
       },
       {
-        "from": "vendor/opencode",
+        "from": "vendor/opencode/native",
         "to": "opencode",
         "filter": [
-          "**/*"
+          "opencode",
+          "opencode.exe"
         ]
       }
     ],
