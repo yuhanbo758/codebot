@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   
   // 选择文件夹（用于项目目录选择等）
   selectFolder: (options) => ipcRenderer.invoke('dialog:selectFolder', toPlainValue(options)),
+  upgradeCodexRuntime: () => ipcRenderer.invoke('codex:upgrade-runtime'),
 
   // 安装与启动是两个独立的受控动作：渲染进程不能传入命令、下载地址、
   // 安装器参数或可执行文件路径，只能选择数据根目录并接收脱敏进度。

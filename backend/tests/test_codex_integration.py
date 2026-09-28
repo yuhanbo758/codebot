@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
@@ -290,6 +290,83 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         settings.CONVERSATIONS_DB = self.original_db
         settings.DATA_DIR = self.original_data_dir
         self.temp_dir.cleanup()
+
+    async def test_codex_native_model_list_remains_primary_with_opencode_extension(self):
+        route = ModelRoute(
+            display_id="openrouter/cohere/north-mini-code:free", display_name="North Mini Code",
+            opencode_provider="openrouter", opencode_model="cohere/north-mini-code:free",
+            codex_provider="bridge_openrouter", codex_model="cohere/north-mini-code:free",
+            base_url="https://openrouter.ai/api/v1", env_key="", api_key="test-key",
+            upstream_protocol="chat_completions", credential_mode="api_key", connected=True,
+        )
+        self.runtime._opencode_models = {route.display_id: route}
+        with (
+            patch.object(self.runtime, "start", new=AsyncMock()),
+            patch.object(self.runtime, "_refresh_opencode_models_if_changed", new=AsyncMock()),
+            patch.object(self.runtime, "_call", new=AsyncMock(return_value=SimpleNamespace(data=[
+                {"id": "gpt-6-astra", "displayName": "GPT-6 Astra"},
+            ]))),
+        ):
+            models = await self.runtime.models()
+        self.assertEqual([model["id"] for model in models], ["gpt-6-astra", route.display_id])
+        self.assertEqual([model["source"] for model in models], ["codex", "opencode"])
+        self.assertTrue(models[1]["runnable"])
+
+    async def test_revert_uses_first_removed_turn_id_with_new_codex_protocol(self):
+        from openai_codex.generated.v2_all import ThreadRevertParams
+
+        self.runtime._save_session(42, "thread-42", self.temp_dir.name)
+        self.runtime._save_turn_binding(42, 10, "turn-10")
+        self.runtime._save_turn_binding(42, 20, "turn-20")
+        self.runtime._save_turn_binding(42, 30, "turn-30")
+        request = MagicMock(return_value={})
+        self.runtime._client = SimpleNamespace(request=request, close=lambda: None)
+        with (
+            patch.object(self.runtime, "start", new=AsyncMock()),
+            patch.object(self.runtime, "_sdk_imports", return_value={"ThreadRevertParams": ThreadRevertParams}),
+        ):
+            self.assertTrue(await self.runtime.rollback_from_message(42, 20))
+        self.assertEqual(request.call_args.args[:2], (
+            "thread/revert", {"threadId": "thread-42", "beforeTurnId": "turn-20"},
+        ))
+        self.assertIsInstance(request.call_args.kwargs["response_model"].model_validate({}),
+                              request.call_args.kwargs["response_model"])
+        with self.runtime._connect_db() as conn:
+            rows = conn.execute("SELECT user_message_id FROM agent_turn_bindings ORDER BY user_message_id").fetchall()
+        self.assertEqual([row[0] for row in rows], [10])
+
+    async def test_openrouter_sdk_provider_uses_connected_api_key_and_chat_bridge(self):
+        payload = {"connected": ["openrouter"], "all": [{
+            "id": "openrouter", "name": "OpenRouter", "env": ["OPENROUTER_API_KEY"],
+            "models": {"cohere/north-mini-code:free": {
+                "name": "North Mini Code", "api": {
+                    "id": "cohere/north-mini-code:free",
+                    "url": "https://openrouter.ai/api/v1",
+                    "npm": "@openrouter/ai-sdk-provider",
+                },
+            }},
+        }]}
+        routes, incompatible = self.runtime._parse_opencode_provider_catalog(
+            payload, {"openrouter": {"type": "api", "key": "test-key"}}, {},
+        )
+        route = routes["openrouter/cohere/north-mini-code:free"]
+        self.assertFalse(incompatible)
+        self.assertEqual(route.upstream_protocol, "chat_completions")
+        self.assertTrue(route.public_model()["runnable"])
+
+        async def upstream(url, headers, _query, body):
+            self.assertEqual(url, "https://openrouter.ai/api/v1/chat/completions")
+            self.assertEqual(headers["Authorization"], "Bearer test-key")
+            self.assertEqual(body["model"], "cohere/north-mini-code:free")
+            return {"id": "chatcmpl-test", "choices": [{
+                "message": {"role": "assistant", "content": "123"}, "finish_reason": "stop",
+            }]}
+
+        with patch("core.codex_model_bridge._post_upstream", new=upstream):
+            result = await bridge_responses_request(route, {"model": route.codex_model, "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "Reply 123"}]},
+            ]})
+        self.assertEqual(result.response["output"][0]["content"][0]["text"], "123")
 
     async def test_thread_start_resume_and_project_switch(self):
         calls = []

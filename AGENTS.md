@@ -35,7 +35,7 @@
 | 桌面端 | Electron 43, electron-builder, electron-updater |
 | 打包 | PyInstaller, electron-builder |
 | CI/CD | GitHub Actions release workflow |
-| Agent 运行时 | OpenCode CLI / Server；`openai-codex==0.147.0` SDK 与随包 Codex runtime |
+| Agent 运行时 | OpenCode CLI / Server；`openai-codex==0.158.0` SDK 与随包 Codex runtime |
 
 ---
 
@@ -251,7 +251,7 @@ build.bat
 ## 重要依赖和外部服务
 
 - OpenCode CLI 必须可用，推荐运行 `opencode serve --port 11200 --hostname 127.0.0.1`。
-- Codex 目标默认使用 `openai-codex==0.147.0` 随包 runtime；仅在用户选择 `runtime_source=custom` 时读取 `codex_bin`，不要求系统 PATH 另装 Codex。
+- Codex 目标默认使用 `openai-codex==0.158.0` 随包 runtime；桌面设置页可通过官方 npm 一键安装新版 CLI 到 Codebot 用户目录并切换到 `runtime_source=custom`，不修改系统全局 Codex。
 - Codebot 会尝试自动安装或启动 OpenCode，相关逻辑在 `backend/utils/installer.py` 和 Electron 主进程中。
 - 第三方 MCP 服务通过 Codebot 聚合后暴露给 OpenCode，OpenCode 侧通常只需要连接 Codebot 的 MCP 入口。
 - ModelScope MCP 需要相关 API Key，配置属于用户本地数据，不应写入仓库。
@@ -306,6 +306,8 @@ build.bat
 ---
 
 ## 变更日志
+
+2026-09-28：Codex 模型目录恢复以随包 Codex CLI 的原生 `model/list` 为主，SDK/runtime 升级到 0.158.0 以提供原生 GPT-6；OpenCode 认证模型继续作为兼容扩展。为 OpenRouter 官方 AI SDK provider 增加 Chat Completions 协议映射，真实免费模型经桥返回文本。桌面 Codex 设置新增一键升级：从官方 npm registry 安装版本化 CLI 到 Codebot 用户目录，校验原生程序版本后切换运行时并重启，失败恢复原配置；不修改全局 CLI。打包门禁核对随包 CLI 与依赖版本一致；README 同步。无数据库变更。
 
 2026-09-28：继续修复 Codex 对话的 GPT-6 选择与实际发送：进入 Codex 对话时先核对 OpenCode 当前 Server 目录，CLI 已有但桥未加载的模型保留为不可选并明确显示，OpenAI 可运行路由按版本降序靠前，搜索 `codex` 也包含 OpenCode 接入 Codex 的模型；OpenCode OpenAI OAuth 的 Codex Responses 端点要求 `stream=true`，模型桥改为收集 SSE 完成事件与 output item 后交给 App Server，保留 incomplete 终态。真实 `openai/gpt-6-luna` 经 Codebot Codex Harness 返回指定文本，专项测试和前端构建通过；无数据库、配置或依赖变更。
 

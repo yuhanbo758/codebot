@@ -12,6 +12,7 @@ const {
   startInstalledDockerDesktop,
 } = require('./docker-installer');
 const { startRakazoDesktopStack } = require('./rakazo-startup');
+const { upgradeManagedCodex } = require('./codex-updater');
 let autoUpdater = null;
 try {
   autoUpdater = require('electron-updater').autoUpdater;
@@ -55,6 +56,7 @@ let dockerDesktopOperationPromise = null;
 // “一键启动全部”和随 Codebot 自动启动共享同一任务，避免用户连续点击后重复
 // 拉起 Docker、Compose 或本机授权。该互斥不包含任何凭据。
 let rakazoDesktopStartPromise = null;
+let codexUpgradePromise = null;
 // 只在本次 Electron/后端进程间使用，拒绝网页或局域网客户端调用包含明文
 // Rakazo 凭据的桌面专用接口。令牌不会传给渲染进程或写入磁盘。
 const desktopBridgeToken = crypto.randomBytes(32).toString('base64url');
@@ -526,6 +528,13 @@ ipcMain.handle('dialog:selectFolder', async (_event, options) => {
   });
   if (result.canceled || !result.filePaths.length) return null;
   return result.filePaths[0];
+});
+
+ipcMain.handle('codex:upgrade-runtime', async () => {
+  if (codexUpgradePromise) return codexUpgradePromise;
+  codexUpgradePromise = upgradeManagedCodex(app.getPath('userData'));
+  try { return await codexUpgradePromise; }
+  finally { codexUpgradePromise = null; }
 });
 
 ipcMain.handle('docker:status', async (_event, rawOptions) => {

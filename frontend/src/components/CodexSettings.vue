@@ -46,7 +46,9 @@
       <el-form-item>
         <el-button type="primary" :loading="saving" @click="save">保存 Codex 设置</el-button>
         <el-button :loading="restarting" @click="restart">重启 App Server</el-button>
+        <el-button v-if="windowSupportsUpgrade" :loading="upgrading" :disabled="saving || restarting" @click="upgradeRuntime">一键升级 Codex CLI</el-button>
         <el-button :loading="loading" @click="load">刷新状态</el-button>
+        <div v-if="windowSupportsUpgrade" class="field-tip">下载官方最新版到 Codebot 用户目录；成功后切换运行时并重启 App Server。需要本机已安装 npm，不影响系统全局 Codex。</div>
       </el-form-item>
     </el-form>
 
@@ -71,6 +73,7 @@
     <div class="status-grid">
       <div><span>App Server</span><el-tag :type="status?.running ? 'success' : 'danger'">{{ status?.running ? '运行中' : '未运行' }}</el-tag></div>
       <div><span>SDK 版本</span><code>{{ status?.metadata?.sdkVersion || '-' }}</code></div>
+      <div><span>CLI 版本</span><code>{{ status?.metadata?.runtimeVersion || '-' }}</code></div>
       <div><span>Runtime</span><code>{{ status?.runtimeSource || form.runtime_source }}</code></div>
       <div><span>可用模型</span><code>{{ models.length }}</code></div>
       <div><span>OpenCode 可兼容</span><code>{{ status?.openCodeCompatibleModels ?? status?.openCodeResponsesModels ?? 0 }}</code></div>
@@ -117,6 +120,8 @@ import axios from 'axios'
 const loading = ref(false)
 const saving = ref(false)
 const restarting = ref(false)
+const upgrading = ref(false)
+const windowSupportsUpgrade = Boolean(window.electronAPI?.upgradeCodexRuntime)
 const loginLoading = ref(false)
 const logoutLoading = ref(false)
 const status = ref(null)
@@ -220,6 +225,49 @@ const restart = async () => {
     ElMessage.error(error?.response?.data?.detail || '重启 Codex 失败')
   } finally {
     restarting.value = false
+  }
+}
+
+const upgradeRuntime = async () => {
+  upgrading.value = true
+  let previous = null
+  let changed = false
+  try {
+    const currentStatus = (await axios.get('/api/codex/status')).data?.data || {}
+    if (currentStatus.activeConversations?.length) throw new Error('Codex 有正在运行的对话，请完成或停止后再升级。')
+    previous = (await axios.get('/api/config/codex')).data?.data || null
+    const installed = await window.electronAPI.upgradeCodexRuntime()
+    if (!installed?.codexBin || !installed?.version) throw new Error('Codex CLI 安装结果不完整')
+    await axios.patch('/api/config/codex', { runtime_source: 'custom', codex_bin: installed.codexBin })
+    changed = true
+    if (previous?.enabled) {
+      const restarted = (await axios.post('/api/codex/restart')).data?.data || {}
+      if (restarted.metadata?.runtimeVersion !== `codex-cli ${installed.version}`) {
+        throw new Error('Codex App Server 没有加载刚安装的 CLI 版本')
+      }
+      const nativeModels = (await axios.get('/api/codex/models')).data?.data || []
+      if (!Array.isArray(nativeModels) || !nativeModels.some((model) => model.source === 'codex')) {
+        throw new Error('新版 Codex CLI 未返回原生模型目录')
+      }
+    }
+    await load()
+    ElMessage.success(`Codex CLI 已升级到 ${installed.version}${previous?.enabled ? '，Codex App Server 已切换' : '，下次启用 Codex 时使用'}`)
+  } catch (error) {
+    if (changed && previous) {
+      try {
+        await axios.patch('/api/config/codex', {
+          runtime_source: previous.runtime_source,
+          codex_bin: previous.codex_bin || '',
+        })
+        if (previous.enabled) await axios.post('/api/codex/restart')
+        await load()
+      } catch (_) {
+        ElMessage.error('升级后回滚运行时失败，请检查 Codex 设置。')
+      }
+    }
+    ElMessage.error(error?.response?.data?.detail || error?.message || 'Codex CLI 升级失败')
+  } finally {
+    upgrading.value = false
   }
 }
 

@@ -622,7 +622,9 @@ _PROTOCOL_ADAPTERS: Dict[str, ProtocolBridgeAdapter] = {
         protocol="chat_completions",
         label="OpenAI-compatible Chat Completions",
         public_protocol="chat-completions-bridge",
-        npm_packages=("@ai-sdk/openai-compatible",),
+        # OpenRouter 官方 AI SDK provider 同样调用 /chat/completions；其模型
+        # ID 保留 provider/model 形式，由 OpenRouter 自己路由到实际厂商。
+        npm_packages=("@ai-sdk/openai-compatible", "@openrouter/ai-sdk-provider"),
         endpoint_suffix="/chat/completions",
         auth_kind="bearer",
         request_builder=build_chat_completions_request,

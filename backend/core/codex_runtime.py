@@ -11,6 +11,7 @@ from contextlib import contextmanager
 import json
 import os
 import secrets
+import subprocess
 import sqlite3
 import threading
 import time
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 from loguru import logger
+from pydantic import BaseModel
 
 from config import app_config, settings
 from core.codex_model_bridge import bridge_protocol_metadata
@@ -70,6 +72,10 @@ class ActiveCodexTurn:
 OpenCodeResponsesModel = ModelRoute
 
 
+class _ThreadRevertResponse(BaseModel):
+    """新版 SDK 已提供 thread/revert 参数模型，但响应尚无生成类型。"""
+
+
 class CodexRuntime:
     """管理单个 Codex App Server 进程和多个 Codebot 对话线程。"""
 
@@ -103,7 +109,7 @@ class CodexRuntime:
             GetAccountTokenUsageResponse,
             LoginAccountParams,
             SkillsListResponse,
-            ThreadRollbackResponse,
+            ThreadRevertParams,
         )
 
         return {
@@ -115,7 +121,7 @@ class CodexRuntime:
             "GetAccountTokenUsageResponse": GetAccountTokenUsageResponse,
             "LoginAccountParams": LoginAccountParams,
             "SkillsListResponse": SkillsListResponse,
-            "ThreadRollbackResponse": ThreadRollbackResponse,
+            "ThreadRevertParams": ThreadRevertParams,
         }
 
     def _runtime_port(self) -> int:
@@ -397,8 +403,17 @@ class CodexRuntime:
             # OpenCode 已连接的 provider，不修改 ~/.codex/config.toml 或 OpenCode 配置。
             self._opencode_models, self._opencode_incompatible = self._discover_opencode_models_sync()
             sdk = self._sdk_imports()
+            config = self._build_sdk_config()
+            if config.codex_bin:
+                runtime_version = subprocess.run(
+                    [config.codex_bin, "--version"], capture_output=True, text=True,
+                    timeout=10, check=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                ).stdout.strip()
+            else:
+                runtime_version = f"codex-cli {sdk['sdk_version']}"
             client = sdk["CodexClient"](
-                config=self._build_sdk_config(),
+                config=config,
                 approval_handler=self._handle_server_request,
             )
             try:
@@ -410,6 +425,7 @@ class CodexRuntime:
             self._client = client
             self._metadata = _model_dump(metadata)
             self._metadata["sdkVersion"] = sdk["sdk_version"]
+            self._metadata["runtimeVersion"] = runtime_version
             self._last_error = ""
             self._started_at = time.time()
 
@@ -620,16 +636,15 @@ class CodexRuntime:
         if not session:
             return True
         with self._connect_db() as conn:
-            count = int(
-                conn.execute(
-                    """
-                    SELECT COUNT(*) FROM agent_turn_bindings
-                    WHERE conversation_id = ? AND runtime = 'codex' AND user_message_id >= ?
-                    """,
-                    (conversation_id, user_message_id),
-                ).fetchone()[0]
-            )
-        if count <= 0:
+            first_turn = conn.execute(
+                """
+                SELECT turn_id FROM agent_turn_bindings
+                WHERE conversation_id = ? AND runtime = 'codex' AND user_message_id >= ?
+                ORDER BY user_message_id ASC LIMIT 1
+                """,
+                (conversation_id, user_message_id),
+            ).fetchone()
+        if first_turn is None:
             return True
         try:
             sdk = self._sdk_imports()
@@ -639,9 +654,11 @@ class CodexRuntime:
                 raise RuntimeError("Codex App Server 未启动")
             await asyncio.to_thread(
                 client.request,
-                "thread/rollback",
-                {"threadId": session["thread_id"], "numTurns": count},
-                response_model=sdk["ThreadRollbackResponse"],
+                "thread/revert",
+                sdk["ThreadRevertParams"](
+                    thread_id=session["thread_id"], before_turn_id=str(first_turn[0]),
+                ).model_dump(by_alias=True),
+                response_model=_ThreadRevertResponse,
             )
             with self._connect_db() as conn:
                 conn.execute(

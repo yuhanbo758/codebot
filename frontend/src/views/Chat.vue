@@ -2992,8 +2992,9 @@ const loadModels = async (options = {}) => {
         listed.add(id)
       }
       const versionOrder = new Intl.Collator('en', { numeric: true })
-      const priority = m => m.source === 'opencode' && m.provider === 'openai' && m.runnable !== false ? 0 : m.source === 'codex' ? 1 : 2
-      newList.sort((a, b) => priority(a) - priority(b) || (priority(a) === 0 ? versionOrder.compare(b.model, a.model) : 0))
+      // Codex App Server 的原生 model/list 是主目录；OpenCode 只扩展可兼容路由。
+      const priority = m => m.source === 'codex' ? 0 : m.source === 'opencode' && m.runnable !== false ? 1 : 2
+      newList.sort((a, b) => priority(a) - priority(b) || (priority(a) === 1 && a.provider === 'openai' && b.provider === 'openai' ? versionOrder.compare(b.model, a.model) : 0))
     }
 
     // 如果用户有已保存的模型，且新列表中没有对应条目，则保留一个占位条目以避免 el-select 显示空值

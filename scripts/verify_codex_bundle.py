@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -44,6 +45,16 @@ def main() -> int:
     codex_bin = candidates[0]
 
     creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    requirements = (Path(__file__).resolve().parents[1] / "backend" / "requirements.txt").read_text(encoding="utf-8")
+    pinned = re.search(r"^openai-codex==([0-9.]+)$", requirements, re.MULTILINE)
+    if pinned is None:
+        raise RuntimeError("后端依赖缺少固定的 openai-codex 版本")
+    version = subprocess.run(
+        [str(codex_bin), "--version"], capture_output=True, text=True,
+        timeout=15, check=True, creationflags=creation_flags,
+    ).stdout.strip()
+    if version != f"codex-cli {pinned.group(1)}":
+        raise RuntimeError(f"随包 Codex runtime 版本与依赖不一致：{version}")
     process = subprocess.Popen(
         [str(codex_bin), "app-server", "--listen", "stdio://"],
         stdin=subprocess.PIPE,
