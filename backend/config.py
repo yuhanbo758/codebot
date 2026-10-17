@@ -277,7 +277,7 @@ class SandboxConfig(BaseModel):
 
 class AppConfig(BaseModel):
     """应用配置"""
-    version: str = "7.2.0"
+    version: str = "7.3.0"
     general: GeneralConfig = GeneralConfig()
     agent: AgentConfig = Field(default_factory=AgentConfig)
     memory: MemoryConfig = MemoryConfig()
