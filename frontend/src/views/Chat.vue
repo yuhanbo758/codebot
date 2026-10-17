@@ -2939,6 +2939,12 @@ const loadModels = async (options = {}) => {
     // 与 CLI 目录同步，手动刷新时才联网更新模型缓存。
     if (useCodex && !useRakazo) {
       try {
+        const runtimeStatus = (await axios.get('/api/codex/status')).data?.data
+        if (runtimeStatus?.runtimeInstallRequired) {
+          ElMessage.info('首次使用 Codex，正在下载并校验官方 CLI；OpenCode 对话不受影响。')
+        }
+      } catch { /* 模型 API 会给出具体错误。 */ }
+      try {
         const refreshed = await axios.get('/api/chat/models', {
           params: manual ? { refresh: true } : undefined,
         })
@@ -3031,7 +3037,7 @@ const loadModels = async (options = {}) => {
     if (manual && res.data?.message) {
       ElMessage.warning(res.data.message)
     }
-  } catch {
+  } catch (error) {
     if (sequence !== modelLoadSequence) return
     // 加载失败时，如果有已保存模型，保留其占位条目
     const saved = useRakazo ? '' : normalizeModelId(selectedModel.value)
@@ -3043,8 +3049,8 @@ const loadModels = async (options = {}) => {
     } else {
       availableModels.value = []
     }
-    if (manual) {
-      ElMessage.error('刷新模型列表失败')
+    if (manual || useCodex) {
+      ElMessage.error(error?.response?.data?.detail || '刷新模型列表失败')
     }
   } finally {
     if (sequence === modelLoadSequence) modelsLoading.value = false

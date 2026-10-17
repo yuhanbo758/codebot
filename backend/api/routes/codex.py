@@ -23,10 +23,15 @@ class CodexLoginRequest(BaseModel):
     api_key: str = ""
 
 
-async def prepare_if_enabled() -> None:
+async def prepare_if_enabled() -> bool:
     """供 FastAPI lifespan 预热；禁用或关闭自动启动时保持惰性。"""
     if app_config.codex.enabled and app_config.codex.auto_start:
+        if codex_runtime.status()["runtimeInstallRequired"]:
+            # 新安装的 Windows 轻量包只在用户进入 Codex 时下载 CLI。
+            return False
         await codex_runtime.start()
+        return True
+    return False
 
 
 @router.get("/status")

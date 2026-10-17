@@ -96,6 +96,7 @@ class CodexRuntime:
         # 该随机令牌仅在当前后端进程与其子 Codex App Server 之间流转，
         # 不复用 LAN Token，也不持久化到 config.json。
         self._bridge_token = secrets.token_urlsafe(32)
+        self._install_progress: Dict[str, Any] = {"installing": False, "downloadedBytes": 0, "totalBytes": 0}
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -393,6 +394,21 @@ class CodexRuntime:
             configured_bin = str(app_config.codex.codex_bin or "").strip()
             if not configured_bin:
                 raise ValueError("已选择自定义 Codex runtime，但 codex_bin 为空")
+        else:
+            from utils.codex_installer import ensure_managed_codex, uses_managed_runtime
+
+            if uses_managed_runtime():
+                # Windows 正式包不再携带 CLI；首次调用 Codex 时下载固定的官方版本。
+                self._install_progress = {"installing": True, "downloadedBytes": 0, "totalBytes": 0}
+                try:
+                    def update_progress(downloaded: int, total: int) -> None:
+                        self._install_progress = {
+                            "installing": True, "downloadedBytes": downloaded, "totalBytes": total,
+                        }
+
+                    configured_bin = str(ensure_managed_codex(progress=update_progress))
+                finally:
+                    self._install_progress = {**self._install_progress, "installing": False}
 
         env = {
             # 即使当前请求来自 loopback 也传入 Token，未来收紧本机鉴权时无需改协议。
@@ -483,6 +499,10 @@ class CodexRuntime:
                     last_error = exc
                     self._last_error = str(exc)
                     await asyncio.to_thread(self._close_sync)
+                    from utils.codex_installer import CodexInstallError
+
+                    if isinstance(exc, CodexInstallError):
+                        raise
                     if attempt == 0:
                         await asyncio.sleep(0.2)
             raise RuntimeError(f"Codex App Server 连续两次启动失败：{last_error}") from last_error
@@ -536,6 +556,10 @@ class CodexRuntime:
             raise
 
     def status(self) -> Dict[str, Any]:
+        from utils.codex_installer import CODEX_RUNTIME_VERSION, managed_runtime_installed, uses_managed_runtime
+
+        install_required = (app_config.codex.runtime_source == "bundled"
+                            and uses_managed_runtime() and not managed_runtime_installed())
         protocol_counts: Dict[str, int] = {}
         for route in self._opencode_models.values():
             protocol_counts[route.upstream_protocol] = protocol_counts.get(route.upstream_protocol, 0) + 1
@@ -556,6 +580,9 @@ class CodexRuntime:
             "enabled": bool(app_config.codex.enabled),
             "running": self._client is not None,
             "runtimeSource": app_config.codex.runtime_source,
+            "runtimeInstallRequired": install_required,
+            "managedRuntimeVersion": CODEX_RUNTIME_VERSION if uses_managed_runtime() else "",
+            "runtimeDownload": dict(self._install_progress),
             "codexBin": app_config.codex.codex_bin if app_config.codex.runtime_source == "custom" else "",
             "approvalPolicy": app_config.codex.approval_policy,
             "fullAccess": app_config.codex.full_access,

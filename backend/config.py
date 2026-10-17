@@ -152,8 +152,8 @@ class SkillsConfig(BaseModel):
 class CodexConfig(BaseModel):
     """Codex Agent Harness 集成配置。
 
-    默认使用 ``openai-codex`` Python SDK 随包携带的固定版本运行时；只有
-    用户明确选择 ``custom`` 时才读取 ``codex_bin``，避免打包版依赖系统 PATH。
+    默认由 Codebot 管理与 SDK 匹配的固定版本运行时：Windows 正式包按需安装，
+    其他平台随包；只有用户明确选择 ``custom`` 时才读取 ``codex_bin``。
     """
     enabled: bool = True
     auto_start: bool = True

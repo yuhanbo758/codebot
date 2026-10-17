@@ -317,8 +317,10 @@ async def lifespan(app: FastAPI):
     if app_config.codex.enabled and app_config.codex.auto_start:
         async def prepare_codex_runtime():
             try:
-                await codex_router.prepare_if_enabled()
-                logger.info("Codex App Server 已预热")
+                if await codex_router.prepare_if_enabled():
+                    logger.info("Codex App Server 已预热")
+                else:
+                    logger.info("Codex CLI 将在首次使用时安装")
             except Exception as exc:
                 logger.warning(f"Codex App Server 预热失败，将在首次使用时重试：{exc}")
 

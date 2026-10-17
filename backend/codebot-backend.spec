@@ -45,9 +45,10 @@ tmp_ret = collect_all('lark_oapi')
 datas += [(source, target) for source, target in tmp_ret[0] if not source.lower().endswith('.py')]
 binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
-# 官方 Codex Python SDK 与平台随包 runtime。codex_cli_bin 中不仅有 Python
-# 元数据，还包含 codex、rg、命令执行器和 Windows 沙箱辅助程序，必须整体收集。
-for _pkg in ('openai_codex', 'codex_cli_bin'):
+# Windows 轻量包保留 SDK，CLI 在首次使用时从官方 registry 安装到用户目录。
+# 其他平台沿用经验证的随包 CLI，避免扩大本次打包变更范围。
+_on_demand_codex = sys.platform == 'win32'
+for _pkg in (('openai_codex',) if _on_demand_codex else ('openai_codex', 'codex_cli_bin')):
     try:
         tmp_ret = collect_all(_pkg)
         datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
@@ -170,6 +171,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
+        *(['codex_cli_bin'] if _on_demand_codex else []),
         'tkinter',
         'matplotlib',
         'scipy',

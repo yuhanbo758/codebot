@@ -35,7 +35,7 @@
 | 桌面端 | Electron 43, electron-builder, electron-updater |
 | 打包 | PyInstaller, electron-builder |
 | CI/CD | GitHub Actions release workflow |
-| Agent 运行时 | OpenCode CLI / Server；`openai-codex==0.158.0` SDK 与随包 Codex runtime |
+| Agent 运行时 | OpenCode CLI / Server；`openai-codex==0.158.0` SDK，Windows Codex CLI 按需安装，其他平台随包 |
 
 ---
 
@@ -92,7 +92,7 @@ codebot/
 | 应用入口 | `backend/main.py` | 创建 FastAPI 应用，初始化数据库、OpenCode 客户端、记忆、通知、沙箱、调度器、飞书机器人，并挂载 API 路由和静态前端资源。 |
 | 配置系统 | `backend/config.py` | 定义 `AppConfig`、`Settings` 及各业务配置模型，负责 `data/config.json` 和环境变量加载。 |
 | OpenCode 客户端 | `backend/core/opencode_ws.py` | 通过 OpenCode HTTP API 创建 session、发送 prompt、流式读取响应、管理对话队列和模型参数；模型刷新优先使用 `opencode models` 对齐 CLI 视角，HTTP `/provider` 作为兜底，并在发送前校验当前 server 是否已加载所选模型。 |
-| Codex 运行时 | `backend/core/codex_runtime.py`, `backend/api/routes/codex.py` | 通过官方 `openai-codex` SDK 管理单个 App Server、多对话持久 thread/turn、审批、问题、中断、回滚、账号、模型、Skills 与事件到 Codebot NDJSON 的映射。 |
+| Codex 运行时 | `backend/core/codex_runtime.py`, `backend/utils/codex_installer.py`, `backend/api/routes/codex.py` | 通过官方 `openai-codex` SDK 管理单个 App Server、多对话持久 thread/turn、审批、问题、中断、回滚、账号、模型、Skills 与事件到 Codebot NDJSON 的映射；Windows 正式包首次使用时校验并安装固定版本 CLI 到用户目录。 |
 | 聊天 API | `backend/api/routes/chat.py` | 对话 CRUD、消息发送、流式输出、附件读取、多Agent群聊调度、分享只读接口、标题生成、技能生成、聊天队列和记忆提取入口。 |
 | 记忆系统 | `backend/core/memory_manager.py`, `backend/api/routes/memory.py` | 管理对话、消息、长期记忆、归档、搜索、备份和 ChromaDB 向量检索。 |
 | 自动记忆整理 | `backend/core/memory_extractor.py`, `backend/core/memory_organizer.py` | 从聊天中提取背景信息，并按计划进行合并、去重和整理。 |
@@ -252,7 +252,7 @@ build.bat
 ## 重要依赖和外部服务
 
 - OpenCode CLI 必须可用，推荐运行 `opencode serve --port 11200 --hostname 127.0.0.1`。
-- Codex 目标默认使用 `openai-codex==0.158.0` 随包 runtime；桌面设置页可通过官方 npm 一键安装新版 CLI 到 Codebot 用户目录并切换到 `runtime_source=custom`，不修改系统全局 Codex。
+- Codex 默认使用 `openai-codex==0.158.0` SDK；Windows 正式包首次使用时直接从官方 registry 安装同版本 CLI 到 Codebot 用户目录，不依赖 npm，macOS/Linux 沿用随包 runtime。桌面设置页的一键升级最新版仍通过 npm 安装并切换到 `runtime_source=custom`，不修改系统全局 Codex。
 - Codebot 会尝试自动安装或启动 OpenCode，相关逻辑在 `backend/utils/installer.py` 和 Electron 主进程中。
 - 第三方 MCP 服务通过 Codebot 聚合后暴露给 OpenCode，OpenCode 侧通常只需要连接 Codebot 的 MCP 入口。
 - ModelScope MCP 需要相关 API Key，配置属于用户本地数据，不应写入仓库。
@@ -307,6 +307,8 @@ build.bat
 ---
 
 ## 变更日志
+
+2026-10-17：Windows 安装包不再收录 Codex CLI 原生组件，只保留 SDK 与随包 OpenCode。首次进入 Codex 对话或设置页主动安装时，从官方 npm registry 下载固定版本平台包，限制来源和大小、校验 SHA-512、CLI 版本与 App Server 启动，并在用户目录原子安装；新装桌面端不预热未安装的 Codex，OpenCode 不受下载失败影响。其他平台与源码开发继续使用随包 CLI；发布门禁检查 Windows 包不含 Codex CLI、SDK 与下载版本一致。README 同步，无数据库结构变更。
 
 2026-10-17：审计仓库与安装包体积：删除无引用的历史备份 `backend/api/routes/chat.py.old`；PyInstaller 不再将飞书 SDK 已进入 PYZ 的约万份 `.py` 源码重复复制到资源目录，保留全部隐藏导入及非代码数据，并在产物门禁确认 SDK 入口。Codex/OpenCode 原生运行时保留以维持离线安装与模型功能；无新依赖、配置或数据库变更。
 

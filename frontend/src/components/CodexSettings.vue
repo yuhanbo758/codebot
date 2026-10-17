@@ -9,7 +9,7 @@
       </el-form-item>
       <el-form-item label="Runtime 来源">
         <el-radio-group v-model="form.runtime_source">
-          <el-radio-button label="bundled">SDK 内置（推荐）</el-radio-button>
+          <el-radio-button label="bundled">Codebot 管理（推荐）</el-radio-button>
           <el-radio-button label="custom">本机自定义</el-radio-button>
         </el-radio-group>
       </el-form-item>
@@ -45,7 +45,8 @@
       </el-form-item>
       <el-form-item>
         <el-button type="primary" :loading="saving" @click="save">保存 Codex 设置</el-button>
-        <el-button :loading="restarting" @click="restart">重启 App Server</el-button>
+        <el-button :loading="restarting" :disabled="status?.runtimeInstallRequired" @click="restart">重启 App Server</el-button>
+        <el-button v-if="status?.runtimeInstallRequired && form.runtime_source === 'bundled'" :loading="installing" :disabled="!form.enabled || saving" @click="installRuntime">下载并启用 Codex CLI</el-button>
         <el-button v-if="windowSupportsUpgrade" :loading="upgrading" :disabled="saving || restarting" @click="upgradeRuntime">一键升级 Codex CLI</el-button>
         <el-button :loading="loading" @click="load">刷新状态</el-button>
         <div v-if="windowSupportsUpgrade" class="field-tip">下载官方最新版到 Codebot 用户目录；成功后切换运行时并重启 App Server。需要本机已安装 npm，不影响系统全局 Codex。</div>
@@ -70,6 +71,8 @@
     />
 
     <el-divider content-position="left">运行状态</el-divider>
+    <el-alert v-if="status?.runtimeInstallRequired" class="status-alert" title="Codex CLI 尚未安装" :description="`首次启用时会从官方 npm registry 下载并校验 Codex CLI ${status.managedRuntimeVersion}，保存到 Codebot 用户目录；OpenCode 可继续使用。`" type="info" show-icon :closable="false" />
+    <el-progress v-if="status?.runtimeDownload?.installing && status.runtimeDownload.totalBytes" :percentage="Math.min(100, Math.round(status.runtimeDownload.downloadedBytes / status.runtimeDownload.totalBytes * 100))" :stroke-width="10" />
     <div class="status-grid">
       <div><span>App Server</span><el-tag :type="status?.running ? 'success' : 'danger'">{{ status?.running ? '运行中' : '未运行' }}</el-tag></div>
       <div><span>SDK 版本</span><code>{{ status?.metadata?.sdkVersion || '-' }}</code></div>
@@ -125,7 +128,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Delete, Plus } from '@element-plus/icons-vue'
 import axios from 'axios'
@@ -133,6 +136,9 @@ import axios from 'axios'
 const loading = ref(false)
 const saving = ref(false)
 const restarting = ref(false)
+const installing = ref(false)
+let installProgressTimer = null
+onUnmounted(() => { if (installProgressTimer) clearInterval(installProgressTimer) })
 const upgrading = ref(false)
 const windowSupportsUpgrade = Boolean(window.electronAPI?.upgradeCodexRuntime)
 const loginLoading = ref(false)
@@ -248,6 +254,25 @@ const restart = async () => {
     ElMessage.error(error?.response?.data?.detail || '重启 Codex 失败')
   } finally {
     restarting.value = false
+  }
+}
+
+const installRuntime = async () => {
+  installing.value = true
+  installProgressTimer = setInterval(async () => {
+    try { status.value = (await axios.get('/api/codex/status')).data?.data || status.value } catch { /* 下载请求会显示错误。 */ }
+  }, 1000)
+  try {
+    await axios.post('/api/codex/start')
+    ElMessage.success('Codex CLI 已安装并启动')
+    await load()
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || error?.message || 'Codex CLI 安装失败，请检查网络后重试')
+    await load()
+  } finally {
+    clearInterval(installProgressTimer)
+    installProgressTimer = null
+    installing.value = false
   }
 }
 

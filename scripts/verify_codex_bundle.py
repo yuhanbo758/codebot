@@ -1,4 +1,4 @@
-"""验证 PyInstaller 产物内 Codex binary 存在且 App Server 可以保持运行。"""
+"""验证 Windows 按需安装门禁及其他平台随包 Codex App Server。"""
 from __future__ import annotations
 
 import os
@@ -30,6 +30,7 @@ def main() -> int:
         # 聊天提示词去重和日志隐私必须进入三平台正式后端，不能只在源码测试通过。
         "api.routes.chat", "api.routes.logs", "core.prompt_optimizer", "core.jevai",
         "api.routes.media", "core.media_runtime",
+        "utils.codex_installer",
         # 飞书 SDK 的生成源码不再重复复制到资源目录，入口仍必须留在 PYZ 中。
         "lark_oapi", "lark_oapi.ws.client",
     }
@@ -46,15 +47,23 @@ def main() -> int:
         for path in root.rglob("codex.exe" if os.name == "nt" else "codex")
         if path.is_file() and "codex_cli_bin" in {part.lower() for part in path.parts}
     ]
-    if not candidates:
-        raise RuntimeError(f"打包产物内未找到 Codex runtime：{root}")
-    codex_bin = candidates[0]
-
     creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     requirements = (Path(__file__).resolve().parents[1] / "backend" / "requirements.txt").read_text(encoding="utf-8")
     pinned = re.search(r"^openai-codex==([0-9.]+)$", requirements, re.MULTILINE)
     if pinned is None:
         raise RuntimeError("后端依赖缺少固定的 openai-codex 版本")
+    installer = (Path(__file__).resolve().parents[1] / "backend" / "utils" / "codex_installer.py").read_text(encoding="utf-8")
+    managed = re.search(r'^CODEX_RUNTIME_VERSION = "([0-9.]+)"$', installer, re.MULTILINE)
+    if managed is None or managed.group(1) != pinned.group(1):
+        raise RuntimeError("按需下载的 Codex CLI 版本与 SDK 依赖不一致")
+    if os.name == "nt":
+        if candidates:
+            raise RuntimeError("Windows 轻量包仍意外包含 Codex CLI")
+        print(f"Windows on-demand Codex runtime verified: {managed.group(1)}")
+        return 0
+    if not candidates:
+        raise RuntimeError(f"打包产物内未找到 Codex runtime：{root}")
+    codex_bin = candidates[0]
     version = subprocess.run(
         [str(codex_bin), "--version"], capture_output=True, text=True,
         timeout=15, check=True, creationflags=creation_flags,
