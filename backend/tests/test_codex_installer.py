@@ -72,6 +72,36 @@ class CodexInstallerTests(unittest.TestCase):
             self.assertEqual(archive.read_bytes(), b"archive")
             self.assertEqual(updates, [(7, 7)])
 
+    def test_download_resumes_after_read_timeout(self):
+        class InterruptedResponse(_Response):
+            def read(self, size=-1):
+                if self.tell() == 0:
+                    return super().read(3)
+                raise TimeoutError("temporary network stall")
+
+        first = InterruptedResponse(b"abcdef", "https://registry.npmjs.org/test")
+        first.headers["Content-Length"] = "6"
+        resumed = _Response(b"def", "https://registry.npmjs.org/test")
+        resumed.status = 206
+        resumed.headers["Content-Range"] = "bytes 3-5/6"
+        requested = []
+
+        def response_for_range(_url, *, range_start=0):
+            requested.append(range_start)
+            return first if range_start == 0 else resumed
+
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "codex.tgz"
+            with (
+                patch.object(installer, "_open_official", side_effect=response_for_range),
+                patch.object(installer.time, "sleep"),
+            ):
+                installer._download_verified(
+                    "https://registry.npmjs.org/test", hashlib.sha512(b"abcdef").digest(), archive,
+                )
+            self.assertEqual(archive.read_bytes(), b"abcdef")
+            self.assertEqual(requested, [0, 3])
+
     def test_archive_rejects_path_escape_and_extracts_binary(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -308,7 +308,7 @@ build.bat
 
 ## 变更日志
 
-2026-10-17：Windows 安装包不再收录 Codex CLI 原生组件，只保留 SDK 与随包 OpenCode。首次进入 Codex 对话或设置页主动安装时，从官方 npm registry 下载固定版本平台包，限制来源和大小、校验 SHA-512、CLI 版本与 App Server 启动，并在用户目录原子安装；新装桌面端不预热未安装的 Codex，OpenCode 不受下载失败影响。其他平台与源码开发继续使用随包 CLI；发布门禁检查 Windows 包不含 Codex CLI、SDK 与下载版本一致。README 同步，无数据库结构变更。
+2026-10-17：Windows 安装包不再收录 Codex CLI 原生组件，只保留 SDK 与随包 OpenCode。首次进入 Codex 对话或设置页主动安装时，从官方 npm registry 下载固定版本平台包，限制来源和大小、校验 SHA-512、CLI 版本与 App Server 启动，并在用户目录原子安装；连接短暂中断时验证 Range 响应并续传，新装桌面端不预热未安装的 Codex，OpenCode 不受下载失败影响。其他平台与源码开发继续使用随包 CLI；发布门禁检查 Windows 包不含 Codex CLI、SDK 与下载版本一致。README 同步，无数据库结构变更。
 
 2026-10-17：审计仓库与安装包体积：删除无引用的历史备份 `backend/api/routes/chat.py.old`；PyInstaller 不再将飞书 SDK 已进入 PYZ 的约万份 `.py` 源码重复复制到资源目录，保留全部隐藏导入及非代码数据，并在产物门禁确认 SDK 入口。Codex/OpenCode 原生运行时保留以维持离线安装与模型功能；无新依赖、配置或数据库变更。
 

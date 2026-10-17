@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,6 +16,7 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 from urllib.parse import urlparse
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from config import settings
@@ -83,8 +86,11 @@ def _official_url(url: str) -> str:
     return url
 
 
-def _open_official(url: str):
-    response = urlopen(Request(_official_url(url), headers={"User-Agent": "Codebot-Codex-Installer"}), timeout=30)
+def _open_official(url: str, *, range_start: int = 0):
+    headers = {"User-Agent": "Codebot-Codex-Installer"}
+    if range_start:
+        headers["Range"] = f"bytes={range_start}-"
+    response = urlopen(Request(_official_url(url), headers=headers), timeout=30)
     try:
         _official_url(response.geturl())
     except Exception:
@@ -121,19 +127,58 @@ def _download_verified(tarball: str, expected_digest: bytes, archive: Path,
                        progress: Optional[ProgressCallback] = None) -> None:
     digest = hashlib.sha512()
     total = 0
+    expected_size = 0
     started = time.monotonic()
-    with _open_official(tarball) as response, archive.open("wb") as output:
-        expected_size = int(response.headers.get("Content-Length") or 0)
-        while chunk := response.read(64 * 1024):
-            total += len(chunk)
-            if total > _MAX_ARCHIVE_BYTES:
-                raise RuntimeError("Codex CLI 下载超过大小限制")
-            if time.monotonic() - started > 60 * 60:
-                raise RuntimeError("Codex CLI 下载超时")
-            digest.update(chunk)
-            output.write(chunk)
-            if progress:
-                progress(total, expected_size)
+    with archive.open("w+b") as output:
+        for attempt in range(12):
+            try:
+                with _open_official(tarball, range_start=total) as response:
+                    status = getattr(response, "status", 200)
+                    if total and status == 206:
+                        content_range = re.fullmatch(
+                            r"bytes (\d+)-(\d+)/(\d+)",
+                            str(response.headers.get("Content-Range") or ""),
+                        )
+                        if (not content_range or int(content_range.group(1)) != total
+                                or int(content_range.group(2)) < total
+                                or int(content_range.group(2)) >= int(content_range.group(3))
+                                or (expected_size and int(content_range.group(3)) != expected_size)):
+                            raise RuntimeError("Codex CLI 续传响应的起始位置不匹配")
+                        expected_size = int(content_range.group(3))
+                    elif total and status == 200:
+                        # 官方源未接受 Range 时从头重算哈希，绝不拼接两份响应。
+                        output.seek(0)
+                        output.truncate()
+                        digest = hashlib.sha512()
+                        total = 0
+                        expected_size = int(response.headers.get("Content-Length") or 0)
+                    elif status == 200:
+                        expected_size = int(response.headers.get("Content-Length") or 0)
+                    else:
+                        raise RuntimeError(f"Codex CLI 下载返回异常状态：{status}")
+                    if expected_size > _MAX_ARCHIVE_BYTES:
+                        raise RuntimeError("Codex CLI 下载超过大小限制")
+                    while chunk := response.read(64 * 1024):
+                        if total + len(chunk) > _MAX_ARCHIVE_BYTES or (expected_size and total + len(chunk) > expected_size):
+                            raise RuntimeError("Codex CLI 下载超过大小限制")
+                        output.write(chunk)
+                        digest.update(chunk)
+                        total += len(chunk)
+                        if time.monotonic() - started > 60 * 60:
+                            raise RuntimeError("Codex CLI 下载超时")
+                        if progress:
+                            progress(total, expected_size)
+                    if expected_size and total != expected_size:
+                        raise http.client.IncompleteRead(b"", expected_size - total)
+                break
+            except (OSError, URLError, http.client.HTTPException) as exc:
+                if expected_size and total == expected_size:
+                    output.flush()
+                    if archive.stat().st_size == expected_size and digest.digest() == expected_digest:
+                        break
+                if attempt == 11 or time.monotonic() - started > 60 * 60:
+                    raise RuntimeError(f"Codex CLI 下载多次中断：{exc}") from exc
+                time.sleep(min(2 ** attempt, 8))
     if total == 0 or digest.digest() != expected_digest:
         raise RuntimeError("Codex CLI 下载文件的 SHA-512 校验失败")
 
