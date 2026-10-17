@@ -15,6 +15,7 @@ from config import (
     app_config,
     save_config,
     SkillsConfig,
+    AgentConfig,
     CodexConfig,
     JevAIConfig,
     RakazoConfig,
@@ -215,6 +216,26 @@ def _validate_abs_dir_list(values: Optional[List[str]], label: str) -> List[str]
 
 class OpenCodeAccessUpdateRequest(BaseModel):
     full_access: bool
+
+
+class AgentConfigUpdateRequest(BaseModel):
+    aegis_enabled: Optional[bool] = None
+    reply_style: Optional[Literal["concise", "balanced", "detailed", "off"]] = None
+
+
+@router.get("/agent")
+async def get_agent_config():
+    return {"success": True, "data": app_config.agent.model_dump()}
+
+
+@router.patch("/agent")
+async def update_agent_config(request: AgentConfigUpdateRequest):
+    updated = {**app_config.agent.model_dump(), **request.model_dump(exclude_unset=True, exclude_none=True)}
+    candidate = AgentConfig(**updated)
+    # 保存成功后再切换本轮内存配置，写盘失败时不出现“报错但已生效”。
+    save_config(app_config.model_copy(update={"agent": candidate}))
+    app_config.agent = candidate
+    return await get_agent_config()
 
 
 class JevAIConfigUpdateRequest(BaseModel):

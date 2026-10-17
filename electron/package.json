@@ -50,6 +50,11 @@
         "to": "README.md"
       },
       {
+        "from": "../third_party/aegis",
+        "to": "third_party/aegis",
+        "filter": ["LICENSE", "NOTICE.md"]
+      },
+      {
         "from": "../skills",
         "to": "skills",
         "filter": [

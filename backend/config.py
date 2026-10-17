@@ -87,6 +87,12 @@ class GeneralConfig(BaseModel):
 
 
 
+class AgentConfig(BaseModel):
+    """Agent 方法层与聊天回复偏好，不改变执行器权限。"""
+    aegis_enabled: bool = True
+    reply_style: Literal["concise", "balanced", "detailed", "off"] = "balanced"
+
+
 class OpenCodeConfig(BaseModel):
     """OpenCode 配置"""
     # 仅覆盖交互执行会话，不修改用户全局 OpenCode 权限配置。
@@ -273,6 +279,7 @@ class AppConfig(BaseModel):
     """应用配置"""
     version: str = "6.9.0"
     general: GeneralConfig = GeneralConfig()
+    agent: AgentConfig = Field(default_factory=AgentConfig)
     memory: MemoryConfig = MemoryConfig()
     logs: LogConfig = LogConfig()
     notification: NotificationConfig = NotificationConfig()

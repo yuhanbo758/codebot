@@ -1,5 +1,31 @@
 <template>
   <div class="mode-settings">
+    <h2>Agent 与回复</h2>
+    <p class="hint">适用于 OpenCode 与 Codex 的聊天。设置保存后从下一轮消息生效，Rakazo 继续使用独立执行链。</p>
+    <el-form label-width="115px" class="mode-form" v-loading="agentLoading">
+      <el-form-item label="Aegis 编程方法">
+        <div>
+          <el-switch v-model="agentForm.aegis_enabled" :disabled="!agentLoaded" />
+          <div class="hint">Agent 模式按需使用项目现状核对、根因诊断、代码审查和完成验证规则。简单问答保持轻量，不增加额外模型调用，也不改变权限设置。</div>
+        </div>
+      </el-form-item>
+      <el-form-item label="回复详略">
+        <div class="media-picker">
+          <el-select v-model="agentForm.reply_style" :disabled="!agentLoaded" class="model-picker">
+            <el-option label="简洁：保留结论、关键依据与验证" value="concise" />
+            <el-option label="均衡：按问题复杂度展开（默认）" value="balanced" />
+            <el-option label="详细：解释取舍与复现步骤" value="detailed" />
+            <el-option label="原有表达：不追加回复风格规则" value="off" />
+          </el-select>
+          <div class="hint">适用于各聊天模式，用户当轮指定的格式与详略优先。直接约束生成表达，不裁剪或二次改写回复。</div>
+        </div>
+      </el-form-item>
+      <el-form-item class="agent-actions">
+        <el-button type="primary" :disabled="!agentLoaded" :loading="agentSaving" @click="saveAgent">保存 Agent 与回复设置</el-button>
+        <el-button :loading="agentLoading" @click="loadAgent">重新加载</el-button>
+      </el-form-item>
+    </el-form>
+    <el-divider />
     <h2>JevAI 模式</h2>
     <p class="hint">Jev 负责路由与分类；生成内容和文件操作继续由当前 OpenCode 或 Codex 对话执行。模型只会在任务阶段之间切换。</p>
     <el-form label-width="115px" class="mode-form">
@@ -58,6 +84,36 @@ const loading = ref(false)
 const saving = ref(false)
 const keySaving = ref(false)
 const keyInput = ref('')
+const agentForm = reactive({ aegis_enabled: true, reply_style: 'balanced' })
+const agentLoading = ref(false)
+const agentLoaded = ref(false)
+const agentSaving = ref(false)
+
+async function loadAgent() {
+  agentLoading.value = true
+  try {
+    const response = await axios.get('/api/config/agent')
+    Object.assign(agentForm, response.data.data)
+    agentLoaded.value = true
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || '加载 Agent 与回复设置失败')
+  } finally {
+    agentLoading.value = false
+  }
+}
+
+async function saveAgent() {
+  agentSaving.value = true
+  try {
+    const response = await axios.patch('/api/config/agent', { ...agentForm })
+    Object.assign(agentForm, response.data.data)
+    ElMessage.success('Agent 与回复设置已保存，下一轮消息生效')
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || '保存 Agent 与回复设置失败')
+  } finally {
+    agentSaving.value = false
+  }
+}
 
 async function load() {
   loading.value = true
@@ -131,13 +187,15 @@ async function updateKey(key) {
 }
 const saveKey = () => updateKey(keyInput.value.trim())
 const clearKey = () => updateKey('')
-onMounted(load)
+onMounted(() => { loadAgent(); load() })
 </script>
 
 <style scoped>
 .mode-settings { max-width: 820px; }
 .mode-settings h2 { margin-top: 0; }
-.hint { color: #909399; font-size: 13px; line-height: 1.6; margin: 0 0 10px; }
+.hint { color: #909399; font-size: 13px; line-height: 1.6; margin: 0 0 10px; overflow-wrap: anywhere; }
+.agent-actions :deep(.el-form-item__content) { gap: 8px; }
+.agent-actions :deep(.el-button + .el-button) { margin-left: 0; }
 .key-row { display: flex; gap: 8px; width: 100%; }
 .key-row .el-input { max-width: 430px; }
 .model-picker { width: min(100%, 520px); }

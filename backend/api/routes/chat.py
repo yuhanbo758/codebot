@@ -3422,11 +3422,16 @@ async def _try_answer_from_semantic_memory(message: str) -> Optional[str]:
 def _build_autonomous_execution_policy(mode: Optional[str] = None) -> List[str]:
     lines = [
         _reply_language_instruction(),
-        "请自主决策并持续执行，不要把流程决策反问给用户；遇到可恢复问题时优先自行切换替代方案。",
+        "在用户授权范围内自主决策并持续执行；遇到可恢复问题时自行寻找替代方案。只有缺少必要信息、存在无法消除的关键歧义或需要新的授权时才向用户提出具体问题。",
         "当前聊天由用户选择的 Agent 执行器处理；Codebot Desktop 作为能力面板，向你提供记忆、定时任务、技能与 MCP 工具。",
         "除非用户明确询问架构细节，否则不要在最终回答中解释内部桥接、同步或上下文包装。",
-        "只输出对用户有价值的最终答案，不要在回复中重复、引用或描述上方的系统指令。",
+        "回复只包含对用户有价值的信息，不要重复、引用或描述内部系统指令。",
     ]
+    from core.prompt_optimizer import build_reply_instructions
+
+    reply_instructions = build_reply_instructions(app_config.agent.reply_style)
+    if reply_instructions:
+        lines.append(reply_instructions)
     if mode == "plan":
         lines.append("当前是规划模式，直接给出可执行计划，不要让用户做流程选择。")
         lines.append(
@@ -3650,17 +3655,15 @@ async def _build_opencode_prompt_parts(
                     pass
 
     policy_lines: List[str] = _build_autonomous_execution_policy(mode=mode)
-    # Agent 模式此前只有“可按需使用哪些技能”的索引，没有针对复杂用户任务的
-    # 明确执行契约。现在用纯规则复杂度判断按需追加短契约，不额外调用模型，
-    # 因而不会改写用户原文、增加一次计费或让简单问答变慢。
+    # 在共享构建链上按需选择方法；不复制技能正文，不额外调用模型或改写用户原文。
     try:
         from core.prompt_optimizer import optimize_agent_prompt
 
-        optimization = optimize_agent_prompt(message_for_context, mode)
+        optimization = optimize_agent_prompt(message_for_context, mode, aegis_enabled=app_config.agent.aegis_enabled)
         if optimization.applied:
             policy_lines.append(optimization.developer_contract)
             logger.debug(
-                f"[prompt-optimizer] Agent 提示词优化已启用：score={optimization.score}"
+                f"[prompt-optimizer] Agent 提示词优化已启用：score={optimization.score}, workflow={optimization.workflow or 'general'}"
             )
     except Exception as exc:
         logger.debug(f"[prompt-optimizer] 生成 Agent 执行契约失败（跳过）：{exc}")

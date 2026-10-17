@@ -101,7 +101,7 @@ codebot/
 | 共享模型路由 | `backend/core/model_route_registry.py` | 以 OpenCode `/provider` 为唯一模型清单，生成不含凭据的稳定路由指纹，并为 Codex/Rakazo 显式区分 Responses、Chat Completions、Anthropic 及未适配协议；Rakazo 只消费当前 Server 已连接、已启用的模型，并在宿主侧复用 API Key 或 OpenCode 内置 OpenAI OAuth 同一连接，不展示未连接 Provider 的静态全目录。 |
 | Rakazo 运行时 | `backend/core/rakazo_runtime.py`, `backend/api/routes/rakazo.py`, `integrations/rakazo*` | Python 运行时适配层管理项目唯一 Bot/Thread/Computer/主会话、oRPC/事件、模型实测门禁、项目级 MCP、权限与日志脱敏及 Docker/契约握手；四项项目权限均可即时持久化，命令在 dedicated Computer 内执行并按账号级审批规则保守合并，外部网络由每 Bot 精确加盐的 Docker `--internal`/普通 bridge 控制。对话只固定执行器和项目身份，当前模型可在空闲时从聊天顶部切换，每轮保留真实路由快照。远端 Bot 丢失时仅在错误或官方列表复核明确不存在后自愈，保留原 Codebot 会话、权限、路由和 Computer home；确定性项目 MCP slug 会精确清理失败重试孤儿。删除 Rakazo 主会话先清理 Bot/Thread/Memory、项目 MCP、专属 Computer/网络/home，再删除本地映射与对话，始终保留宿主项目文件、Docker Desktop 和共享运行时。固定实验版在 Bot 创建、换模和已有会话发送前通过上游官方 `models.credentials/models.connect` 幂等建立或迁移本地 Provider 记录，保存版本化的 Codebot 私网桥协议键并与 Adapter 入口校验一致；Adapter 再换成随机进程采样令牌，始终不复用 OpenCode 密钥。TypeScript 侧车代理真实上游模型流，并在 api/worker 网络命名空间内提供 localhost 项目 MCP 回环。Rakazo 默认禁用，用户未主动打开安装向导时不探测 Docker、WSL、Compose 或模型目录。稳定通道失败关闭；实验通道只允许兼容清单固定的官方提交、Compose 摘要和镜像摘要，使用 DPAPI 运行时密钥、持久 Corepack 缓存及启动后镜像身份校验。稳定契约端到端通过前不宣称为完整 TypeScript Runtime Adapter，也不修改 Rakazo 上游源码。 |
 | Docker 与 Rakazo 桌面编排 | `electron/docker-installer.js`, `electron/rakazo-startup.js`, `electron/main.js` | Windows 桌面端把安装与启动拆成独立 IPC：只有未安装状态可下载 Docker Desktop、限制官方域名、验证 Docker Inc Authenticode 签名、准备 WSL 2 并使用用户所选程序/镜像/虚拟磁盘目录；已安装待启动状态只执行现有 `Docker Desktop.exe`，不进入安装确认、下载、验签或 WSL 安装链。首次安装/授权完成后，一键启动按 Docker、OpenCode 可用模型、Rakazo 运行时、既有 `safeStorage` 授权顺序统一恢复；`auto_start` 在桌面主界面显示后执行同一编排，但不静默安装系统组件或创建账号。通过注册表与自选路径识别已有安装，确认退出码 3 为“版本已最新”后跳过重装；固定路径和日志命中且两组目录内容均通过运行端点白名单预检时，同时隔离 `Docker\run` 与 `docker-secrets-engine` 两组纯运行 socket 目录并重试，旧目录保留可回退，绝不删除 Docker 数据。渲染进程不能传入命令、下载地址或凭据。 |
-| 提示词优化 | `backend/core/prompt_optimizer.py` | 用可预测复杂度信号为复杂 Agent 请求和 AI 定时任务按需生成精简执行契约；保留用户/任务原文，不增加额外模型调用。 |
+| 提示词优化 | `backend/core/prompt_optimizer.py` | 用可预测复杂度信号为复杂 Agent 请求和 AI 定时任务按需生成精简执行契约；Agent 编程任务按需使用 Aegis 方法适配（实现、调试、审查），共享回复表达支持详略选择；保留用户/任务原文，不增加额外模型调用。来源及 MIT 条款在 `third_party/aegis/`，随后端与 Electron 分发。 |
 | 技能系统 | `backend/core/skill_registry.py`, `backend/core/skill_generator.py`, `backend/core/tool_dispatcher.py`, `backend/api/routes/skills.py` | 发现内置、自动生成、外部兼容、OpenClaw 兼容和 OpenCode/AgentSkills 技能，读写 Codebot 可写 `SKILL.md`，从对话素材提炼真正的技能正文，并在聊天中注入相关技能上下文；内置多Agent协作调度技能。 |
 | MCP 聚合 | `backend/api/routes/mcp.py` | 管理第三方 MCP；保留 OpenCode SSE，并以带 Bearer Token 的标准 Streamable HTTP MCP 向 Codex 暴露记忆、调度、Skills 和第三方工具代理。 |
 | 模型网关 | `backend/api/routes/gateway.py` | 提供 OpenAI 兼容 `/v1/models` 和 `/v1/chat/completions` 接口。 |
@@ -223,6 +223,7 @@ build.bat
 - 路径处理优先使用 `pathlib.Path`，跨平台路径不要硬编码分隔符。
 - 数据库访问当前以 `sqlite3` 同步连接为主，表结构集中在 `backend/database/init_db.py` 初始化。
 - 配置变更应同步更新 `AppConfig` 子模型、配置 API 和前端设置页。
+- Agent 方法与回复偏好由 `agent.aegis_enabled`、`agent.reply_style` 和 `/api/config/agent` 管理，在 OpenCode/Codex 共享提示词构建链生效；不要对最终正文做截断或第二次模型改写。Aegis 适配不改变审批、自动提交、Skills 原生输入及 Rakazo 独立执行边界；更新适配来源时同步 `third_party/aegis/NOTICE.md` 与许可证打包门禁。
 
 ### 前端
 
@@ -307,9 +308,13 @@ build.bat
 
 ## 变更日志
 
+2026-10-17：审计仓库与安装包体积：删除无引用的历史备份 `backend/api/routes/chat.py.old`；PyInstaller 不再将飞书 SDK 已进入 PYZ 的约万份 `.py` 源码重复复制到资源目录，保留全部隐藏导入及非代码数据，并在产物门禁确认 SDK 入口。Codex/OpenCode 原生运行时保留以维持离线安装与模型功能；无新依赖、配置或数据库变更。
+
 2026-10-17：发布安全门禁新增前端 Vue、Axios、markdown-it、source-map-js 与 Electron 构建链的锁文件修复；Electron builder 升到 27.0.0-alpha.10，以移除稳定版构建链中无可修复版本的安全告警。前端和 Electron 的 `npm ci`、全依赖审计及构建/测试检查在本机通过；Windows 已完成 `win-unpacked` 资源收集，完整压缩与三平台安装包以 GitHub Actions 为准。无数据库或运行配置结构变更。
 
 2026-10-17：Codex 原生账号与 OpenCode Provider 认证分别诊断；Codex 模型目录和发送前验证 OpenCode OpenAI OAuth，刷新令牌被拒绝时仅将该连接的模型标记为需重新登录，并在聊天选择器与 Codex 设置显示具体操作。共享路由遇到其他 OpenCode 进程轮换 refresh token 时只读取官方凭据文件并重试一次，避免误判失效。已验证本机随包 Codex CLI 0.158.0 及 Codebot SDK 原生 GPT-6 对话成功、OpenCode CLI 同一 OAuth 连接刷新返回 401；不把认证失效归咎于打包或 Codex CLI 升级。README 同步，无新依赖或数据库结构变更。
+
+2026-10-17：在 OpenCode/Codex 共享 Agent 提示词链增加 Aegis 方法适配，按编程/调试/审查任务补充项目现状核对、责任归属、最小充分修复、复杂度控制和证据验证，普通简单问答保持快速路径。新增 `agent` 配置段、`/api/config/agent` GET/PATCH 与“模式 → Agent 与回复”设置：方法默认开启，回复详略默认均衡，可选择简洁、详细或原有表达；用户当轮格式优先，不裁剪正文或额外调用模型。Rakazo 保持独立。保留上游固定提交与 MIT 归属说明，PyInstaller/Electron 收集许可证并增加产物门禁；README 同步设置文档。无新依赖或数据库结构变更。
 
 2026-09-28：Codex 模型目录恢复以随包 Codex CLI 的原生 `model/list` 为主，SDK/runtime 升级到 0.158.0 以提供原生 GPT-6；OpenCode 认证模型继续作为兼容扩展。为 OpenRouter 官方 AI SDK provider 增加 Chat Completions 协议映射，真实免费模型经桥返回文本。桌面 Codex 设置新增一键升级：从官方 npm registry 安装版本化 CLI 到 Codebot 用户目录，校验原生程序版本后切换运行时并重启，失败恢复原配置；不修改全局 CLI。打包门禁核对随包 CLI 与依赖版本一致；README 同步。无数据库变更。
 

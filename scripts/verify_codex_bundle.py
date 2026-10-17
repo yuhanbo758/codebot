@@ -30,11 +30,17 @@ def main() -> int:
         # 聊天提示词去重和日志隐私必须进入三平台正式后端，不能只在源码测试通过。
         "api.routes.chat", "api.routes.logs", "core.prompt_optimizer", "core.jevai",
         "api.routes.media", "core.media_runtime",
+        # 飞书 SDK 的生成源码不再重复复制到资源目录，入口仍必须留在 PYZ 中。
+        "lark_oapi", "lark_oapi.ws.client",
     }
     missing = required_modules.difference(bundled_modules)
     if missing:
         raise RuntimeError(f"后端产物缺少模型路由模块：{sorted(missing)}")
     print("Codebot bundled model routing modules verified")
+    aegis_dir = root / "_internal" / "third_party" / "aegis"
+    for name in ("LICENSE", "NOTICE.md"):
+        if not (aegis_dir / name).is_file():
+            raise RuntimeError(f"Missing bundled Aegis attribution: {name}")
     candidates = [
         path
         for path in root.rglob("codex.exe" if os.name == "nt" else "codex")

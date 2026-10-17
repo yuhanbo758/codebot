@@ -41,7 +41,9 @@ hiddenimports += collect_submodules('uvicorn')
 
 # lark_oapi
 tmp_ret = collect_all('lark_oapi')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# SDK 的生成模块已通过 hiddenimports 收进 PYZ；不再把上万份 .py 源码重复复制到安装目录。
+datas += [(source, target) for source, target in tmp_ret[0] if not source.lower().endswith('.py')]
+binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 # 官方 Codex Python SDK 与平台随包 runtime。codex_cli_bin 中不仅有 Python
 # 元数据，还包含 codex、rg、命令执行器和 Windows 沙箱辅助程序，必须整体收集。
@@ -89,6 +91,10 @@ if os.path.isdir(_skills_src):
     print(f"[spec] bundling skills from: {_skills_src}")
 else:
     print(f"[spec] WARNING: skills dir not found at: {_skills_src}")
+
+# Aegis 适配包含上游方法，许可证与来源说明须随三平台后端分发。
+_aegis_src = os.path.normpath(os.path.join(_spec_dir, '..', 'third_party', 'aegis'))
+datas.append((_aegis_src, 'third_party/aegis'))
 
 # other hidden imports
 hiddenimports += ['hnswlib']
