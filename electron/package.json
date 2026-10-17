@@ -1,6 +1,6 @@
 {
   "name": "codebot",
-  "version": "7.4.0",
+  "version": "7.5.0",
   "description": "基于 OpenCode 的个人 AI 助手",
   "author": "Codebot",
   "main": "main.js",
@@ -86,7 +86,9 @@
         {
           "from": "vendor/opencode/native",
           "to": "opencode",
-          "filter": ["opencode"]
+          "filter": [
+            "opencode"
+          ]
         }
       ]
     },
@@ -116,7 +118,9 @@
         {
           "from": "vendor/opencode/native",
           "to": "opencode",
-          "filter": ["opencode"]
+          "filter": [
+            "opencode"
+          ]
         }
       ]
     },
