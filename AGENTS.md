@@ -201,7 +201,7 @@ build.bat
 - 运行时配置默认保存在 `data/config.json`，由 `backend/config.py` 的 `load_config()` / `save_config()` 管理。
 - 聊天回复语言由 `general.language` 控制，跟随“设置 → 通用设置 → 语言”，未配置时默认 `zh-CN`。
 - 默认 OpenCode Server 地址是 `http://127.0.0.1:11200`。
-- `opencode.cli_path` 可配置 OpenCode CLI 可执行文件或所在目录；为空时依次尝试 `CODEBOT_OPENCODE_PATH`、打包目录和系统 PATH；Windows 桌面端还会额外扫描 `%APPDATA%\npm`、Scoop shim、WinGet Links 和 Chocolatey bin 等常见安装目录。Codebot 自己拉起 OpenCode Server 时，会先把用户全局 `~/.config/opencode/opencode.json` 中的 `provider` 合并到 `data/opencode-config/opencode.json`，并通过 `OPENCODE_CONFIG_HOME=data/opencode-config` 启动 OpenCode；不要同时覆写 `XDG_CONFIG_HOME`，否则新 provider 可能不会被当前 server 加载。
+- `opencode.cli_path` 可配置 OpenCode CLI 可执行文件或所在目录；默认依次尝试显式 `CODEBOT_OPENCODE_PATH`、显式 `opencode.cli_path`、本机安装、打包目录。Windows 桌面端会扫描 `%APPDATA%\npm` 中的原生程序、Scoop shim、WinGet Links 和 Chocolatey bin 等常见安装目录；本机 CLI 启动失败时回退随包运行时。Codebot 管理的 Server 使用哪个程序，模型刷新便优先调用同一程序。Codebot 自己拉起 OpenCode Server 时，会先把用户全局 `~/.config/opencode/opencode.json` 中的 `provider` 合并到 `data/opencode-config/opencode.json`，并通过 `OPENCODE_CONFIG_HOME=data/opencode-config` 启动 OpenCode；不要同时覆写 `XDG_CONFIG_HOME`，否则新 provider 可能不会被当前 server 加载。
 - Web 后端默认监听 `0.0.0.0:15682`；Electron 源码开发模式默认使用 `18080`。
 - Electron 会为打包环境注入 `CODEBOT_DATA_DIR` 和 `CODEBOT_RESOURCES_DIR`，使数据目录可写并定位内置资源。
 - 数据库文件位于 `data/conversations.db`、`data/scheduled_tasks.db` 等路径。
@@ -307,6 +307,8 @@ build.bat
 ---
 
 ## 变更日志
+
+2026-10-17：桌面端不再把随包 OpenCode 强制设为最高优先级；默认优先复用本机已安装的原生 CLI，本机启动失败时沿用随包运行时。Codebot 管理的 Server 与模型刷新优先使用同一程序，避免 CLI 目录和当前 Server 版本错位。保留随包 OpenCode 以支持新安装与离线环境；README 同步，无新依赖或数据库变更。
 
 2026-10-17：Windows 正式包的 Codex 默认运行时先识别本机 npm 或 PATH 中的原生 `codex.exe`，用 SDK 最低版本要求和 App Server 初始化握手验证，兼容时直接使用；没有兼容候选时提示用户到设置页手动一键下载，普通启动、模型读取和对话不自动联网安装。设置页区分待验证本机 CLI 与确实缺少 CLI，并显示实际运行来源；自动预热不在启动时触发首次验证。保留自定义路径与其他平台的现有行为。README 同步，无新依赖或数据库结构变更。
 

@@ -14,14 +14,53 @@ _DATA = tempfile.TemporaryDirectory(prefix="codebot-model-refresh-tests-")
 os.environ.setdefault("CODEBOT_DATA_DIR", _DATA.name)
 
 from api.routes import chat  # noqa: E402
+from config import app_config  # noqa: E402
 from core.model_route_registry import model_route_registry  # noqa: E402
 from core.opencode_ws import OpenCodeClient  # noqa: E402
+from utils import installer  # noqa: E402
 
 
 GPT6 = {"id": "openai/gpt-6-sol", "name": "GPT-6 Sol", "provider": "openai", "model": "gpt-6-sol"}
 
 
 class ModelRefreshTests(unittest.IsolatedAsyncioTestCase):
+    def test_existing_local_cli_precedes_bundled_and_models_follow_running_server(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = "opencode.exe" if os.name == "nt" else "opencode"
+            npm_dir = root / "AppData" / "Roaming" / "npm"
+            local = (npm_dir / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
+                     if os.name == "nt" else root / "local" / executable)
+            bundled = root / "resources" / "opencode" / executable
+            for candidate in (local, bundled):
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+                candidate.write_bytes(b"MZtest" if os.name == "nt" else b"test")
+            environment = {
+                "APPDATA": str(root / "AppData" / "Roaming"),
+                "USERPROFILE": str(root),
+                "LOCALAPPDATA": str(root / "AppData" / "Local"),
+                "CODEBOT_RESOURCES_DIR": str(root / "resources"),
+                "CODEBOT_OPENCODE_PATH": "",
+            }
+            with (
+                patch.dict(os.environ, environment),
+                patch.object(Path, "home", return_value=root),
+                patch.object(app_config.opencode, "cli_path", ""),
+                patch.object(installer.shutil, "which", side_effect=lambda name: str(local) if name == executable else None),
+                patch.object(installer, "_opencode_server_process", None),
+                patch.object(installer, "_opencode_server_command", None),
+            ):
+                commands = installer.collect_opencode_commands()
+                self.assertEqual(commands[0], [str(local)])
+                self.assertIn([str(bundled)], commands)
+
+                # Server 实际使用回退程序时，模型 CLI 应读取同一程序的目录。
+                with (
+                    patch.object(installer, "_opencode_server_process", SimpleNamespace(poll=lambda: None)),
+                    patch.object(installer, "_opencode_server_command", [str(bundled)]),
+                ):
+                    self.assertEqual(installer.collect_opencode_commands()[0], [str(bundled)])
+
     def test_codex_bridge_accepts_refreshed_gpt6_catalog(self):
         payload = {"connected": ["openai"], "all": [{
             "id": "openai", "name": "OpenAI", "models": {"gpt-6-sol": {

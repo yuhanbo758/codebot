@@ -19,6 +19,7 @@ import httpx
 
 
 _opencode_server_process: Optional[subprocess.Popen] = None
+_opencode_server_command: Optional[List[str]] = None
 
 
 def _is_runnable_opencode_path(p: Path) -> bool:
@@ -51,7 +52,7 @@ def _collect_opencode_commands() -> List[List[str]]:
         # app can still discover the CLI even when PATH differs from the shell.
         if os.name == "nt":
             base_names = ["opencode", "opencode-ai"]
-            suffixes = [".cmd", ".bat", ".ps1", ".exe", ""]
+            suffixes = [".exe", ".cmd", ".bat", ".ps1", ""]
         else:
             base_names = ["opencode", "opencode-ai"]
             suffixes = ["", ".exe"]
@@ -94,6 +95,8 @@ def _collect_opencode_commands() -> List[List[str]]:
         _append_dir(Path(program_data) / "chocolatey" / "bin" if program_data else None)
 
         for directory in candidate_dirs:
+            # npm 的 shim 依赖 shell；优先直接使用同一安装中的原生程序。
+            _append_path(directory / "node_modules" / "opencode-ai" / "bin" / "opencode.exe")
             _append_opencode_dir(directory)
 
     configured_paths = [os.environ.get("CODEBOT_OPENCODE_PATH", "").strip()]
@@ -113,23 +116,9 @@ def _collect_opencode_commands() -> List[List[str]]:
         for p in candidates:
             _append_path(p)
 
-    # 1. Check for a bundled binary shipped alongside the packaged app.
-    #    Electron sets CODEBOT_RESOURCES_DIR to process.resourcesPath.
-    resources_dir = os.environ.get("CODEBOT_RESOURCES_DIR", "").strip()
-    if resources_dir:
-        _append_opencode_dir(Path(resources_dir) / "opencode")
-
-    repo_root = Path(__file__).resolve().parents[2]
-    for directory in [
-        repo_root / "electron" / "vendor" / "opencode" / "native",
-        repo_root / "electron" / "vendor" / "opencode",
-        repo_root / "vendor" / "opencode",
-    ]:
-        _append_opencode_dir(directory)
-
     _append_windows_known_dirs()
 
-    # 2. Fall back to system PATH
+    # 本机 CLI 优先于随包版本，以便沿用用户已经更新的模型目录。
     if os.name == "nt":
         path_names = [
             "opencode.cmd",
@@ -150,11 +139,28 @@ def _collect_opencode_commands() -> List[List[str]]:
         if path_found:
             _append_path(Path(path_found))
 
+    # 本机缺失或启动失败时仍可使用发布包内经过验证的运行时。
+    resources_dir = os.environ.get("CODEBOT_RESOURCES_DIR", "").strip()
+    if resources_dir:
+        _append_opencode_dir(Path(resources_dir) / "opencode")
+
+    repo_root = Path(__file__).resolve().parents[2]
+    for directory in [
+        repo_root / "electron" / "vendor" / "opencode" / "native",
+        repo_root / "electron" / "vendor" / "opencode",
+        repo_root / "vendor" / "opencode",
+    ]:
+        _append_opencode_dir(directory)
+
     return commands
 
 
 def collect_opencode_commands() -> List[List[str]]:
-    return _collect_opencode_commands()
+    commands = _collect_opencode_commands()
+    if is_managed_opencode_server_running() and _opencode_server_command in commands:
+        commands.remove(_opencode_server_command)
+        commands.insert(0, _opencode_server_command)
+    return commands
 
 
 def _external_opencode_config_candidates() -> List[Path]:
@@ -442,7 +448,7 @@ async def start_opencode_server(port: int = 11200) -> int:
     - 否则尝试启动新实例。
     """
     try:
-        global _opencode_server_process
+        global _opencode_server_process, _opencode_server_command
 
         # 若指定端口已被占用，先检查是否是可用的 OpenCode 服务
         if _is_port_open("127.0.0.1", port):
@@ -526,6 +532,7 @@ async def start_opencode_server(port: int = 11200) -> int:
                 for _ in range(30):
                     if await _is_opencode_http_ready(base_url):
                         _opencode_server_process = proc
+                        _opencode_server_command = command
                         logger.info(f"OpenCode Server 已启动 ({base_url})，命令：{command[0]}")
                         return port
                     if proc.poll() is not None:
@@ -549,9 +556,10 @@ async def start_opencode_server(port: int = 11200) -> int:
 
 def stop_opencode_server():
     """停止 codebot 自己启动的 OpenCode 实例。不会影响外部 OpenCode 进程（如桌面应用）。"""
-    global _opencode_server_process
+    global _opencode_server_process, _opencode_server_command
     proc = _opencode_server_process
     _opencode_server_process = None
+    _opencode_server_command = None
     if not proc:
         logger.debug("无 codebot 管理的 OpenCode 进程需要停止（可能是复用了外部实例）")
         return

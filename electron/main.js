@@ -1666,18 +1666,6 @@ async function startBackend() {
   const logStream = fs.createWriteStream(logFile, { flags: 'a', encoding: 'utf8' });
 
   const resourcesDir = process.resourcesPath || path.join(repoRoot, 'electron', 'resources');
-  const opencodeCandidates = [
-    path.join(process.resourcesPath || '', 'opencode', 'opencode.exe'),
-    path.join(process.resourcesPath || '', 'opencode', 'opencode'),
-    path.join(repoRoot, 'electron', 'vendor', 'opencode', 'native', 'opencode.exe'),
-    path.join(repoRoot, 'electron', 'vendor', 'opencode', 'native', 'opencode'),
-    path.join(repoRoot, 'electron', 'vendor', 'opencode', 'opencode.exe'),
-    path.join(repoRoot, 'electron', 'vendor', 'opencode', 'opencode'),
-    path.join(repoRoot, 'vendor', 'opencode', 'opencode.exe'),
-    path.join(repoRoot, 'vendor', 'opencode', 'opencode'),
-  ];
-  const opencodePath = opencodeCandidates.find((p) => p && fs.existsSync(p)) || '';
-
   const env = {
     ...process.env,
     PYTHONUTF8: '1',
@@ -1686,7 +1674,6 @@ async function startBackend() {
     CODEBOT_DATA_DIR: userDataDir,
     CODEBOT_RESOURCES_DIR: resourcesDir,
     CODEBOT_DOCS_SOURCE: docsSource,
-    CODEBOT_OPENCODE_PATH: opencodePath,
     CODEBOT_FORCE_OPENCODE_AUTOSTART: '1',
     CODEBOT_BACKEND_PORT: backendPort,
     CODEBOT_OPENCODE_SERVER_URL: `http://127.0.0.1:${opencodePort}`,
