@@ -58,7 +58,6 @@ def stage_binary() -> Path:
 
 def find_packaged_binary(root: Path, platform_name: str) -> Path:
     patterns = {
-        "win32": "win*-unpacked/resources/opencode/opencode.exe",
         "darwin": "mac*/Codebot.app/Contents/Resources/opencode/opencode",
         "linux": "linux*-unpacked/resources/opencode/opencode",
     }
@@ -71,12 +70,27 @@ def find_packaged_binary(root: Path, platform_name: str) -> Path:
     return matches[0]
 
 
+def verify_windows_package_is_slim(root: Path) -> None:
+    """Windows 发布包不能从旧 staging 目录误收 OpenCode 原生程序。"""
+    unpacked = list(root.glob("win*-unpacked"))
+    if len(unpacked) != 1:
+        raise RuntimeError(f"Expected one unpacked Windows app, found {len(unpacked)}")
+    opencode = unpacked[0] / "resources" / "opencode"
+    if opencode.exists():
+        raise RuntimeError(f"Windows package still contains OpenCode runtime: {opencode}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--verify-only", action="store_true")
     parser.add_argument("--verify-path", type=Path)
     parser.add_argument("--verify-packaged-root", type=Path)
+    parser.add_argument("--verify-windows-slim", type=Path)
     options = parser.parse_args()
+    if options.verify_windows_slim:
+        verify_windows_package_is_slim(options.verify_windows_slim)
+        print("Windows package has no bundled OpenCode runtime")
+        sys.exit(0)
     if options.verify_packaged_root:
         binary = find_packaged_binary(options.verify_packaged_root, sys.platform)
     else:

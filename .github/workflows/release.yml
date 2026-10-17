@@ -174,17 +174,14 @@ jobs:
         working-directory: electron
         run: npm ci
 
-      - name: Stage native OpenCode runtime
-        run: python scripts/stage_opencode_binary.py
-
       - name: Build Windows artifacts
         working-directory: electron
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npm run build -- --win nsis portable --publish never
+        run: .\node_modules\.bin\electron-builder.cmd --win nsis portable --publish never
 
-      - name: Verify packaged OpenCode runtime
-        run: python scripts/stage_opencode_binary.py --verify-packaged-root electron/dist/electron_new
+      - name: Verify slim Windows package
+        run: python scripts/stage_opencode_binary.py --verify-windows-slim electron/dist/electron_new
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4

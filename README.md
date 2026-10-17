@@ -54,7 +54,7 @@ Codebot 保持现有主界面和本地可控架构，不复制第三方产品界
 
 #### Windows
 
-正式安装包使用可选目录的向导安装，不再强制写入默认程序目录。Codebot 自带的后端、OpenCode、前端资源和适配器随程序放在所选目录；Rakazo 设置页还能单独选择 Docker 程序、镜像和 WSL 虚拟磁盘的大文件目录。Windows/WSL 系统组件、Chromium 小型用户配置等受系统约束的内容仍保留在系统位置。
+正式安装包使用可选目录的向导安装，不再强制写入默认程序目录。Codebot 自带的后端、前端资源和适配器随程序放在所选目录；Windows 安装包不包含 OpenCode CLI，优先使用本机已有安装，缺失时可在“设置 → OpenCode”一键下载并启动。Rakazo 设置页还能单独选择 Docker 程序、镜像和 WSL 虚拟磁盘的大文件目录。Windows/WSL 系统组件、Chromium 小型用户配置等受系统约束的内容仍保留在系统位置。
 
 ```bash
 # 下载项目后，双击运行
@@ -73,7 +73,7 @@ chmod +x scripts/install.sh
 
 #### 先启动 OpenCode Serve（必需）
 
-桌面发布包内置经版本与文件格式校验的 OpenCode 原生运行时；源码开发或自管部署仍需可用的 OpenCode CLI，并使 `opencode serve` 可连接。
+Windows 桌面发布包优先使用本机已安装的 OpenCode CLI，未找到时在“设置 → OpenCode”点击“一键下载并启动 OpenCode CLI”；这会从官方 npm registry 下载固定版本，验证 SHA-512 和原生程序后安装到 Codebot 用户目录，不要求本机安装 npm，也不会修改全局 CLI。下载只在用户点击后进行；OpenCode 未安装时仍可打开设置及使用不依赖它的功能。macOS/Linux 发布包继续内置经校验的 OpenCode 原生运行时。源码开发或自管部署仍需可用的 OpenCode CLI，并使 `opencode serve` 可连接。
 
 ```bash
 # Windows（打开 cmd 运行）
@@ -84,7 +84,7 @@ opencode serve --port 11200 --hostname 127.0.0.1
 ```
 
 应用程序配置文件（设置 → 通用 → 配置文件 → `config.json`）里的 `server_url` 需要与 `opencode serve` 保持一致（端口/地址一致）。如果连不上，请优先检查该配置项。桌面端启动后端时会自动尝试拉起 OpenCode 服务，并统一优先使用 `127.0.0.1:11200`；`npm start` 开发模式也会跟正式版一样优先连到 `11200`，避免误起另一套 dev server。如需覆盖默认值，可设置环境变量 `CODEBOT_OPENCODE_PREFERRED_PORT` 与 `CODEBOT_OPENCODE_FALLBACK_PORT`。
-聊天页手动刷新会调用 `opencode models --refresh` 更新模型缓存，再核对当前 `server_url` 的 OpenCode Server；普通页面加载只读取现有目录。Codex 对话以 Codex App Server 原生 `model/list` 为主目录，追加当前 OpenCode 已连接且有安全协议适配的模型；搜索 `gpt-6` 可查看原生及桥接的 GPT-6。CLI 已有而桥尚未加载的模型会显示为不可选。OpenCode 内置 OpenAI OAuth 模型通过 Codex Harness 使用上游要求的 Responses 流式传输。桌面发布包优先使用本机已安装的 OpenCode CLI；本机没有可启动的 CLI 时回退到随包运行时，保证新安装和离线环境可用。可在 `config.json` 的 `opencode.cli_path` 填写可执行文件或目录，也可以设置 `CODEBOT_OPENCODE_PATH` 作为显式优先路径；Windows 还会扫描 `%APPDATA%\npm` 的原生程序、Scoop、WinGet 和 Chocolatey。Codebot 自己拉起 Server 时，会将用户全局 `~/.config/opencode/opencode.json` 的 `provider` 合并到 `data/opencode-config/opencode.json`，并通过 `OPENCODE_CONFIG_HOME` 启动。刷新不会切换 Server 地址；Codebot 管理的 Server 发现新模型时会重启加载，外部 Server 若仍使用旧目录，需要重启该实例后再刷新。
+聊天页手动刷新会调用 `opencode models --refresh` 更新模型缓存，再核对当前 `server_url` 的 OpenCode Server；普通页面加载只读取现有目录。Codex 对话以 Codex App Server 原生 `model/list` 为主目录，追加当前 OpenCode 已连接且有安全协议适配的模型；搜索 `gpt-6` 可查看原生及桥接的 GPT-6。CLI 已有而桥尚未加载的模型会显示为不可选。OpenCode 内置 OpenAI OAuth 模型通过 Codex Harness 使用上游要求的 Responses 流式传输。Windows 桌面版优先使用本机已安装的 OpenCode CLI；没有本机 CLI 时，只有点击设置页的一键下载才会安装到 Codebot 用户目录，离线环境可以事先自行安装或连接已有的 OpenCode Serve。可在 `config.json` 的 `opencode.cli_path` 填写可执行文件或目录，也可以设置 `CODEBOT_OPENCODE_PATH` 作为显式优先路径；Windows 还会扫描 `%APPDATA%\npm` 的原生程序、Scoop、WinGet 和 Chocolatey。Codebot 自己拉起 Server 时，会将用户全局 `~/.config/opencode/opencode.json` 的 `provider` 合并到 `data/opencode-config/opencode.json`，并通过 `OPENCODE_CONFIG_HOME` 启动。刷新不会切换 Server 地址；Codebot 管理的 Server 发现新模型时会重启加载，外部 Server 若仍使用旧目录，需要重启该实例后再刷新。
 启动后，Codebot 会自动把以下内容同步到 OpenCode：
 
 - Codebot 自身的第三方 MCP 入口：`/api/mcp/codebot/sse`
@@ -152,7 +152,7 @@ npm start
 ```
 
 开发模式下（从源码运行），Electron 默认使用 `venv\\Scripts\\python.exe`（若存在）启动 `backend\\main.py`，以确保后端代码变更立即生效；如需强制使用 `backend\\dist\\codebot-backend.exe`，可设置环境变量 `CODEBOT_BACKEND_MODE=exe`。
-Electron 会优先使用应用内置的 `opencode` 可执行文件（`electron/vendor/opencode` 或打包后的 `resources/opencode`）自动拉起 `opencode serve`；若内置文件不可用或不可执行，会自动回退到系统 PATH 中的 `opencode`。桌面端会强制开启 OpenCode 自动拉起，并统一优先尝试 `127.0.0.1:11200`；如果系统里已经有 OpenCode 桌面端或 `opencode serve` 在运行，Codebot 会直接复用现有健康服务并跳过额外安装检查，避免启动阶段被 OpenCode 检测卡住。
+Electron 会优先使用本机 `opencode` CLI 自动拉起 `opencode serve`；Windows 本机缺失时保持后端可用，等待用户在“设置 → OpenCode”一键下载并启动，macOS/Linux 可回退到随包运行时。桌面端会强制开启 OpenCode 自动拉起，并统一优先尝试 `127.0.0.1:11200`；如果系统里已经有 OpenCode 桌面端或 `opencode serve` 在运行，Codebot 会直接复用现有健康服务，不会自动下载 CLI。
 
 ### Windows 隔离后端现状
 

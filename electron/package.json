@@ -75,20 +75,19 @@
           "rakazo-adapter/Dockerfile",
           "rakazo-adapter/src/**/*"
         ]
-      },
-      {
-        "from": "vendor/opencode/native",
-        "to": "opencode",
-        "filter": [
-          "opencode",
-          "opencode.exe"
-        ]
       }
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [
         "zip"
+      ],
+      "extraResources": [
+        {
+          "from": "vendor/opencode/native",
+          "to": "opencode",
+          "filter": ["opencode"]
+        }
       ]
     },
     "win": {
@@ -112,7 +111,14 @@
       "target": [
         "AppImage"
       ],
-      "artifactName": "Codebot-${version}.${ext}"
+      "artifactName": "Codebot-${version}.${ext}",
+      "extraResources": [
+        {
+          "from": "vendor/opencode/native",
+          "to": "opencode",
+          "filter": ["opencode"]
+        }
+      ]
     },
     "publish": [
       {

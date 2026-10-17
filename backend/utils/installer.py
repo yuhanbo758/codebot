@@ -5,7 +5,6 @@ import subprocess
 import sys
 import os
 import json
-import platform
 import shutil
 import socket
 import time
@@ -139,7 +138,15 @@ def _collect_opencode_commands() -> List[List[str]]:
         if path_found:
             _append_path(Path(path_found))
 
-    # 本机缺失或启动失败时仍可使用发布包内经过验证的运行时。
+    # 手动下载的运行时只在本机 CLI 缺失时使用，不修改全局安装。
+    if os.name == "nt":
+        try:
+            from utils.opencode_installer import managed_opencode_path
+            _append_path(managed_opencode_path())
+        except RuntimeError:
+            pass
+
+    # macOS/Linux 发布包仍提供离线运行时；旧 Windows 安装包也可继续使用。
     resources_dir = os.environ.get("CODEBOT_RESOURCES_DIR", "").strip()
     if resources_dir:
         _append_opencode_dir(Path(resources_dir) / "opencode")
@@ -352,90 +359,6 @@ async def check_opencode_installed() -> bool:
     return False
 
 
-async def install_opencode() -> bool:
-    """安装 OpenCode"""
-    system = platform.system()
-    logger.info(f"检测到操作系统：{system}")
-    
-    try:
-        if system == "Windows":
-            # 尝试使用 scoop
-            try:
-                logger.info("尝试使用 Scoop 安装 OpenCode...")
-                result = subprocess.run(
-                    ["scoop", "install", "opencode"],
-                    stdin=subprocess.DEVNULL,
-                    check=True,
-                    capture_output=True,
-                    text=True
-                )
-                logger.info("Scoop 安装成功")
-                return True
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                # 回退到 npm
-                logger.info("Scoop 不可用，使用 npm 安装...")
-                result = subprocess.run(
-                    ["npm", "install", "-g", "opencode-ai"],
-                    stdin=subprocess.DEVNULL,
-                    check=True,
-                    capture_output=True,
-                    text=True
-                )
-                logger.info("npm 安装成功")
-                return True
-                
-        elif system == "Darwin":
-            # macOS - 使用 Homebrew
-            logger.info("使用 Homebrew 安装 OpenCode...")
-            result = subprocess.run(
-                ["brew", "install", "anomalyco/tap/opencode"],
-                stdin=subprocess.DEVNULL,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            logger.info("Homebrew 安装成功")
-            return True
-            
-        else:
-            # Linux - 使用安装脚本
-            logger.info("使用官方脚本安装 OpenCode...")
-            script = "curl -fsSL https://opencode.ai/install | bash"
-            result = subprocess.run(
-                script,
-                shell=True,
-                stdin=subprocess.DEVNULL,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            logger.info("安装成功")
-            return True
-            
-    except subprocess.CalledProcessError as e:
-        logger.error(f"安装失败：{e.stderr}")
-        return False
-    except Exception as e:
-        logger.error(f"安装失败：{e}")
-        return False
-
-
-async def check_and_install_opencode() -> bool:
-    """检查并安装 OpenCode"""
-    running_service = await _find_running_opencode_service()
-    if running_service:
-        logger.info(f"检测到运行中的 OpenCode 服务：{running_service}，跳过安装检查")
-        return True
-
-    # 检查是否已安装
-    if await check_opencode_installed():
-        return True
-    
-    # 未安装，执行安装
-    logger.info("OpenCode 未安装，开始安装...")
-    return await install_opencode()
-
-
 async def start_opencode_server(port: int = 11200) -> int:
     """
     启动 codebot 专用的 OpenCode Server，返回实际监听的端口号（失败返回 0）。
@@ -586,16 +509,3 @@ async def restart_managed_opencode_server(port: int = 11200) -> int:
             break
         await asyncio.sleep(0.25)
     return await start_opencode_server(port)
-
-
-if __name__ == "__main__":
-    import asyncio
-    
-    async def main():
-        installed = await check_and_install_opencode()
-        if installed:
-            print("✅ OpenCode 已就绪")
-        else:
-            print("❌ OpenCode 安装失败")
-    
-    asyncio.run(main())

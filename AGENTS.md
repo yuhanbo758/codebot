@@ -201,7 +201,7 @@ build.bat
 - 运行时配置默认保存在 `data/config.json`，由 `backend/config.py` 的 `load_config()` / `save_config()` 管理。
 - 聊天回复语言由 `general.language` 控制，跟随“设置 → 通用设置 → 语言”，未配置时默认 `zh-CN`。
 - 默认 OpenCode Server 地址是 `http://127.0.0.1:11200`。
-- `opencode.cli_path` 可配置 OpenCode CLI 可执行文件或所在目录；默认依次尝试显式 `CODEBOT_OPENCODE_PATH`、显式 `opencode.cli_path`、本机安装、打包目录。Windows 桌面端会扫描 `%APPDATA%\npm` 中的原生程序、Scoop shim、WinGet Links 和 Chocolatey bin 等常见安装目录；本机 CLI 启动失败时回退随包运行时。Codebot 管理的 Server 使用哪个程序，模型刷新便优先调用同一程序。Codebot 自己拉起 OpenCode Server 时，会先把用户全局 `~/.config/opencode/opencode.json` 中的 `provider` 合并到 `data/opencode-config/opencode.json`，并通过 `OPENCODE_CONFIG_HOME=data/opencode-config` 启动 OpenCode；不要同时覆写 `XDG_CONFIG_HOME`，否则新 provider 可能不会被当前 server 加载。
+- `opencode.cli_path` 可配置 OpenCode CLI 可执行文件或所在目录；默认依次尝试显式 `CODEBOT_OPENCODE_PATH`、显式 `opencode.cli_path`、本机安装、Codebot 用户目录中的手动下载版本和非 Windows 随包运行时。Windows 桌面端会扫描 `%APPDATA%\npm` 中的原生程序、Scoop shim、WinGet Links 和 Chocolatey bin 等常见安装目录；Windows 安装包不包含 OpenCode CLI，启动时不自动下载。Codebot 管理的 Server 使用哪个程序，模型刷新便优先调用同一程序。Codebot 自己拉起 OpenCode Server 时，会先把用户全局 `~/.config/opencode/opencode.json` 中的 `provider` 合并到 `data/opencode-config/opencode.json`，并通过 `OPENCODE_CONFIG_HOME=data/opencode-config` 启动 OpenCode；不要同时覆写 `XDG_CONFIG_HOME`，否则新 provider 可能不会被当前 server 加载。
 - Web 后端默认监听 `0.0.0.0:15682`；Electron 源码开发模式默认使用 `18080`。
 - Electron 会为打包环境注入 `CODEBOT_DATA_DIR` 和 `CODEBOT_RESOURCES_DIR`，使数据目录可写并定位内置资源。
 - 数据库文件位于 `data/conversations.db`、`data/scheduled_tasks.db` 等路径。
@@ -251,9 +251,9 @@ build.bat
 
 ## 重要依赖和外部服务
 
-- OpenCode CLI 必须可用，推荐运行 `opencode serve --port 11200 --hostname 127.0.0.1`。
+- OpenCode 对话需要可用的 CLI 或 Serve；Windows 桌面端优先复用本机 CLI，缺失时由用户在“设置 → OpenCode”一键下载并启动，推荐监听 `127.0.0.1:11200`。
 - Codex 默认使用 `openai-codex==0.158.0` SDK；Windows 正式包使用 Codex 时优先验证本机已安装的原生 Codex CLI（版本和 SDK 握手），可用则直接复用。全部不可用时只提示用户到设置页手动一键下载固定版本到 Codebot 用户目录，不自动联网安装，也不依赖 npm。macOS/Linux 沿用随包 runtime。桌面设置页的一键升级最新版仍通过 npm 安装并切换到 `runtime_source=custom`，不修改系统全局 Codex。
-- Codebot 会尝试自动安装或启动 OpenCode，相关逻辑在 `backend/utils/installer.py` 和 Electron 主进程中。
+- Codebot 会尝试启动已有 OpenCode；手动下载和校验在 `backend/utils/opencode_installer.py`，启动在 `backend/utils/installer.py`。
 - 第三方 MCP 服务通过 Codebot 聚合后暴露给 OpenCode，OpenCode 侧通常只需要连接 Codebot 的 MCP 入口。
 - ModelScope MCP 需要相关 API Key，配置属于用户本地数据，不应写入仓库。
 - 飞书、邮件和对象存储发布凭据均应通过环境变量、GitHub Secrets 或本地配置提供。
@@ -307,6 +307,8 @@ build.bat
 ---
 
 ## 变更日志
+
+2026-10-17：Windows 安装包移除随包 OpenCode 原生程序，保留 macOS/Linux 随包运行时。Windows 桌面优先复用本机 CLI；缺失时仅用户点击“设置 → OpenCode”一键下载，官方 npm 原生包经 SHA-512、包名/版本、文件格式及 `--version` 校验后原子保存到 Codebot 用户目录，并启动服务。移除启动时 Scoop/npm 全局自动安装路径，保留旧 `auto_install` 配置字段兼容但不执行。CI 和本地构建增加 Windows 无内置运行时门禁；README 同步。无新依赖或数据库变更。
 
 2026-10-17：桌面端不再把随包 OpenCode 强制设为最高优先级；默认优先复用本机已安装的原生 CLI，本机启动失败时沿用随包运行时。Codebot 管理的 Server 与模型刷新优先使用同一程序，避免 CLI 目录和当前 Server 版本错位。保留随包 OpenCode 以支持新安装与离线环境；README 同步，无新依赖或数据库变更。
 

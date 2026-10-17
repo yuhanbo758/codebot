@@ -68,8 +68,7 @@ backend/build_log*.txt
 # 后端构建
 backend/dist/
 backend/dist_build/
-backend/build_tmp/
-backend/build_tmp2/
+backend/build_tmp*/
 backend/build_model_routing/
 backend/dist_model_routing/
 

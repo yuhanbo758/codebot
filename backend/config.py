@@ -99,7 +99,8 @@ class OpenCodeConfig(BaseModel):
     full_access: bool = False
     server_url: str = "http://127.0.0.1:11200"
     cli_path: str = ""
-    auto_install: bool = True
+    # 兼容旧配置字段；安装只由设置页的显式操作触发。
+    auto_install: bool = False
     auto_start: bool = True
 
 

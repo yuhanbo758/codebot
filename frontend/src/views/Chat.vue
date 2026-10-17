@@ -234,6 +234,12 @@
             <el-tag size="small" :type="thirdPartyStatus.opencode_connected ? 'success' : 'info'">
               {{ thirdPartyStatus.opencode_connected ? 'OpenCode 已连接' : 'OpenCode 未连接' }}
             </el-tag>
+            <el-button
+              v-if="!thirdPartyStatus.opencode_connected"
+              size="small"
+              text
+              @click="$router.push({ path: '/settings', query: { tab: 'opencode' } })"
+            >安装或启动 OpenCode</el-button>
             <el-tag size="small" :type="thirdPartyStatus.bridge_status?.registered ? 'success' : 'warning'">
               {{ thirdPartyStatus.bridge_status?.registered ? 'Bridge 已注册' : 'Bridge 待注册' }}
             </el-tag>

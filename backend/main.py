@@ -26,7 +26,7 @@ from core.lark_ws_bot import LarkWsBot
 from core.scheduler import TaskScheduler
 from core.sandbox import SandboxManager
 from services.notification import NotificationService
-from utils.installer import check_and_install_opencode, start_opencode_server, stop_opencode_server
+from utils.installer import start_opencode_server, stop_opencode_server
 from utils.background_tasks import create_background_task, cancel_background_tasks
 from core.lan_auth import path_is_auth_exempt, request_is_authenticated
 
@@ -195,14 +195,7 @@ async def lifespan(app: FastAPI):
     _seed_builtin_skills(settings.SKILLS_DIR)
     _migrate_auto_json_skills(settings.SKILLS_DIR)
     
-    # 3. 检查并安装 OpenCode
-    if app_config.opencode.auto_install:
-        logger.info("检查 OpenCode 安装状态...")
-        installed = await check_and_install_opencode()
-        if installed:
-            logger.info("OpenCode 已安装或安装成功")
-        else:
-            logger.warning("OpenCode 安装失败，请手动安装")
+    # OpenCode 缺失时保持后端可用，由用户在设置页主动下载。
     
     # 4. 初始化数据库
     logger.info("初始化数据库...")

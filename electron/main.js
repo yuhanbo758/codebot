@@ -1623,11 +1623,13 @@ async function startBackend() {
     const payload = await checkHealth();
     const opencodeConnected = Boolean(payload?.opencode_connected);
     const runtimeSource = payload?.runtime_source;
+    if (!isDev && payload?.status === 'healthy') {
+      console.log(opencodeConnected
+        ? '[backend] 已检测到运行中的服务且 OpenCode 已连接，跳过启动'
+        : '[backend] 已检测到运行中的服务；OpenCode 可在设置页按需启动');
+      return;
+    }
     if (opencodeConnected) {
-      if (!isDev) {
-        console.log('[backend] 已检测到运行中的服务且 OpenCode 已连接，跳过启动');
-        return;
-      }
       if (runtimeSource === 'source') {
         console.log('[backend] 开发模式检测到源码后端，准备重启以加载最新代码');
       }
@@ -1863,7 +1865,7 @@ async function waitForBackendReady() {
       await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
-  throw new Error('后端启动超时，请确认后端可执行文件与 OpenCode 环境可用');
+  throw new Error('后端启动超时，请确认后端可执行文件可用');
 }
 
 function showAbout() {

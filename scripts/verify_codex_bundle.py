@@ -30,7 +30,7 @@ def main() -> int:
         # 聊天提示词去重和日志隐私必须进入三平台正式后端，不能只在源码测试通过。
         "api.routes.chat", "api.routes.logs", "core.prompt_optimizer", "core.jevai",
         "api.routes.media", "core.media_runtime",
-        "utils.codex_installer",
+        "utils.codex_installer", "utils.opencode_installer",
         # 飞书 SDK 的生成源码不再重复复制到资源目录，入口仍必须留在 PYZ 中。
         "lark_oapi", "lark_oapi.ws.client",
     }

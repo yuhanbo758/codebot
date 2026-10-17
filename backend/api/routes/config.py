@@ -2,6 +2,8 @@
 通用配置 API（读写 data/config.json 中的 integration、skills 等配置段）
 """
 from pathlib import Path
+import asyncio
+import subprocess
 import json
 import os
 import re
@@ -28,6 +30,8 @@ from config import (
 from utils.secrets import merge_masked_secrets, redact_secrets
 
 router = APIRouter()
+_opencode_install_lock = asyncio.Lock()
+_opencode_download = {"installing": False, "downloadedBytes": 0, "totalBytes": 0}
 
 
 class IntegrationUpdateRequest(BaseModel):
@@ -298,6 +302,75 @@ async def update_opencode_access(request: OpenCodeAccessUpdateRequest):
     app_config.opencode.full_access = request.full_access
     save_config(app_config)
     return await get_opencode_access()
+
+
+def _probe_opencode_cli():
+    """状态页验证候选程序，不把仅存在的脚本误报为可用 CLI。"""
+    from utils.installer import collect_opencode_commands
+    from utils.opencode_installer import managed_opencode_path
+
+    managed = str(managed_opencode_path()).lower() if os.name == "nt" else ""
+    for command in collect_opencode_commands():
+        try:
+            result = subprocess.run(
+                [*command, "--version"], stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            version = result.stdout.strip()
+            if result.returncode == 0 and version:
+                path = command[0]
+                normalized = path.replace("\\", "/").lower()
+                source = "managed" if path.lower() == managed else (
+                    "bundled" if "/vendor/opencode/" in normalized or "/resources/opencode/" in normalized else "local"
+                )
+                return {"path": path, "version": version, "source": source}
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
+@router.get("/opencode/runtime/status")
+async def opencode_runtime_status():
+    from api.routes import chat
+    detected = await asyncio.to_thread(_probe_opencode_cli)
+    return {"success": True, "data": {
+        "cli": detected,
+        "serverConnected": bool(chat.opencode_ws and chat.opencode_ws.connected),
+        "downloadSupported": os.name == "nt",
+        "download": dict(_opencode_download),
+    }}
+
+
+@router.post("/opencode/runtime/install")
+async def install_opencode_runtime():
+    """显式点击后才下载；已有本机 CLI 时只尝试启动服务。"""
+    from api.routes import chat
+    from utils.opencode_installer import install_managed_opencode
+
+    if _opencode_install_lock.locked():
+        raise HTTPException(status_code=409, detail="OpenCode CLI 正在安装")
+    async with _opencode_install_lock:
+        _opencode_download.update(installing=True, downloadedBytes=0, totalBytes=0)
+        try:
+            detected = await asyncio.to_thread(_probe_opencode_cli)
+            if detected is None:
+                if os.name != "nt":
+                    raise RuntimeError("当前平台请先安装 OpenCode CLI，再点击启动")
+
+                def progress(done, total):
+                    _opencode_download.update(downloadedBytes=done, totalBytes=total)
+
+                await asyncio.to_thread(install_managed_opencode, progress)
+            if chat.opencode_ws is None:
+                raise RuntimeError("Codebot 后端尚未启动完成")
+            if not await chat._ensure_opencode_client_connected(chat.opencode_ws):
+                raise RuntimeError("OpenCode CLI 已找到，但服务启动失败；请检查 OpenCode 日志")
+            return await opencode_runtime_status()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        finally:
+            _opencode_download["installing"] = False
 
 
 @router.get("/codex")

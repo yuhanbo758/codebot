@@ -36,7 +36,6 @@ class OpenCodeBundleTests(unittest.TestCase):
 
     def test_packaged_path_matches_each_platform_layout(self):
         layouts = {
-            "win32": "win-unpacked/resources/opencode/opencode.exe",
             "darwin": "mac-arm64/Codebot.app/Contents/Resources/opencode/opencode",
             "linux": "linux-unpacked/resources/opencode/opencode",
         }
@@ -54,6 +53,18 @@ class OpenCodeBundleTests(unittest.TestCase):
             fake.write_bytes(b"#!/bin/sh\n")
             with self.assertRaisesRegex(RuntimeError, "not native"):
                 stage.verify_binary(fake)
+
+    def test_windows_package_excludes_opencode_even_with_stale_stage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            unpacked = root / "win-unpacked" / "resources"
+            unpacked.mkdir(parents=True)
+            stage.verify_windows_package_is_slim(root)
+            runtime = unpacked / "opencode" / "opencode.exe"
+            runtime.parent.mkdir()
+            runtime.write_bytes(b"MZ")
+            with self.assertRaisesRegex(RuntimeError, "still contains"):
+                stage.verify_windows_package_is_slim(root)
 
 
 if __name__ == "__main__":
