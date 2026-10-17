@@ -252,7 +252,7 @@ build.bat
 ## 重要依赖和外部服务
 
 - OpenCode CLI 必须可用，推荐运行 `opencode serve --port 11200 --hostname 127.0.0.1`。
-- Codex 默认使用 `openai-codex==0.158.0` SDK；Windows 正式包首次使用时直接从官方 registry 安装同版本 CLI 到 Codebot 用户目录，不依赖 npm，macOS/Linux 沿用随包 runtime。桌面设置页的一键升级最新版仍通过 npm 安装并切换到 `runtime_source=custom`，不修改系统全局 Codex。
+- Codex 默认使用 `openai-codex==0.158.0` SDK；Windows 正式包使用 Codex 时优先验证本机已安装的原生 Codex CLI（版本和 SDK 握手），可用则直接复用。全部不可用时只提示用户到设置页手动一键下载固定版本到 Codebot 用户目录，不自动联网安装，也不依赖 npm。macOS/Linux 沿用随包 runtime。桌面设置页的一键升级最新版仍通过 npm 安装并切换到 `runtime_source=custom`，不修改系统全局 Codex。
 - Codebot 会尝试自动安装或启动 OpenCode，相关逻辑在 `backend/utils/installer.py` 和 Electron 主进程中。
 - 第三方 MCP 服务通过 Codebot 聚合后暴露给 OpenCode，OpenCode 侧通常只需要连接 Codebot 的 MCP 入口。
 - ModelScope MCP 需要相关 API Key，配置属于用户本地数据，不应写入仓库。
@@ -307,6 +307,8 @@ build.bat
 ---
 
 ## 变更日志
+
+2026-10-17：Windows 正式包的 Codex 默认运行时先识别本机 npm 或 PATH 中的原生 `codex.exe`，用 SDK 最低版本要求和 App Server 初始化握手验证，兼容时直接使用；没有兼容候选时提示用户到设置页手动一键下载，普通启动、模型读取和对话不自动联网安装。设置页区分待验证本机 CLI 与确实缺少 CLI，并显示实际运行来源；自动预热不在启动时触发首次验证。保留自定义路径与其他平台的现有行为。README 同步，无新依赖或数据库结构变更。
 
 2026-10-17：Windows 安装包不再收录 Codex CLI 原生组件，只保留 SDK 与随包 OpenCode。首次进入 Codex 对话或设置页主动安装时，从官方 npm registry 下载固定版本平台包，限制来源和大小、校验 SHA-512、CLI 版本与 App Server 启动，并在用户目录原子安装；连接短暂中断时验证 Range 响应并续传，新装桌面端不预热未安装的 Codex，OpenCode 不受下载失败影响。其他平台与源码开发继续使用随包 CLI；发布门禁检查 Windows 包不含 Codex CLI、SDK 与下载版本一致。README 同步，无数据库结构变更。
 

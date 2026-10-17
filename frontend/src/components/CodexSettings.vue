@@ -9,7 +9,7 @@
       </el-form-item>
       <el-form-item label="Runtime 来源">
         <el-radio-group v-model="form.runtime_source">
-          <el-radio-button label="bundled">Codebot 管理（推荐）</el-radio-button>
+          <el-radio-button label="bundled">自动选择（推荐）</el-radio-button>
           <el-radio-button label="custom">本机自定义</el-radio-button>
         </el-radio-group>
       </el-form-item>
@@ -46,7 +46,8 @@
       <el-form-item>
         <el-button type="primary" :loading="saving" @click="save">保存 Codex 设置</el-button>
         <el-button :loading="restarting" :disabled="status?.runtimeInstallRequired" @click="restart">重启 App Server</el-button>
-        <el-button v-if="status?.runtimeInstallRequired && form.runtime_source === 'bundled'" :loading="installing" :disabled="!form.enabled || saving" @click="installRuntime">下载并启用 Codex CLI</el-button>
+        <el-button v-if="status?.runtimeCheckDeferred && form.runtime_source === 'bundled'" :loading="restarting" :disabled="!form.enabled || saving || status?.runtimeSource !== form.runtime_source" @click="startLocalRuntime">验证并启用本机 Codex CLI</el-button>
+        <el-button v-if="status?.managedRuntimeVersion && !status?.managedRuntimeInstalled && (status?.runtimeInstallRequired || status?.lastError) && form.runtime_source === 'bundled'" :loading="installing" :disabled="saving || status?.runtimeSource !== form.runtime_source" @click="installRuntime">一键下载 Codex CLI</el-button>
         <el-button v-if="windowSupportsUpgrade" :loading="upgrading" :disabled="saving || restarting" @click="upgradeRuntime">一键升级 Codex CLI</el-button>
         <el-button :loading="loading" @click="load">刷新状态</el-button>
         <div v-if="windowSupportsUpgrade" class="field-tip">下载官方最新版到 Codebot 用户目录；成功后切换运行时并重启 App Server。需要本机已安装 npm，不影响系统全局 Codex。</div>
@@ -71,13 +72,15 @@
     />
 
     <el-divider content-position="left">运行状态</el-divider>
-    <el-alert v-if="status?.runtimeInstallRequired" class="status-alert" title="Codex CLI 尚未安装" :description="`首次启用时会从官方 npm registry 下载并校验 Codex CLI ${status.managedRuntimeVersion}，保存到 Codebot 用户目录；OpenCode 可继续使用。`" type="info" show-icon :closable="false" />
+    <el-alert v-if="status?.runtimeCheckDeferred" class="status-alert" title="检测到本机 Codex CLI" description="点击验证后检查版本和 App Server 兼容性；通过后直接使用，不会自动下载。" type="info" show-icon :closable="false" />
+    <el-alert v-if="status?.runtimeInstallRequired" class="status-alert" title="未找到 Codex CLI" description="使用 Codex 前，请在此点击一键下载，或在上方指定本机 CLI。OpenCode 可继续使用。" type="info" show-icon :closable="false" />
     <el-progress v-if="status?.runtimeDownload?.installing && status.runtimeDownload.totalBytes" :percentage="Math.min(100, Math.round(status.runtimeDownload.downloadedBytes / status.runtimeDownload.totalBytes * 100))" :stroke-width="10" />
     <div class="status-grid">
       <div><span>App Server</span><el-tag :type="status?.running ? 'success' : 'danger'">{{ status?.running ? '运行中' : '未运行' }}</el-tag></div>
       <div><span>SDK 版本</span><code>{{ status?.metadata?.sdkVersion || '-' }}</code></div>
       <div><span>CLI 版本</span><code>{{ status?.metadata?.runtimeVersion || '-' }}</code></div>
       <div><span>Runtime</span><code>{{ status?.runtimeSource || form.runtime_source }}</code></div>
+      <div><span>实际来源</span><code>{{ status?.runtimeOrigin === 'local' ? '本机 CLI' : status?.runtimeOrigin === 'managed' ? 'Codebot 下载' : status?.runtimeOrigin || '-' }}</code></div>
       <div><span>可用模型</span><code>{{ models.length }}</code></div>
       <div><span>OpenCode 可兼容</span><code>{{ status?.openCodeCompatibleModels ?? status?.openCodeResponsesModels ?? 0 }}</code></div>
       <div><span>本机协议桥</span><code>{{ status?.openCodeBridgedModels ?? 0 }}</code></div>
@@ -236,6 +239,7 @@ const save = async () => {
     const payload = { ...form.value, skill_dirs: uniqueDirs(form.value.skill_dirs) }
     const res = await axios.patch('/api/config/codex', payload)
     form.value = { ...form.value, ...(res.data?.data || {}) }
+    status.value = (await axios.get('/api/codex/status')).data?.data || status.value
     ElMessage.success('Codex 设置已保存')
   } catch (error) {
     ElMessage.error(error?.response?.data?.detail || '保存 Codex 设置失败')
@@ -263,8 +267,8 @@ const installRuntime = async () => {
     try { status.value = (await axios.get('/api/codex/status')).data?.data || status.value } catch { /* 下载请求会显示错误。 */ }
   }, 1000)
   try {
-    await axios.post('/api/codex/start')
-    ElMessage.success('Codex CLI 已安装并启动')
+    const res = await axios.post('/api/codex/runtime/install')
+    ElMessage.success(res.data?.data?.enabled ? 'Codex CLI 已安装并启动' : 'Codex CLI 已安装，启用 Codex 后即可使用')
     await load()
   } catch (error) {
     ElMessage.error(error?.response?.data?.detail || error?.message || 'Codex CLI 安装失败，请检查网络后重试')
@@ -273,6 +277,20 @@ const installRuntime = async () => {
     clearInterval(installProgressTimer)
     installProgressTimer = null
     installing.value = false
+  }
+}
+
+const startLocalRuntime = async () => {
+  restarting.value = true
+  try {
+    await axios.post('/api/codex/start')
+    ElMessage.success('本机 Codex CLI 已验证并启动')
+    await load()
+  } catch (error) {
+    ElMessage.error(error?.response?.data?.detail || error?.message || '本机 Codex CLI 无法使用')
+    await load()
+  } finally {
+    restarting.value = false
   }
 }
 

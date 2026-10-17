@@ -78,6 +78,63 @@ def managed_runtime_installed() -> bool:
     return _existing_codex_path() is not None
 
 
+def _local_codex_candidates() -> list[Path]:
+    """只选原生 exe；npm 的 cmd/ps1 启动脚本不能直接交给 SDK。"""
+    platform_name, triple = _target()
+    prefixes = []
+    if os.environ.get("APPDATA"):
+        prefixes.append(Path(os.environ["APPDATA"]) / "npm")
+    if os.environ.get("NPM_CONFIG_PREFIX"):
+        prefixes.append(Path(os.environ["NPM_CONFIG_PREFIX"]))
+    prefixes.extend(Path(entry.strip().strip('"')) for entry in os.environ.get("PATH", "").split(os.pathsep) if entry.strip())
+    package_suffix = Path("vendor") / triple / "bin" / "codex.exe"
+    candidates = []
+    for prefix in prefixes:
+        package_dir = prefix / "node_modules" / "@openai"
+        candidates.extend((
+            package_dir / "codex" / "node_modules" / "@openai" / f"codex-{platform_name}" / package_suffix,
+            package_dir / f"codex-{platform_name}" / package_suffix,
+        ))
+    candidates.extend(prefix / "codex.exe" for prefix in prefixes)
+    if os.environ.get("LOCALAPPDATA"):
+        desktop_bin = Path(os.environ["LOCALAPPDATA"]) / "OpenAI" / "Codex" / "bin"
+        candidates.extend(desktop_bin.glob("*/codex.exe"))
+    seen = set()
+    found = []
+    for candidate in candidates:
+        key = os.path.normcase(os.path.abspath(candidate))
+        if key not in seen and candidate.is_file():
+            seen.add(key)
+            found.append(candidate)
+    return found
+
+
+def local_runtime_detected() -> bool:
+    """状态接口只探测文件，不在页面刷新时启动外部程序。"""
+    return bool(_local_codex_candidates())
+
+
+def _verify_local_candidate(binary: Path) -> None:
+    result = subprocess.run(
+        [str(binary), "--version"], capture_output=True, text=True, timeout=15,
+        check=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    match = re.fullmatch(r"codex-cli ([^\s]+)", result.stdout.strip())
+    if match is None:
+        raise RuntimeError("本机 Codex CLI 未返回可识别的版本")
+    from openai_codex._runtime_requirements import require_runtime_version
+    from openai_codex.client import CodexClient, CodexConfig
+
+    require_runtime_version(match.group(1))
+    # SDK 握手是兼容性门禁；仅能执行 --version 的旧 CLI 不能直接启用。
+    client = CodexClient(config=CodexConfig(codex_bin=str(binary), experimental_api=True))
+    try:
+        client.start()
+        client.initialize()
+    finally:
+        client.close()
+
+
 def _official_url(url: str) -> str:
     parsed = urlparse(url)
     if (parsed.scheme != "https" or parsed.hostname != _REGISTRY_HOST
@@ -250,15 +307,42 @@ def _verify_app_server(binary: Path) -> None:
                 process.wait(timeout=5)
 
 
-def ensure_managed_codex(progress: Optional[ProgressCallback] = None) -> Path:
-    """校验已有程序，或下载到临时目录后原子切换到 Codebot 用户目录。"""
+def resolve_codex_runtime() -> Path:
+    """只复用已有的兼容 CLI；普通 Codex 请求绝不触发下载。"""
+    installed = _existing_codex_path()
+    failure = ""
+    if installed:
+        try:
+            _verify_binary(installed)
+            return installed
+        except Exception as exc:
+            # 受管安装损坏时仍可尝试用户本机其他 CLI。
+            failure = str(exc)
+    for candidate in _local_codex_candidates():
+        try:
+            _verify_local_candidate(candidate)
+            return candidate
+        except Exception as exc:
+            # 下一个本机候选仍可能可用。
+            failure = str(exc)
+            continue
+    if failure:
+        raise CodexInstallError(
+            f"检测到 Codex CLI，但版本或 App Server 不兼容：{failure}。"
+            "请更新本机 CLI，或到设置 → Codex 点击一键下载。"
+        )
+    raise CodexInstallError("未找到兼容的本机 Codex CLI。请到设置 → Codex 点击一键下载，或指定自定义 CLI。")
+
+
+def install_managed_codex(progress: Optional[ProgressCallback] = None) -> Path:
+    """仅供用户主动操作：校验已有受管程序或下载官方固定版本。"""
     try:
-        return _ensure_managed_codex(progress)
+        return _install_managed_codex(progress)
     except Exception as exc:
-        raise CodexInstallError(f"Codex CLI 安装失败：{exc}。请检查网络或到设置 → Codex 重试。") from exc
+        raise CodexInstallError(f"Codex CLI 安装失败：{exc}。请检查网络并在设置 → Codex 重试。") from exc
 
 
-def _ensure_managed_codex(progress: Optional[ProgressCallback]) -> Path:
+def _install_managed_codex(progress: Optional[ProgressCallback]) -> Path:
     installed = _existing_codex_path()
     if installed:
         _verify_binary(installed)

@@ -12,7 +12,7 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -131,15 +131,16 @@ class CodexInstallerTests(unittest.TestCase):
             with (
                 patch.object(settings, "BASE_DIR", Path(temporary)),
                 patch.object(installer, "_target", return_value=("win32-x64", "x86_64-pc-windows-msvc")),
+                patch.object(installer, "_local_codex_candidates", return_value=[]),
                 patch.object(installer, "_package_metadata", return_value=("https://registry.npmjs.org/test", b"0" * 64)) as metadata,
                 patch.object(installer, "_download_verified"),
                 patch.object(installer, "_extract_archive", side_effect=fake_extract),
                 patch.object(installer, "_verify_binary") as verify,
                 patch.object(installer, "_verify_app_server") as verify_server,
             ):
-                first = installer.ensure_managed_codex()
+                first = installer.install_managed_codex()
                 self.assertEqual(first.read_bytes(), b"verified")
-                self.assertEqual(installer.ensure_managed_codex(), first)
+                self.assertEqual(installer.install_managed_codex(), first)
                 self.assertEqual(metadata.call_count, 1)
                 self.assertEqual(verify.call_count, 2)
                 verify_server.assert_called_once()
@@ -158,9 +159,55 @@ class CodexInstallerTests(unittest.TestCase):
                 patch.object(installer, "_package_metadata") as metadata,
             ):
                 self.assertTrue(installer.managed_runtime_installed())
-                self.assertEqual(installer.ensure_managed_codex(), nested)
+                self.assertEqual(installer.resolve_codex_runtime(), nested)
                 verify.assert_called_once_with(nested)
                 metadata.assert_not_called()
+
+    def test_reuses_compatible_local_cli_without_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "npm" / "codex.exe"
+            binary.parent.mkdir()
+            binary.write_bytes(b"local")
+            with (
+                patch.object(settings, "BASE_DIR", Path(temporary)),
+                patch.object(installer, "_target", return_value=("win32-x64", "x86_64-pc-windows-msvc")),
+                patch.object(installer, "_local_codex_candidates", return_value=[binary]),
+                patch.object(installer, "_verify_local_candidate") as verify,
+                patch.object(installer, "_package_metadata") as metadata,
+            ):
+                self.assertEqual(installer.resolve_codex_runtime(), binary)
+                verify.assert_called_once_with(binary)
+                metadata.assert_not_called()
+
+    def test_incompatible_local_candidate_does_not_hide_compatible_one(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            first = Path(temporary) / "first.exe"
+            second = Path(temporary) / "second.exe"
+            with (
+                patch.object(settings, "BASE_DIR", Path(temporary)),
+                patch.object(installer, "_target", return_value=("win32-x64", "x86_64-pc-windows-msvc")),
+                patch.object(installer, "_local_codex_candidates", return_value=[first, second]),
+                patch.object(installer, "_verify_local_candidate", side_effect=[RuntimeError("old version"), None]),
+                patch.object(installer, "_package_metadata") as metadata,
+            ):
+                self.assertEqual(installer.resolve_codex_runtime(), second)
+                metadata.assert_not_called()
+
+    def test_missing_or_incompatible_local_cli_never_downloads_automatically(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = Path(temporary) / "old.exe"
+            with (
+                patch.object(settings, "BASE_DIR", Path(temporary)),
+                patch.object(installer, "_target", return_value=("win32-x64", "x86_64-pc-windows-msvc")),
+                patch.object(installer, "_local_codex_candidates", return_value=[candidate]),
+                patch.object(installer, "_verify_local_candidate", side_effect=RuntimeError("old version")),
+                patch.object(installer, "_package_metadata") as metadata,
+                patch.object(installer, "_open_official") as network,
+            ):
+                with self.assertRaisesRegex(installer.CodexInstallError, "一键下载"):
+                    installer.resolve_codex_runtime()
+                metadata.assert_not_called()
+                network.assert_not_called()
 
     def test_packaged_runtime_uses_managed_binary_and_skips_first_launch_prewarm(self):
         runtime = object.__new__(CodexRuntime)
@@ -171,23 +218,35 @@ class CodexInstallerTests(unittest.TestCase):
         with (
             patch.object(CodexRuntime, "_sdk_imports", return_value={"CodexConfig": lambda **options: options}),
             patch.object(installer, "uses_managed_runtime", return_value=True),
-            patch.object(installer, "ensure_managed_codex", return_value=expected) as ensure,
+            patch.object(installer, "resolve_codex_runtime", return_value=expected) as resolve,
         ):
             config = runtime._build_sdk_config()
         self.assertEqual(config["codex_bin"], str(expected))
-        ensure.assert_called_once()
+        resolve.assert_called_once()
 
         async def verify_prewarm():
             with (
                 patch.object(app_config.codex, "enabled", True),
                 patch.object(app_config.codex, "auto_start", True),
-                patch.object(codex_routes.codex_runtime, "status", return_value={"runtimeInstallRequired": True}),
+                patch.object(codex_routes.codex_runtime, "status", return_value={"runtimeInstallRequired": False, "runtimeCheckDeferred": True}),
                 patch.object(codex_routes.codex_runtime, "start") as start,
             ):
                 self.assertFalse(await codex_routes.prepare_if_enabled())
                 start.assert_not_called()
 
         asyncio.run(verify_prewarm())
+
+    def test_manual_install_endpoint_is_the_only_install_action(self):
+        async def verify():
+            with (
+                patch.object(codex_routes.codex_runtime, "install_managed_runtime", new_callable=AsyncMock) as install,
+                patch.object(codex_routes.codex_runtime, "status", return_value={"running": True}),
+            ):
+                response = await codex_routes.install_codex_runtime()
+                self.assertTrue(response["success"])
+                install.assert_awaited_once()
+
+        asyncio.run(verify())
 
 
 if __name__ == "__main__":

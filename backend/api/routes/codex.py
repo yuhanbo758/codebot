@@ -26,8 +26,9 @@ class CodexLoginRequest(BaseModel):
 async def prepare_if_enabled() -> bool:
     """供 FastAPI lifespan 预热；禁用或关闭自动启动时保持惰性。"""
     if app_config.codex.enabled and app_config.codex.auto_start:
-        if codex_runtime.status()["runtimeInstallRequired"]:
-            # 新安装的 Windows 轻量包只在用户进入 Codex 时下载 CLI。
+        status = codex_runtime.status()
+        if status["runtimeInstallRequired"] or status["runtimeCheckDeferred"]:
+            # 本机 CLI 留到用户使用 Codex 时验证，启动时不执行外部程序。
             return False
         await codex_runtime.start()
         return True
@@ -44,6 +45,16 @@ async def start_codex():
     try:
         await codex_runtime.start()
         return {"success": True, "message": "Codex App Server 已启动", "data": codex_runtime.status()}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/runtime/install")
+async def install_codex_runtime():
+    """只响应设置页的一键下载操作，不参与启动和模型目录读取。"""
+    try:
+        await codex_runtime.install_managed_runtime()
+        return {"success": True, "message": "Codex CLI 已安装", "data": codex_runtime.status()}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

@@ -2940,8 +2940,10 @@ const loadModels = async (options = {}) => {
     if (useCodex && !useRakazo) {
       try {
         const runtimeStatus = (await axios.get('/api/codex/status')).data?.data
-        if (runtimeStatus?.runtimeInstallRequired) {
-          ElMessage.info('首次使用 Codex，正在下载并校验官方 CLI；OpenCode 对话不受影响。')
+        if (runtimeStatus?.runtimeCheckDeferred) {
+          ElMessage.info('正在验证本机 Codex CLI；如不兼容，请到设置 → Codex 手动下载。')
+        } else if (runtimeStatus?.runtimeInstallRequired) {
+          ElMessage.info('未找到本机 Codex CLI。请到设置 → Codex 点击一键下载。')
         }
       } catch { /* 模型 API 会给出具体错误。 */ }
       try {

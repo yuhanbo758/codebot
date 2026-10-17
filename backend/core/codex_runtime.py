@@ -86,6 +86,7 @@ class CodexRuntime:
         self._last_error = ""
         self._started_at = 0.0
         self._start_lock = asyncio.Lock()
+        self._install_lock = asyncio.Lock()
         self._state_lock = threading.RLock()
         self._pending: Dict[str, PendingCodexRequest] = {}
         self._active_by_turn: Dict[str, ActiveCodexTurn] = {}
@@ -97,6 +98,7 @@ class CodexRuntime:
         # 不复用 LAN Token，也不持久化到 config.json。
         self._bridge_token = secrets.token_urlsafe(32)
         self._install_progress: Dict[str, Any] = {"installing": False, "downloadedBytes": 0, "totalBytes": 0}
+        self._runtime_origin = ""
         self._init_db()
 
     # ------------------------------------------------------------------
@@ -394,21 +396,18 @@ class CodexRuntime:
             configured_bin = str(app_config.codex.codex_bin or "").strip()
             if not configured_bin:
                 raise ValueError("已选择自定义 Codex runtime，但 codex_bin 为空")
+            self._runtime_origin = "custom"
         else:
-            from utils.codex_installer import ensure_managed_codex, uses_managed_runtime
+            from utils.codex_installer import resolve_codex_runtime, uses_managed_runtime
 
             if uses_managed_runtime():
-                # Windows 正式包不再携带 CLI；首次调用 Codex 时下载固定的官方版本。
-                self._install_progress = {"installing": True, "downloadedBytes": 0, "totalBytes": 0}
-                try:
-                    def update_progress(downloaded: int, total: int) -> None:
-                        self._install_progress = {
-                            "installing": True, "downloadedBytes": downloaded, "totalBytes": total,
-                        }
-
-                    configured_bin = str(ensure_managed_codex(progress=update_progress))
-                finally:
-                    self._install_progress = {**self._install_progress, "installing": False}
+                # Windows 正式包仅验证现有程序；下载必须由设置页显式触发。
+                configured_bin = str(resolve_codex_runtime())
+                managed_root = (settings.BASE_DIR / "codex-runtime").resolve()
+                self._runtime_origin = ("managed" if Path(configured_bin).resolve().is_relative_to(managed_root)
+                                        else "local")
+            else:
+                self._runtime_origin = "bundled"
 
         env = {
             # 即使当前请求来自 loopback 也传入 Token，未来收紧本机鉴权时无需改协议。
@@ -541,6 +540,28 @@ class CodexRuntime:
         await self.close()
         await self.start()
 
+    async def install_managed_runtime(self) -> None:
+        """用户主动安装 Windows 固定 CLI，安装成功后切换 App Server。"""
+        from utils.codex_installer import install_managed_codex, uses_managed_runtime
+
+        if app_config.codex.runtime_source != "bundled" or not uses_managed_runtime():
+            raise RuntimeError("当前运行时不支持一键下载 Codex CLI")
+        async with self._install_lock:
+            if self._active_by_conversation:
+                raise RuntimeError("Codex 有正在运行的对话，请完成或停止后再安装。")
+            self._install_progress = {"installing": True, "downloadedBytes": 0, "totalBytes": 0}
+            try:
+                def update_progress(downloaded: int, total: int) -> None:
+                    self._install_progress = {
+                        "installing": True, "downloadedBytes": downloaded, "totalBytes": total,
+                    }
+
+                await asyncio.to_thread(install_managed_codex, progress=update_progress)
+            finally:
+                self._install_progress = {**self._install_progress, "installing": False}
+            if app_config.codex.enabled:
+                await self.restart()
+
     async def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         await self.start()
         client = self._client
@@ -556,10 +577,14 @@ class CodexRuntime:
             raise
 
     def status(self) -> Dict[str, Any]:
-        from utils.codex_installer import CODEX_RUNTIME_VERSION, managed_runtime_installed, uses_managed_runtime
+        from utils.codex_installer import (CODEX_RUNTIME_VERSION, local_runtime_detected,
+                                           managed_runtime_installed, uses_managed_runtime)
 
-        install_required = (app_config.codex.runtime_source == "bundled"
-                            and uses_managed_runtime() and not managed_runtime_installed())
+        managed_installed = managed_runtime_installed() if uses_managed_runtime() else False
+        managed_missing = (app_config.codex.runtime_source == "bundled"
+                           and uses_managed_runtime() and not managed_installed)
+        local_detected = managed_missing and local_runtime_detected()
+        install_required = managed_missing and not local_detected
         protocol_counts: Dict[str, int] = {}
         for route in self._opencode_models.values():
             protocol_counts[route.upstream_protocol] = protocol_counts.get(route.upstream_protocol, 0) + 1
@@ -581,6 +606,10 @@ class CodexRuntime:
             "running": self._client is not None,
             "runtimeSource": app_config.codex.runtime_source,
             "runtimeInstallRequired": install_required,
+            "runtimeCheckDeferred": local_detected and self._client is None,
+            "localRuntimeDetected": local_detected,
+            "managedRuntimeInstalled": managed_installed,
+            "runtimeOrigin": self._runtime_origin if self._client is not None else "",
             "managedRuntimeVersion": CODEX_RUNTIME_VERSION if uses_managed_runtime() else "",
             "runtimeDownload": dict(self._install_progress),
             "codexBin": app_config.codex.codex_bin if app_config.codex.runtime_source == "custom" else "",
