@@ -704,26 +704,48 @@ class ModelRouteRegistry:
             if not refresh_token:
                 raise ValueError("OpenCode OpenAI OAuth 已过期且没有 refresh token，请先在 OpenCode 中重新登录")
 
-            token_request = Request(
-                f"{_OPENAI_OAUTH_ISSUER}/oauth/token",
-                data=urlencode({
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": _OPENAI_OAUTH_CLIENT_ID,
-                }).encode("utf-8"),
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                method="POST",
-            )
-            try:
-                with urlopen(token_request, timeout=20) as response:
-                    raw = response.read(512 * 1024)
-                tokens = json.loads(raw.decode("utf-8"))
-            except HTTPError as exc:
-                raise ValueError(
-                    f"OpenCode OpenAI OAuth 刷新失败（HTTP {exc.code}），请在 OpenCode 中重新登录"
-                ) from None
-            except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-                raise ValueError(f"OpenCode OpenAI OAuth 刷新失败：{type(exc).__name__}") from None
+            for attempt in range(2):
+                token_request = Request(
+                    f"{_OPENAI_OAUTH_ISSUER}/oauth/token",
+                    data=urlencode({
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": _OPENAI_OAUTH_CLIENT_ID,
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                try:
+                    with urlopen(token_request, timeout=20) as response:
+                        raw = response.read(512 * 1024)
+                    tokens = json.loads(raw.decode("utf-8"))
+                    break
+                except HTTPError as exc:
+                    if exc.code == 401 and attempt == 0:
+                        # OpenCode CLI/Server 可能在本进程请求期间已轮换 refresh token。
+                        # 只在官方凭据文件确实变化时重试一次，避免把真实失效隐藏掉。
+                        latest = self.load_opencode_credentials().get(route.opencode_provider) or {}
+                        latest_refresh = str(latest.get("refresh") or "").strip()
+                        latest_access = str(latest.get("access") or "").strip()
+                        try:
+                            latest_expires = int(latest.get("expires") or 0)
+                        except (TypeError, ValueError):
+                            latest_expires = 0
+                        if latest_access != access and latest_expires > int(time.time() * 1000) + _OAUTH_REFRESH_SKEW_MS:
+                            self.discover_sync(force=True)
+                            refreshed = self.get(route_id)
+                            if refreshed is not None:
+                                return refreshed
+                        if latest_refresh and latest_refresh != refresh_token:
+                            refresh_token = latest_refresh
+                            access = latest_access
+                            account_id = str(latest.get("accountId") or account_id).strip()
+                            continue
+                    raise ValueError(
+                        f"OpenCode OpenAI OAuth 刷新失败（HTTP {exc.code}），请在 OpenCode 中重新登录"
+                    ) from None
+                except (URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError(f"OpenCode OpenAI OAuth 刷新失败：{type(exc).__name__}") from None
             if not isinstance(tokens, dict):
                 raise ValueError("OpenCode OpenAI OAuth 刷新返回结构无效")
             new_access = str(tokens.get("access_token") or "").strip()

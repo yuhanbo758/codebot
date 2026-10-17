@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 import secrets
@@ -91,6 +92,7 @@ class CodexRuntime:
         self._active_by_conversation: Dict[str, ActiveCodexTurn] = {}
         self._opencode_models: Dict[str, OpenCodeResponsesModel] = {}
         self._opencode_incompatible: Dict[str, str] = {}
+        self._oauth_issues: Dict[str, tuple[str, str]] = {}
         # 该随机令牌仅在当前后端进程与其子 Codex App Server 之间流转，
         # 不复用 LAN Token，也不持久化到 config.json。
         self._bridge_token = secrets.token_urlsafe(32)
@@ -220,6 +222,43 @@ class CodexRuntime:
         self._opencode_incompatible = incompatible
         await self.start()
         return True
+
+    @staticmethod
+    def _oauth_fingerprint(route: OpenCodeResponsesModel) -> str:
+        """只在内存中比较凭据版本，不在状态接口暴露 token。"""
+        raw = f"{route.api_key}\0{route.oauth_refresh_token}\0{route.oauth_expires_at_ms}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _oauth_issue_for(self, route: OpenCodeResponsesModel) -> str:
+        issue = self._oauth_issues.get(route.opencode_provider)
+        if issue and issue[0] == self._oauth_fingerprint(route):
+            return issue[1]
+        self._oauth_issues.pop(route.opencode_provider, None)
+        return ""
+
+    async def _ensure_oauth_ready(self, route: OpenCodeResponsesModel) -> None:
+        """发送前验证 OpenCode OAuth；失效时直接给用户登录指引。"""
+        if route.credential_mode != "opencode_oauth":
+            return
+        cached_issue = self._oauth_issue_for(route)
+        if cached_issue:
+            raise ValueError(cached_issue)
+        try:
+            refreshed = await asyncio.to_thread(
+                model_route_registry.ensure_fresh_credentials, route.route_id
+            )
+        except ValueError as exc:
+            detail = str(exc)
+            if "HTTP 401" in detail or "没有 refresh token" in detail:
+                detail += "。请执行 opencode auth login --provider openai 重新登录，再回到 Codebot 刷新模型。Codex CLI 登录与此连接相互独立"
+                self._oauth_issues[route.opencode_provider] = (
+                    self._oauth_fingerprint(route), detail
+                )
+            raise ValueError(detail) from exc
+        self._oauth_issues.pop(route.opencode_provider, None)
+        if self._route_signature(refreshed) != self._route_signature(route):
+            # 刷新可能更新账户 header 或 provider ID；在开始 turn 前同步进程配置。
+            await self._refresh_opencode_models_if_changed()
 
     def _resolve_model_route(
         self,
@@ -530,6 +569,15 @@ class CodexRuntime:
             "openCodeResponsesModels": len(self._opencode_models),
             "openCodeBridgedModels": sum(1 for route in self._opencode_models.values() if route.uses_bridge),
             "openCodeIncompatibleModels": len(self._opencode_incompatible),
+            "openCodeAuthIssues": [
+                {"provider": provider, "message": issue[1]}
+                for provider, issue in self._oauth_issues.items()
+                if any(
+                    route.opencode_provider == provider
+                    and self._oauth_fingerprint(route) == issue[0]
+                    for route in self._opencode_models.values()
+                )
+            ],
             "openCodeProtocolCoverage": protocol_coverage,
         }
 
@@ -1113,6 +1161,11 @@ class CodexRuntime:
         interactive: bool = True,
     ) -> AsyncIterator[Dict[str, Any]]:
         await self.start()
+        if model and "/" in model:
+            await self._refresh_opencode_models_if_changed()
+            route = self._opencode_models.get(model)
+            if route is not None:
+                await self._ensure_oauth_ready(route)
         codex_model, model_provider, model_config = self._resolve_model_route(model)
         route_instructions, route_data = self._model_route_context(model, codex_model, model_provider)
         effective_developer_instructions = (
@@ -1320,6 +1373,16 @@ class CodexRuntime:
     async def models(self) -> List[Dict[str, Any]]:
         await self.start()
         await self._refresh_opencode_models_if_changed()
+        # 一个 OAuth Provider 的模型共用凭据；目录刷新时只验证一次。
+        oauth_routes: Dict[str, OpenCodeResponsesModel] = {}
+        for route in self._opencode_models.values():
+            if route.credential_mode == "opencode_oauth":
+                oauth_routes.setdefault(route.opencode_provider, route)
+        for route in oauth_routes.values():
+            try:
+                await self._ensure_oauth_ready(route)
+            except ValueError:
+                pass  # 原生目录继续可用；失效路由在下方附上登录原因。
         response = await self._call("model_list", False)
         native_models: List[Dict[str, Any]] = []
         seen: set[str] = set()
@@ -1335,7 +1398,10 @@ class CodexRuntime:
             native_models.append(model)
             seen.add(model_id)
         opencode_models = [
-            route.public_model()
+            route.public_model(
+                compatibility_status="authorization_required",
+                incompatibility_reason=issue,
+            ) if (issue := self._oauth_issue_for(route)) else route.public_model()
             for model_id, route in sorted(self._opencode_models.items())
             if model_id not in seen
         ]

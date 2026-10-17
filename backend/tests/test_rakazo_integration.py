@@ -74,6 +74,36 @@ def make_route(
 
 
 class ModelRouteRegistryTests(unittest.TestCase):
+    def test_openai_oauth_refresh_retries_only_after_external_token_rotation(self):
+        from dataclasses import replace
+        from io import BytesIO
+        from urllib.error import HTTPError
+        from urllib.parse import parse_qs
+
+        registry = ModelRouteRegistry()
+        route = make_route(route_id="openai/gpt-6-luna", credential_mode="opencode_oauth")
+        renewed = replace(route, api_key="fresh-access", oauth_expires_at_ms=9999999999999)
+        credentials = [
+            {"openai": {"type": "oauth", "access": "old-access", "refresh": "old-refresh", "expires": 1}},
+            {"openai": {"type": "oauth", "access": "rotated-access", "refresh": "rotated-refresh", "expires": 1}},
+        ]
+        rejected = HTTPError("https://auth.openai.com/oauth/token", 401, "Unauthorized", None, None)
+        refreshed = BytesIO(b'{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}')
+        with (
+            patch.object(registry, "get", side_effect=[route, renewed]),
+            patch.object(registry, "load_opencode_credentials", side_effect=credentials),
+            patch.object(registry, "discover_sync"),
+            patch("core.model_route_registry.urlopen", side_effect=[rejected, refreshed, BytesIO(b"{}")]) as send,
+        ):
+            result = registry.ensure_fresh_credentials(route.route_id)
+
+        self.assertEqual(result, renewed)
+        first = parse_qs(send.call_args_list[0].args[0].data.decode("utf-8"))
+        second = parse_qs(send.call_args_list[1].args[0].data.decode("utf-8"))
+        self.assertEqual(first["refresh_token"], ["old-refresh"])
+        self.assertEqual(second["refresh_token"], ["rotated-refresh"])
+        self.assertEqual(send.call_count, 3)
+
     def test_full_catalog_matches_opencode_and_unknown_protocol_fails_closed(self):
         payload = {
             "connected": ["known", "oauth"],

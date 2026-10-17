@@ -88,6 +88,19 @@
       <div><span>活跃对话</span><code>{{ status?.activeConversations?.length ?? 0 }}</code></div>
     </div>
     <el-alert v-if="status?.lastError" class="status-alert" :title="status.lastError" type="error" show-icon :closable="false" />
+    <el-alert v-if="accountChecked && !account?.account && !account?.type && !account?.email" class="status-alert" title="Codex CLI 未确认登录" description="请使用上方 ChatGPT 浏览器登录或设备码登录；登录完成后点击刷新状态。" type="warning" show-icon :closable="false" />
+    <el-alert v-if="accountError" class="status-alert" title="Codex 账号状态读取失败" :description="accountError" type="warning" show-icon :closable="false" />
+    <el-alert v-if="modelsError" class="status-alert" title="Codex 模型目录读取失败" :description="modelsError" type="error" show-icon :closable="false" />
+    <el-alert
+      v-for="issue in status?.openCodeAuthIssues || []"
+      :key="issue.provider"
+      class="status-alert"
+      :title="`${issue.provider} 连接需要重新登录`"
+      :description="issue.message"
+      type="warning"
+      show-icon
+      :closable="false"
+    />
     <el-collapse v-if="account || models.length" class="raw-detail">
       <el-collapse-item title="账号、用量与速率限制详情" name="account">
         <pre>{{ JSON.stringify(account, null, 2) }}</pre>
@@ -126,7 +139,10 @@ const loginLoading = ref(false)
 const logoutLoading = ref(false)
 const status = ref(null)
 const account = ref(null)
+const accountChecked = ref(false)
+const accountError = ref('')
 const models = ref([])
+const modelsError = ref('')
 const loginHint = ref(null)
 const apiKeyDialog = ref(false)
 const apiKey = ref('')
@@ -181,6 +197,9 @@ const openExternal = async (url) => {
 
 const load = async () => {
   loading.value = true
+  accountChecked.value = false
+  accountError.value = ''
+  modelsError.value = ''
   try {
     const cfgRes = await axios.get('/api/config/codex')
     form.value = { ...form.value, ...(cfgRes.data?.data || {}), skill_dirs: cfgRes.data?.data?.skill_dirs || [] }
@@ -193,6 +212,10 @@ const load = async () => {
       ])
       account.value = accountRes.status === 'fulfilled' ? accountRes.value.data?.data || null : null
       models.value = modelsRes.status === 'fulfilled' ? modelsRes.value.data?.data || [] : []
+      accountChecked.value = accountRes.status === 'fulfilled'
+      if (accountRes.status === 'rejected') accountError.value = accountRes.reason?.response?.data?.detail || accountRes.reason?.message || '请检查 Codex 登录状态。'
+      if (modelsRes.status === 'rejected') modelsError.value = modelsRes.reason?.response?.data?.detail || modelsRes.reason?.message || '请重启 App Server 后重试。'
+      status.value = (await axios.get('/api/codex/status')).data?.data || status.value
     }
   } catch (error) {
     ElMessage.error(error?.response?.data?.detail || '加载 Codex 设置失败')

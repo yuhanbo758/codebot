@@ -183,6 +183,7 @@
                     :label="model.name"
                     :value="model.id"
                     :disabled="model.selectable === false || model.runnable === false"
+                    :title="model.incompatibilityReason || ''"
                   >
                     <span class="model-option-name">{{ model.model }}</span>
                     <span class="model-option-provider">{{ modelProviderLabel(model) }}</span>
@@ -200,6 +201,7 @@
                       :label="model.name"
                       :value="model.id"
                       :disabled="model.selectable === false || model.runnable === false"
+                      :title="model.incompatibilityReason || ''"
                     >
                       <span class="model-option-name">{{ model.model }}</span>
                       <span class="model-option-provider">{{ modelProviderLabel(model) }}</span>
@@ -652,6 +654,7 @@
                       :label="m.name"
                       :value="m.id"
                       :disabled="m.runnable === false"
+                      :title="m.incompatibilityReason || ''"
                     >
                       <span class="model-option-name">{{ m.model }}</span>
                       <span class="model-option-provider">{{ modelProviderLabel(m) }}</span>
@@ -669,6 +672,7 @@
                         :label="m.name"
                         :value="m.id"
                         :disabled="m.runnable === false"
+                        :title="m.incompatibilityReason || ''"
                       >
                         <span class="model-option-name">{{ m.model }}</span>
                         <span class="model-option-provider">{{ modelProviderLabel(m) }}</span>
@@ -2279,7 +2283,10 @@ const modelProviderLabel = (model) => {
   if (isRakazoConversation.value) {
     return `${model?.provider || '模型'} · ${rakazoModelStatusLabel(model?.compatibilityStatus, model?.probeState)}`
   }
-  if (model?.runnable === false) return `${model?.provider || '模型'} · 当前执行器不可用`
+  if (model?.runnable === false) {
+    if (model?.compatibilityStatus === 'authorization_required') return `${model?.provider || '模型'} · 连接需重新登录`
+    return `${model?.provider || '模型'} · 当前执行器不可用`
+  }
   if (model?.source === 'opencode') {
     const protocol = String(model?.protocol || '')
     const transport = protocol === 'chat-completions-bridge'
@@ -2919,6 +2926,7 @@ const loadConversations = async (autoSelect = false) => {
 
 // 加载可用模型列表
 let modelLoadSequence = 0
+let lastCodexModelIssue = ''
 const loadModels = async (options = {}) => {
   const sequence = ++modelLoadSequence
   const manual = Boolean(options?.manual)
@@ -3014,6 +3022,12 @@ const loadModels = async (options = {}) => {
       }
     }
     availableModels.value = newList
+    if (useCodex && !useRakazo) {
+      const selectedIssue = newList.find(m => m.id === saved && m.runnable === false && m.incompatibilityReason)
+      const issue = selectedIssue?.incompatibilityReason || ''
+      if (issue && issue !== lastCodexModelIssue) ElMessage.warning(issue)
+      lastCodexModelIssue = issue
+    }
     if (manual && res.data?.message) {
       ElMessage.warning(res.data.message)
     }

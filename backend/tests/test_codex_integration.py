@@ -312,6 +312,71 @@ class CodexRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([model["source"] for model in models], ["codex", "opencode"])
         self.assertTrue(models[1]["runnable"])
 
+    async def test_expired_opencode_oauth_disables_only_shared_routes_and_explains_login(self):
+        route = ModelRoute(
+            display_id="openai/gpt-6-luna", display_name="GPT-6 Luna",
+            opencode_provider="openai", opencode_model="gpt-6-luna",
+            codex_provider="codebot_openai", codex_model="gpt-6-luna",
+            base_url="https://chatgpt.com/backend-api/codex", env_key="",
+            api_key="expired-access", upstream_protocol="responses_proxy",
+            credential_mode="opencode_oauth", connected=True,
+            oauth_refresh_token="expired-refresh", oauth_expires_at_ms=1,
+        )
+        self.runtime._opencode_models = {route.display_id: route}
+        with (
+            patch.object(self.runtime, "start", new=AsyncMock()),
+            patch.object(self.runtime, "_refresh_opencode_models_if_changed", new=AsyncMock()),
+            patch.object(self.runtime, "_call", new=AsyncMock(return_value=SimpleNamespace(data=[
+                {"id": "gpt-6-luna", "displayName": "GPT-6 Luna"},
+            ]))),
+            patch.object(model_route_registry, "ensure_fresh_credentials", side_effect=ValueError(
+                "OpenCode OpenAI OAuth 刷新失败（HTTP 401），请在 OpenCode 中重新登录"
+            )) as refresh,
+        ):
+            models = await self.runtime.models()
+            self.assertTrue(models[0]["runnable"])
+            self.assertFalse(models[1]["runnable"])
+            self.assertIn("opencode auth login --provider openai", models[1]["incompatibilityReason"])
+            self.assertEqual(len(self.runtime.status()["openCodeAuthIssues"]), 1)
+            # 相同失效凭据不反复使用已经被拒绝的旋转 refresh token。
+            await self.runtime.models()
+            self.assertEqual(refresh.call_count, 1)
+            with self.assertRaisesRegex(ValueError, "opencode auth login --provider openai"):
+                async for _ in self.runtime.run_turn_stream(
+                    message="test", conversation_id=9, model=route.display_id
+                ):
+                    pass
+            self.assertEqual(refresh.call_count, 1)
+
+    async def test_opencode_relogin_clears_cached_auth_issue(self):
+        from dataclasses import replace
+
+        route = ModelRoute(
+            display_id="openai/gpt-6-luna", display_name="GPT-6 Luna",
+            opencode_provider="openai", opencode_model="gpt-6-luna",
+            codex_provider="codebot_openai", codex_model="gpt-6-luna",
+            base_url="https://chatgpt.com/backend-api/codex", env_key="",
+            api_key="expired-access", upstream_protocol="responses_proxy",
+            credential_mode="opencode_oauth", connected=True,
+            oauth_refresh_token="expired-refresh", oauth_expires_at_ms=1,
+        )
+        self.runtime._opencode_models = {route.display_id: route}
+        self.runtime._oauth_issues["openai"] = (
+            self.runtime._oauth_fingerprint(route), "OpenCode 需要重新登录"
+        )
+        renewed = replace(route, api_key="new-access", oauth_refresh_token="new-refresh",
+                          oauth_expires_at_ms=9999999999999)
+        self.runtime._opencode_models[route.display_id] = renewed
+        with (
+            patch.object(self.runtime, "start", new=AsyncMock()),
+            patch.object(self.runtime, "_refresh_opencode_models_if_changed", new=AsyncMock()),
+            patch.object(self.runtime, "_call", new=AsyncMock(return_value=SimpleNamespace(data=[]))),
+            patch.object(model_route_registry, "ensure_fresh_credentials", return_value=renewed),
+        ):
+            models = await self.runtime.models()
+        self.assertTrue(models[0]["runnable"])
+        self.assertEqual(self.runtime.status()["openCodeAuthIssues"], [])
+
     async def test_revert_uses_first_removed_turn_id_with_new_codex_protocol(self):
         from openai_codex.generated.v2_all import ThreadRevertParams
 

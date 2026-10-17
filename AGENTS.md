@@ -307,6 +307,8 @@ build.bat
 
 ## 变更日志
 
+2026-10-17：Codex 原生账号与 OpenCode Provider 认证分别诊断；Codex 模型目录和发送前验证 OpenCode OpenAI OAuth，刷新令牌被拒绝时仅将该连接的模型标记为需重新登录，并在聊天选择器与 Codex 设置显示具体操作。共享路由遇到其他 OpenCode 进程轮换 refresh token 时只读取官方凭据文件并重试一次，避免误判失效。已验证本机随包 Codex CLI 0.158.0 及 Codebot SDK 原生 GPT-6 对话成功、OpenCode CLI 同一 OAuth 连接刷新返回 401；不把认证失效归咎于打包或 Codex CLI 升级。README 同步，无新依赖或数据库结构变更。
+
 2026-09-28：Codex 模型目录恢复以随包 Codex CLI 的原生 `model/list` 为主，SDK/runtime 升级到 0.158.0 以提供原生 GPT-6；OpenCode 认证模型继续作为兼容扩展。为 OpenRouter 官方 AI SDK provider 增加 Chat Completions 协议映射，真实免费模型经桥返回文本。桌面 Codex 设置新增一键升级：从官方 npm registry 安装版本化 CLI 到 Codebot 用户目录，校验原生程序版本后切换运行时并重启，失败恢复原配置；不修改全局 CLI。打包门禁核对随包 CLI 与依赖版本一致；README 同步。无数据库变更。
 
 2026-09-28：继续修复 Codex 对话的 GPT-6 选择与实际发送：进入 Codex 对话时先核对 OpenCode 当前 Server 目录，CLI 已有但桥未加载的模型保留为不可选并明确显示，OpenAI 可运行路由按版本降序靠前，搜索 `codex` 也包含 OpenCode 接入 Codex 的模型；OpenCode OpenAI OAuth 的 Codex Responses 端点要求 `stream=true`，模型桥改为收集 SSE 完成事件与 output item 后交给 App Server，保留 incomplete 终态。真实 `openai/gpt-6-luna` 经 Codebot Codex Harness 返回指定文本，专项测试和前端构建通过；无数据库、配置或依赖变更。
