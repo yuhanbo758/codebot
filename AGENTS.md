@@ -233,6 +233,7 @@ build.bat
 - 跨页面状态使用 Pinia，例如 `frontend/src/stores/notification.js`。
 - API 调用多使用相对路径 `/api/...`，开发环境由 Vite 代理到后端。
 - 修改前端页面时保持移动端适配和现有 Element Plus 视觉风格。
+- 全局 Element Plus 组件和字符串动态图标在 `frontend/src/plugins/element.js` 按实际使用注册；新增用法须同步清单，避免恢复整库安装。设置标签使用异步组件与 `lazy`，已挂载的表单保留实例。高亮样式不得与按需加载的语言库合入同一 JS chunk。
 
 ### Electron
 
@@ -307,6 +308,8 @@ build.bat
 ---
 
 ## 变更日志
+
+2026-10-20：优化启动和打包：OpenCode 启动、端口确认、连接与 MCP 同步按序在受跟踪后台任务中执行，本地 API 不等待外部运行时；取消启动时清理未接管子进程并关闭日志句柄。Chroma 导入和集合创建推迟到首次向量操作，恢复备份时同时清除两类集合引用。前端按实际使用注册 Element Plus 组件与图标，设置标签按需加载并保留表单，完整代码高亮库在首次代码块出现时加载；高亮样式独立分包，防止 CSS 导入提前加载语言库。修复 Rakazo 关闭状态读取已删除计数变量的问题。PyInstaller 不重复收录普通包的 Python 源码，保留 Chroma 动态命名空间所需源码；内置 Skills 仅由后端分发。产物门禁检查相应 PYZ 模块、动态命名空间和全部 Skills，并在本地构建与三平台 CI 执行真实后端首次向量初始化冒烟检查。README 与设置文档同步，无新依赖、配置或数据库结构变更。
 
 2026-10-17：Windows 安装包移除随包 OpenCode 原生程序，保留 macOS/Linux 随包运行时。Windows 桌面优先复用本机 CLI；缺失时仅用户点击“设置 → OpenCode”一键下载，官方 npm 原生包经 SHA-512、包名/版本、文件格式及 `--version` 校验后原子保存到 Codebot 用户目录，并启动服务。移除启动时 Scoop/npm 全局自动安装路径，保留旧 `auto_install` 配置字段兼容但不执行。CI 和本地构建增加 Windows 无内置运行时门禁；README 同步。无新依赖或数据库变更。
 

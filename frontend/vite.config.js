@@ -25,7 +25,7 @@ export default defineConfig({
     }
   },
   build: {
-    // 提高单 chunk 警告阈值（element-plus 本身约 1MB，无法更小）
+    // 完整语法高亮库按需加载，单独保留以复用全部语言支持。
     chunkSizeWarningLimit: 1100,
     rollupOptions: {
       output: {
@@ -45,8 +45,8 @@ export default defineConfig({
           if (id.includes('node_modules/element-plus')) {
             return 'vendor-element-plus'
           }
-          // highlight.js 核心 + 语言包（统一打包，按需加载由路由懒加载保证）
-          if (id.includes('node_modules/highlight.js')) {
+          // 样式不能合入语言库的 JS chunk，否则静态 CSS 导入会提前拉取整个语言库。
+          if (id.includes('node_modules/highlight.js') && !id.includes('/styles/')) {
             return 'vendor-highlight'
           }
           // markdown-it

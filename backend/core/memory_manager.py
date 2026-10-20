@@ -3,8 +3,6 @@
 """
 import sqlite3
 import json
-import chromadb
-from chromadb.config import Settings as ChromaSettings
 import shutil
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -20,6 +18,10 @@ def _create_chroma_client(path: Path):
     Codebot 固定使用 ChromaDB 0.4.x，而新版 posthog 已改变 ``capture``
     参数签名；关闭遥测可避免每次启动输出无关异常，同时不影响向量存储。
     """
+    # 仅语义检索和向量写入需要 Chroma；普通聊天列表与设置页无需加载推理依赖。
+    import chromadb
+    from chromadb.config import Settings as ChromaSettings
+
     return chromadb.PersistentClient(
         path=str(path),
         settings=ChromaSettings(anonymized_telemetry=False),
@@ -39,14 +41,38 @@ class MemoryManager:
         )
         self.sqlite_db.row_factory = sqlite3.Row
         
-        chroma_dir = Path(self.data_dir) / "chroma"
-        self.chroma_client, self.memory_collection = self._init_chroma(chroma_dir)
-        self.facts_collection = self.chroma_client.get_or_create_collection(name="facts_memory")
+        self._chroma_client = None
+        self._memory_collection = None
+        self._facts_collection = None
         
         # 初始化表结构
         self._init_tables()
         
         logger.info("记忆管理器初始化完成")
+
+    def _ensure_chroma(self):
+        if self._chroma_client is None:
+            client, memories = self._init_chroma(Path(self.data_dir) / "chroma")
+            facts = client.get_or_create_collection(name="facts_memory")
+            # 全部初始化成功才发布引用；失败后允许下一次使用重试。
+            self._memory_collection = memories
+            self._facts_collection = facts
+            self._chroma_client = client
+
+    @property
+    def chroma_client(self):
+        self._ensure_chroma()
+        return self._chroma_client
+
+    @property
+    def memory_collection(self):
+        self._ensure_chroma()
+        return self._memory_collection
+
+    @property
+    def facts_collection(self):
+        self._ensure_chroma()
+        return self._facts_collection
     
     def _init_tables(self):
         """初始化表结构"""
@@ -1197,10 +1223,10 @@ class MemoryManager:
                 )
                 self.sqlite_db.row_factory = sqlite3.Row
                 
-                self.chroma_client = _create_chroma_client(Path(self.data_dir) / "chroma")
-                self.memory_collection = self.chroma_client.get_or_create_collection(
-                    name="long_term_memory"
-                )
+                # 恢复后同时丢弃两类旧集合，下一次向量操作再连接恢复后的数据。
+                self._chroma_client = None
+                self._memory_collection = None
+                self._facts_collection = None
                 
                 logger.info("记忆恢复完成")
                 return True

@@ -1086,7 +1086,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Grid, Delete, Refresh, VideoPlay, VideoPause, Upload, Close, Document, Paperclip, Picture, Search, FolderOpened, MagicStick, Promotion } from '@element-plus/icons-vue'
 import axios from 'axios'
 import MarkdownIt from 'markdown-it'
-import hljs from 'highlight.js'
+import { highlightCode } from '@/utils/syntaxHighlight'
 import 'highlight.js/styles/github.css'
 
 const assistantAvatarUrl = '/logo.png'
@@ -1096,14 +1096,7 @@ const md = new MarkdownIt({
   linkify: true,
   typographer: true,
   highlight: function (str, lang) {
-    if (lang && hljs.getLanguage(lang)) {
-      try {
-        return '<pre class="hljs"><code>' +
-               hljs.highlight(str, { language: lang, ignoreIllegals: true }).value +
-               '</code></pre>';
-      } catch (__) {}
-    }
-    return '<pre class="hljs"><code>' + md.utils.escapeHtml(str) + '</code></pre>';
+    return highlightCode(str, lang, md.utils.escapeHtml)
   }
 })
 

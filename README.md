@@ -71,7 +71,11 @@ chmod +x scripts/install.sh
 
 ### 启动
 
-#### 先启动 OpenCode Serve（必需）
+主界面和本地 API 就绪后，OpenCode 在后台启动和连接；其启动重试不会拖住设置、历史对话等本地页面。需要 OpenCode 执行的任务仍须等待服务连接成功。语义记忆的向量库在首次检索或写入时初始化，普通列表和设置页不加载推理依赖。
+
+设置页仅在首次打开对应标签时加载其内容，切换标签会保留尚未保存的表单。聊天和文档首次显示带语言标记的代码块时才加载完整高亮库，加载完成后自动补上高亮。
+
+#### 准备 OpenCode Serve
 
 Windows 桌面发布包优先使用本机已安装的 OpenCode CLI，未找到时在“设置 → OpenCode”点击“一键下载并启动 OpenCode CLI”；这会从官方 npm registry 下载固定版本，验证 SHA-512 和原生程序后安装到 Codebot 用户目录，不要求本机安装 npm，也不会修改全局 CLI。下载只在用户点击后进行；OpenCode 未安装时仍可打开设置及使用不依赖它的功能。macOS/Linux 发布包继续内置经校验的 OpenCode 原生运行时。源码开发或自管部署仍需可用的 OpenCode CLI，并使 `opencode serve` 可连接。
 
@@ -712,12 +716,13 @@ npm run build
 补充说明：
 
 - Electron 启动时会先检查 `http://127.0.0.1:15682/api/health`，若后端已在运行则复用现有实例，不会重复拉起后端进程。
-- 若检测到已有后端运行但 `opencode_connected=false`，Electron 会自动重启后端以重新拉起 `opencode serve`。
+- 正式桌面版会复用健康后端，即使 OpenCode 尚在连接或未安装；可在设置页查看和启动 OpenCode。
 - 开发模式下 `npm start` 始终使用 `venv\Scripts\python.exe backend\main.py` 启动后端，确保运行的是当前源码。
 - 开发模式若本机已启动 `frontend` 的 Vite dev server（默认 `http://127.0.0.1:3000`），Electron 会优先连接该前端开发服务；未启动时才会自动构建 `frontend/dist` 后再继续加载应用。
 - 开发模式默认使用 `18080`，若检测到该端口为非源码后端（`runtime_source != source`），会先终止该进程再拉起源码后端，避免看不到最新流式改动。
 - 文档页 `/docs` 通过 `/api/docs/readme` 读取项目根目录 README；桌面端会显式传递 `CODEBOT_DOCS_SOURCE`，避免开发态或打包态下文档 404。
 - 桌面端打包默认读取 `backend/dist_build/codebot-backend` 作为后端资源目录。
+- 后端包的普通 Python 模块保存在 PYZ，不额外复制这些包的源码；Chroma 动态命名空间需要的源码、模板、原生库和许可证仍保留。内置 Skills 统一随 `_internal/skills` 分发，Electron 不再重复复制；`scripts/verify_codex_bundle.py` 同时检查按需加载模块和全部内置技能；`scripts/smoke_backend_bundle.py` 在临时数据目录启动真实产物并验证首次向量初始化，不调用真实模型。
 - Windows 下建议使用根目录 `build.bat` 执行完整打包流程（后端 PyInstaller + 前端构建 + Electron 安装包）。
 - Windows 打包产物默认输出到 `electron/dist/electron_new/`。
 - 发布流水线从 `opencode-ai` 安装结果中的原生程序制作内置 OpenCode，并校验 Windows、macOS、Linux 展开包中的文件头及版本。

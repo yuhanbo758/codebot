@@ -16,10 +16,10 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import MarkdownIt from 'markdown-it'
-import hljs from 'highlight.js'
+import { highlightCode } from '@/utils/syntaxHighlight'
 import 'highlight.js/styles/github.css'
 
 const md = new MarkdownIt({
@@ -27,14 +27,7 @@ const md = new MarkdownIt({
   linkify: true,
   breaks: true,
   highlight: function (str, lang) {
-    if (lang && hljs.getLanguage(lang)) {
-      try {
-        return '<pre class="hljs"><code>' +
-               hljs.highlight(str, { language: lang, ignoreIllegals: true }).value +
-               '</code></pre>'
-      } catch (__) {}
-    }
-    return '<pre class="hljs"><code>' + md.utils.escapeHtml(str) + '</code></pre>'
+    return highlightCode(str, lang, md.utils.escapeHtml)
   }
 })
 
@@ -62,7 +55,8 @@ md.renderer.rules.image = function (tokens, idx, options, env, self) {
 }
 
 const loading = ref(false)
-const html = ref('')
+const markdown = ref('')
+const html = computed(() => md.render(markdown.value))
 
 const loadDoc = async () => {
   loading.value = true
@@ -70,7 +64,7 @@ const loadDoc = async () => {
     const res = await fetch('/api/docs/readme')
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const text = await res.text()
-    html.value = md.render(text || '')
+    markdown.value = text || ''
   } catch (e) {
     ElMessage.error(`加载文档失败: ${e.message || e}`)
   } finally {

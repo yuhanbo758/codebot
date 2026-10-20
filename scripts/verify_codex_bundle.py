@@ -33,11 +33,28 @@ def main() -> int:
         "utils.codex_installer", "utils.opencode_installer",
         # 飞书 SDK 的生成源码不再重复复制到资源目录，入口仍必须留在 PYZ 中。
         "lark_oapi", "lark_oapi.ws.client",
+        # 按需导入仍须收录到 PYZ；去掉重复源码不能去掉模块、原生库或模板数据。
+        "core.memory_manager", "chromadb", "chromadb.api.segment", "chromadb.config",
+        "openai_codex", "tokenizers", "pydantic", "tornado.web",
+        "docx", "pptx", "pypdf", "pdfplumber", "reportlab",
     }
     missing = required_modules.difference(bundled_modules)
     if missing:
         raise RuntimeError(f"后端产物缺少模型路由模块：{sorted(missing)}")
     print("Codebot bundled model routing modules verified")
+    for module in (
+        "chromadb.ingest.impl.simple_policy", "chromadb.ingest.impl.utils",
+        "chromadb.segment.impl.manager.local", "chromadb.segment.impl.metadata.sqlite",
+        "chromadb.segment.impl.vector.local_persistent_hnsw", "chromadb.db.mixins.embeddings_queue",
+    ):
+        # 无 __init__.py 的动态命名空间可能仅通过源码布局分发，不能只检查 PYZ 顶层入口。
+        if module not in bundled_modules and not (root / "_internal" / Path(*module.split("."))).with_suffix(".py").is_file():
+            raise RuntimeError(f"Missing dynamic Chroma module: {module}")
+    skills_dir = Path(__file__).resolve().parents[1] / "skills"
+    for source in skills_dir.rglob("SKILL.md"):
+        target = root / "_internal" / "skills" / source.relative_to(skills_dir)
+        if not target.is_file():
+            raise RuntimeError(f"Missing bundled skill: {source.relative_to(skills_dir)}")
     aegis_dir = root / "_internal" / "third_party" / "aegis"
     for name in ("LICENSE", "NOTICE.md"):
         if not (aegis_dir / name).is_file():

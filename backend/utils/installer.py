@@ -439,36 +439,44 @@ async def start_opencode_server(port: int = 11200) -> int:
         proc_env.pop("XDG_CONFIG_HOME", None)
         proc_env["OPENCODE_CONFIG_HOME"] = opencode_config_dir
 
-        stdout_file = open(stdout_path, "a", encoding="utf-8")
-        stderr_file = open(stderr_path, "a", encoding="utf-8")
         base_url = f"http://127.0.0.1:{port}"
-        for command in commands:
-            try:
-                proc = subprocess.Popen(
-                    [*command, "serve", "--port", str(port), "--hostname", "127.0.0.1"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    cwd=str(Path.home()),
-                    env=proc_env,
-                )
-                for _ in range(30):
-                    if await _is_opencode_http_ready(base_url):
-                        _opencode_server_process = proc
-                        _opencode_server_command = command
-                        logger.info(f"OpenCode Server 已启动 ({base_url})，命令：{command[0]}")
-                        return port
-                    if proc.poll() is not None:
-                        break
-                    await asyncio.sleep(0.5)
-                if proc.poll() is None:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-                logger.warning(f"OpenCode 命令未就绪，尝试下一个候选：{command[0]}")
-            except Exception as cmd_err:
-                logger.warning(f"OpenCode 命令启动失败，尝试下一个候选：{command[0]} ({cmd_err})")
+        with open(stdout_path, "a", encoding="utf-8") as stdout_file, open(stderr_path, "a", encoding="utf-8") as stderr_file:
+            for command in commands:
+                proc = None
+                try:
+                    proc = subprocess.Popen(
+                        [*command, "serve", "--port", str(port), "--hostname", "127.0.0.1"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=stdout_file,
+                        stderr=stderr_file,
+                        cwd=str(Path.home()),
+                        env=proc_env,
+                    )
+                    for _ in range(30):
+                        if await _is_opencode_http_ready(base_url):
+                            _opencode_server_process = proc
+                            _opencode_server_command = command
+                            logger.info(f"OpenCode Server 已启动 ({base_url})，命令：{command[0]}")
+                            return port
+                        if proc.poll() is not None:
+                            break
+                        await asyncio.sleep(0.5)
+                    if proc.poll() is None:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                    logger.warning(f"OpenCode 命令未就绪，尝试下一个候选：{command[0]}")
+                except Exception as cmd_err:
+                    logger.warning(f"OpenCode 命令启动失败，尝试下一个候选：{command[0]} ({cmd_err})")
+
+                finally:
+                    # 后台启动被取消或候选超时，也必须清理尚未交给主生命周期的子进程。
+                    if proc is not None and proc is not _opencode_server_process and proc.poll() is None:
+                        try:
+                            proc.terminate()
+                        except OSError:
+                            pass
 
         logger.error(f"OpenCode Server 启动失败，所有候选命令均未就绪 ({base_url})")
         return 0

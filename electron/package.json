@@ -58,13 +58,6 @@
         ]
       },
       {
-        "from": "../skills",
-        "to": "skills",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
         "from": "../integrations",
         "to": "integrations",
         "filter": [

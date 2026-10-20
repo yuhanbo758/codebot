@@ -242,44 +242,44 @@ async def lifespan(app: FastAPI):
     )
     await scheduler_router.scheduler.start()
     
-    force_auto_start = os.environ.get("CODEBOT_FORCE_OPENCODE_AUTOSTART", "").strip().lower() in {"1", "true", "yes", "on"}
-    should_auto_start = bool(force_auto_start or app_config.opencode.auto_start or os.environ.get("CODEBOT_DATA_DIR"))
-    if should_auto_start:
-        parsed = urlparse(runtime_opencode_url)
-        configured_port = parsed.port or 11200
-        preferred_port_raw = os.environ.get("CODEBOT_OPENCODE_PREFERRED_PORT", "").strip()
-        fallback_port_raw = os.environ.get("CODEBOT_OPENCODE_FALLBACK_PORT", "").strip()
-        try:
-            preferred_port = int(preferred_port_raw) if preferred_port_raw else 11200
-        except Exception:
-            preferred_port = 11200
-        try:
-            fallback_port = int(fallback_port_raw) if fallback_port_raw else 11200
-        except Exception:
-            fallback_port = 11200
-        candidate_sources = [preferred_port, fallback_port] if (preferred_port_raw or fallback_port_raw) else [preferred_port, configured_port, fallback_port]
-        candidate_ports = []
-        for p in candidate_sources:
-            if not isinstance(p, int) or p < 1 or p > 65535:
-                continue
-            if p not in candidate_ports:
-                candidate_ports.append(p)
-        actual_port = 0
-        for port in candidate_ports:
-            actual_port = await start_opencode_server(port)
+    # OpenCode 是独立运行时；先开放本地 API，避免其启动重试拖住整个主界面。
+    async def initialize_opencode():
+        force_auto_start = os.environ.get("CODEBOT_FORCE_OPENCODE_AUTOSTART", "").strip().lower() in {"1", "true", "yes", "on"}
+        should_auto_start = bool(force_auto_start or app_config.opencode.auto_start or os.environ.get("CODEBOT_DATA_DIR"))
+        if should_auto_start:
+            parsed = urlparse(runtime_opencode_url)
+            configured_port = parsed.port or 11200
+            preferred_port_raw = os.environ.get("CODEBOT_OPENCODE_PREFERRED_PORT", "").strip()
+            fallback_port_raw = os.environ.get("CODEBOT_OPENCODE_FALLBACK_PORT", "").strip()
+            try:
+                preferred_port = int(preferred_port_raw) if preferred_port_raw else 11200
+            except Exception:
+                preferred_port = 11200
+            try:
+                fallback_port = int(fallback_port_raw) if fallback_port_raw else 11200
+            except Exception:
+                fallback_port = 11200
+            candidate_sources = [preferred_port, fallback_port] if (preferred_port_raw or fallback_port_raw) else [preferred_port, configured_port, fallback_port]
+            candidate_ports = []
+            for p in candidate_sources:
+                if not isinstance(p, int) or p < 1 or p > 65535:
+                    continue
+                if p not in candidate_ports:
+                    candidate_ports.append(p)
+            actual_port = 0
+            for port in candidate_ports:
+                actual_port = await start_opencode_server(port)
+                if actual_port:
+                    break
             if actual_port:
-                break
-        if actual_port:
-            new_url = f"http://127.0.0.1:{actual_port}"
-            if opencode_ws.base_url != new_url:
-                logger.info(f"OpenCode Server 运行地址: {new_url}")
-                opencode_ws.base_url = new_url
-                chat.opencode_ws.base_url = new_url
-        else:
-            logger.warning("OpenCode Server 未能自动启动，相关 AI 功能可能不可用")
+                new_url = f"http://127.0.0.1:{actual_port}"
+                if opencode_ws.base_url != new_url:
+                    logger.info(f"OpenCode Server 运行地址: {new_url}")
+                    opencode_ws.base_url = new_url
+                    chat.opencode_ws.base_url = new_url
+            else:
+                logger.warning("OpenCode Server 未能自动启动，相关 AI 功能可能不可用")
     
-    # 8. 尝试连接 OpenCode Server
-    async def connect_opencode():
         logger.info("尝试连接 OpenCode Server...")
         try:
             await opencode_ws.connect()
@@ -288,15 +288,12 @@ async def lifespan(app: FastAPI):
             logger.warning(f"无法连接到 OpenCode Server: {e}")
             logger.warning("请确保 OpenCode Server 已启动")
     
-    create_background_task(connect_opencode(), name="opencode-connect")
+    opencode_startup = create_background_task(initialize_opencode(), name="opencode-initialize")
 
     # 8b. 启动时全量同步 MCP 到 opencode（Skills 不同步，由用户自主管理）
     async def sync_to_opencode():
-        # 等待 opencode 连接就绪后再同步
-        for _ in range(20):
-            await asyncio.sleep(1)
-            if opencode_ws and opencode_ws.connected:
-                break
+        # 启动、端口选择、连接按顺序完成后再同步，避免后台启动尚未完成就写入旧地址。
+        await opencode_startup
         try:
             from api.routes.mcp import full_sync_mcp_to_opencode
             full_sync_mcp_to_opencode()

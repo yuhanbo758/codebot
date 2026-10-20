@@ -1536,8 +1536,10 @@ function createWindow() {
   startBackend()
     .then(() => waitForBackendReady())
     .then(async () => {
-      await restoreJevAIKeys().catch((error) => console.warn(`[jevai] 恢复凭据失败: ${error.message || error}`));
-      await restoreMediaKeys().catch((error) => console.warn(`[media] 恢复凭据失败: ${error.message || error}`));
+      await Promise.all([
+        restoreJevAIKeys().catch((error) => console.warn(`[jevai] 恢复凭据失败: ${error.message || error}`)),
+        restoreMediaKeys().catch((error) => console.warn(`[media] 恢复凭据失败: ${error.message || error}`)),
+      ]);
       const localIP = getLocalIP();
       const url = await resolveRendererUrl();
       await mainWindow.loadURL(url);
@@ -1856,13 +1858,13 @@ function escapeHtml(text) {
 }
 
 async function waitForBackendReady() {
-  const maxRetries = 60;
-  for (let i = 0; i < maxRetries; i += 1) {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
     try {
       await checkHealth();
       return true;
     } catch (err) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await new Promise((resolve) => setTimeout(resolve, 250));
     }
   }
   throw new Error('后端启动超时，请确认后端可执行文件可用');

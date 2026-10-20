@@ -10,7 +10,8 @@ datas = []
 hiddenimports = []
 binaries = []
 
-# chromadb
+# Chroma 0.4.x 的 ingest/segment impl 是无 __init__.py 的动态命名空间，
+# collect_submodules 无法完整发现；保留其源码布局供 importlib 加载。
 tmp_ret = collect_all('chromadb')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
@@ -19,7 +20,7 @@ hiddenimports += collect_submodules('fastapi')
 hiddenimports += collect_submodules('starlette')
 
 # pydantic
-tmp_ret = collect_all('pydantic')
+tmp_ret = collect_all('pydantic', include_py_files=False)
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 # onnxruntime 由 PyInstaller 官方 hook 收集 capi 下的原生推理库。不要使用
@@ -29,20 +30,20 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 # 默认嵌入函数通过 importlib 动态加载的核心推理入口。
 
 # tokenizers
-tmp_ret = collect_all('tokenizers')
+tmp_ret = collect_all('tokenizers', include_py_files=False)
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 # tornado
-tmp_ret = collect_all('tornado')
+tmp_ret = collect_all('tornado', include_py_files=False)
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 # uvicorn
 hiddenimports += collect_submodules('uvicorn')
 
 # lark_oapi
-tmp_ret = collect_all('lark_oapi')
+tmp_ret = collect_all('lark_oapi', include_py_files=False)
 # SDK 的生成模块已通过 hiddenimports 收进 PYZ；不再把上万份 .py 源码重复复制到安装目录。
-datas += [(source, target) for source, target in tmp_ret[0] if not source.lower().endswith('.py')]
+datas += tmp_ret[0]
 binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 # Windows 轻量包保留 SDK，CLI 在首次使用时从官方 registry 安装到用户目录。
@@ -50,7 +51,7 @@ binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 _on_demand_codex = sys.platform == 'win32'
 for _pkg in (('openai_codex',) if _on_demand_codex else ('openai_codex', 'codex_cli_bin')):
     try:
-        tmp_ret = collect_all(_pkg)
+        tmp_ret = collect_all(_pkg, include_py_files=False)
         datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
     except Exception as e:
         print(f"Warning: collect_all('{_pkg}') failed: {e}")
@@ -78,7 +79,7 @@ except Exception as e:
 # collect_all for document/data packages
 for _pkg in ('docx', 'pptx', 'pypdf', 'pdfplumber', 'reportlab', 'plyer', 'windows_toasts', 'winrt'):
     try:
-        tmp_ret = collect_all(_pkg)
+        tmp_ret = collect_all(_pkg, include_py_files=False)
         datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
     except Exception as e:
         print(f"Warning: collect_all('{_pkg}') failed: {e}")

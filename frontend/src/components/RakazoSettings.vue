@@ -538,8 +538,6 @@ const loadAll = async () => {
       desktopDocker.value = null
       desktopAuthorization.value = null
       models.value = []
-      modelTotal.value = 0
-      modelCatalogTotal.value = 0
       return
     }
 

@@ -1,52 +1,52 @@
 <template>
   <div class="settings-view">
     <el-tabs v-model="activeTab">
-      <el-tab-pane label="通用" name="general">
+      <el-tab-pane label="通用" name="general" lazy>
         <GeneralSettings />
       </el-tab-pane>
-      <el-tab-pane label="模式" name="mode">
+      <el-tab-pane label="模式" name="mode" lazy>
         <ModeSettings />
       </el-tab-pane>
-      <el-tab-pane label="媒体" name="media">
+      <el-tab-pane label="媒体" name="media" lazy>
         <MediaSettings />
       </el-tab-pane>
-      <el-tab-pane label="OpenCode" name="opencode">
+      <el-tab-pane label="OpenCode" name="opencode" lazy>
         <OpenCodeSettings />
       </el-tab-pane>
-      <el-tab-pane label="Codex" name="codex">
+      <el-tab-pane label="Codex" name="codex" lazy>
         <CodexSettings />
       </el-tab-pane>
-      <el-tab-pane label="Rakazo" name="rakazo">
+      <el-tab-pane label="Rakazo" name="rakazo" lazy>
         <RakazoSettings />
       </el-tab-pane>
-      <el-tab-pane label="Obsidian" name="obsidian">
+      <el-tab-pane label="Obsidian" name="obsidian" lazy>
         <ObsidianSettings />
       </el-tab-pane>
-      <el-tab-pane label="通知" name="notification">
+      <el-tab-pane label="通知" name="notification" lazy>
         <NotificationSettings />
       </el-tab-pane>
-      <el-tab-pane label="飞书" name="lark">
+      <el-tab-pane label="飞书" name="lark" lazy>
         <LarkSettings />
       </el-tab-pane>
-      <el-tab-pane label="邮箱" name="email">
+      <el-tab-pane label="邮箱" name="email" lazy>
         <EmailSettings />
       </el-tab-pane>
-      <el-tab-pane label="技能" name="skills">
+      <el-tab-pane label="技能" name="skills" lazy>
         <SkillsSettings />
       </el-tab-pane>
-      <el-tab-pane label="备份" name="backup">
+      <el-tab-pane label="备份" name="backup" lazy>
         <BackupSettings />
       </el-tab-pane>
-      <el-tab-pane label="集成" name="integration">
+      <el-tab-pane label="集成" name="integration" lazy>
         <IntegrationSettings />
       </el-tab-pane>
-      <el-tab-pane label="安全" name="security">
+      <el-tab-pane label="安全" name="security" lazy>
         <SecuritySettings />
       </el-tab-pane>
-      <el-tab-pane label="沙箱" name="sandbox">
+      <el-tab-pane label="沙箱" name="sandbox" lazy>
         <SandboxSettings />
       </el-tab-pane>
-      <el-tab-pane label="文档" name="docs">
+      <el-tab-pane label="文档" name="docs" lazy>
         <Docs />
       </el-tab-pane>
     </el-tabs>
@@ -54,24 +54,24 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, defineAsyncComponent } from 'vue'
 import { useRoute } from 'vue-router'
-import GeneralSettings from '@/components/GeneralSettings.vue'
-import ModeSettings from '@/components/ModeSettings.vue'
-import MediaSettings from '@/components/MediaSettings.vue'
-import CodexSettings from '@/components/CodexSettings.vue'
-import OpenCodeSettings from '@/components/OpenCodeSettings.vue'
-import RakazoSettings from '@/components/RakazoSettings.vue'
-import ObsidianSettings from '@/components/ObsidianSettings.vue'
-import NotificationSettings from '@/components/NotificationSettings.vue'
-import LarkSettings from '@/components/LarkSettings.vue'
-import EmailSettings from '@/components/EmailSettings.vue'
-import SkillsSettings from '@/components/SkillsSettings.vue'
-import BackupSettings from '@/components/BackupSettings.vue'
-import IntegrationSettings from '@/components/IntegrationSettings.vue'
-import SecuritySettings from '@/components/SecuritySettings.vue'
-import SandboxSettings from '@/components/SandboxSettings.vue'
-import Docs from '@/views/Docs.vue'
+const GeneralSettings = defineAsyncComponent(() => import('@/components/GeneralSettings.vue'))
+const ModeSettings = defineAsyncComponent(() => import('@/components/ModeSettings.vue'))
+const MediaSettings = defineAsyncComponent(() => import('@/components/MediaSettings.vue'))
+const CodexSettings = defineAsyncComponent(() => import('@/components/CodexSettings.vue'))
+const OpenCodeSettings = defineAsyncComponent(() => import('@/components/OpenCodeSettings.vue'))
+const RakazoSettings = defineAsyncComponent(() => import('@/components/RakazoSettings.vue'))
+const ObsidianSettings = defineAsyncComponent(() => import('@/components/ObsidianSettings.vue'))
+const NotificationSettings = defineAsyncComponent(() => import('@/components/NotificationSettings.vue'))
+const LarkSettings = defineAsyncComponent(() => import('@/components/LarkSettings.vue'))
+const EmailSettings = defineAsyncComponent(() => import('@/components/EmailSettings.vue'))
+const SkillsSettings = defineAsyncComponent(() => import('@/components/SkillsSettings.vue'))
+const BackupSettings = defineAsyncComponent(() => import('@/components/BackupSettings.vue'))
+const IntegrationSettings = defineAsyncComponent(() => import('@/components/IntegrationSettings.vue'))
+const SecuritySettings = defineAsyncComponent(() => import('@/components/SecuritySettings.vue'))
+const SandboxSettings = defineAsyncComponent(() => import('@/components/SandboxSettings.vue'))
+const Docs = defineAsyncComponent(() => import('@/views/Docs.vue'))
 
 const route = useRoute()
 // 支持通过设置链接直接定位 OpenCode 权限开关。

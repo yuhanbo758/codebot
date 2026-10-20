@@ -74,6 +74,10 @@ if errorlevel 1 (
     exit /b 1
 )
 popd
+"%PYTHON%" "%ROOT%scripts\verify_codex_bundle.py" "%ROOT%backend\dist_build\codebot-backend"
+if errorlevel 1 exit /b 1
+"%PYTHON%" "%ROOT%scripts\smoke_backend_bundle.py" "%ROOT%backend\dist_build\codebot-backend"
+if errorlevel 1 exit /b 1
 echo      Backend built: backend\dist\codebot-backend\
 
 :: ---------------------------------------------------------------
